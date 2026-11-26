@@ -1,6 +1,6 @@
 //! Project document: footage, layers, shapes, surfaces and per-frame track data.
 
-use crate::geometry::{apply, invert, mul, Mat3, MotionModel, Point, IDENTITY};
+use crate::geometry::{apply, invert, mul, normalize, Mat3, MotionModel, Point, IDENTITY};
 use crate::shape::{default_surface, Shape};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -105,6 +105,45 @@ pub struct Layer {
     pub surface: [Point; 4],
     pub settings: TrackSettings,
     pub tracks: BTreeMap<usize, FrameTrack>,
+    /// Follow another layer's motion instead of tracking on its own.
+    #[serde(default)]
+    pub link: Option<u32>,
+    /// Image or clip pinned to the surface for previewing the track.
+    #[serde(default)]
+    pub insert: Option<Insert>,
+}
+
+/// Media corner-pinned onto a layer's surface (Mocha-style "insert").
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Insert {
+    pub source: String,
+    /// One file per insert frame (a still image has one).
+    pub frames: Vec<String>,
+    pub width: u32,
+    pub height: u32,
+    pub opacity: f64,
+    /// Footage frame index at which insert frame 0 plays.
+    pub start_frame: usize,
+    pub looped: bool,
+}
+
+impl Insert {
+    /// Insert frame shown at footage frame `frame`.
+    pub fn frame_for(&self, frame: usize) -> Option<&str> {
+        let n = self.frames.len() as i64;
+        if n == 0 {
+            return None;
+        }
+        let i = frame as i64 - self.start_frame as i64;
+        let idx = if n == 1 {
+            0
+        } else if self.looped {
+            i.rem_euclid(n)
+        } else {
+            i.clamp(0, n - 1)
+        };
+        self.frames.get(idx as usize).map(String::as_str)
+    }
 }
 
 const LAYER_COLORS: [&str; 6] = [
@@ -119,14 +158,20 @@ impl Layer {
         Self {
             id,
             name: format!("Layer {id}"),
-            color: LAYER_COLORS[(id as usize).wrapping_sub(1) % LAYER_COLORS.len()].to_string(),
+            color: Self::color_for(id),
             visible: true,
             ref_frame,
             shape,
             surface,
             settings: TrackSettings::default(),
             tracks,
+            link: None,
+            insert: None,
         }
+    }
+
+    pub fn color_for(id: u32) -> String {
+        LAYER_COLORS[(id as usize).wrapping_sub(1) % LAYER_COLORS.len()].to_string()
     }
 
     pub fn h_at(&self, frame: usize) -> Option<Mat3> {
@@ -237,6 +282,68 @@ impl Project {
         self.layers.iter_mut().find(|l| l.id == id)
     }
 
+    /// Copy a layer (shape, surface, settings, track, insert) under a new id.
+    pub fn duplicate_layer(&mut self, id: u32) -> Option<u32> {
+        let mut copy = self.layer(id)?.clone();
+        let new_id = self.next_layer_id;
+        self.next_layer_id += 1;
+        copy.id = new_id;
+        copy.name = format!("{} copy", copy.name);
+        copy.color = Layer::color_for(new_id);
+        let pos = self
+            .layers
+            .iter()
+            .position(|l| l.id == id)
+            .map_or(self.layers.len(), |p| p + 1);
+        self.layers.insert(pos, copy);
+        Some(new_id)
+    }
+
+    /// Would linking `child` to `parent` create a cycle?
+    pub fn link_creates_cycle(&self, child: u32, parent: u32) -> bool {
+        let mut cur = Some(parent);
+        let mut guard = 0;
+        while let Some(id) = cur {
+            if id == child || guard > self.layers.len() {
+                return true;
+            }
+            guard += 1;
+            cur = self.layer(id).and_then(|l| l.link);
+        }
+        false
+    }
+
+    /// Recompute the track of every linked layer from its parent's motion.
+    pub fn resolve_links(&mut self) {
+        for _ in 0..=self.layers.len() {
+            let mut changed = false;
+            for i in 0..self.layers.len() {
+                let Some(pid) = self.layers[i].link else {
+                    continue;
+                };
+                let (cid, cref) = (self.layers[i].id, self.layers[i].ref_frame);
+                if pid == cid || self.link_creates_cycle(cid, pid) {
+                    self.layers[i].link = None;
+                    changed = true;
+                    continue;
+                }
+                let Some(parent) = self.layer(pid) else {
+                    self.layers[i].link = None;
+                    changed = true;
+                    continue;
+                };
+                let tracks = linked_tracks(parent, cref);
+                if self.layers[i].tracks != tracks {
+                    self.layers[i].tracks = tracks;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("project serialises")
     }
@@ -251,5 +358,98 @@ impl Project {
             ));
         }
         Ok(p)
+    }
+}
+
+/// Track data for a layer whose reference frame is `child_ref`, moving with `parent`.
+fn linked_tracks(parent: &Layer, child_ref: usize) -> BTreeMap<usize, FrameTrack> {
+    let mut m = BTreeMap::new();
+    let Some(hr) = parent.h_at(child_ref).and_then(|h| invert(&h)) else {
+        m.insert(child_ref, FrameTrack::reference());
+        return m;
+    };
+    for (&f, t) in &parent.tracks {
+        let h = if f == child_ref {
+            IDENTITY
+        } else {
+            normalize(&mul(&t.h_from_ref, &hr))
+        };
+        m.insert(
+            f,
+            FrameTrack {
+                h_from_ref: h,
+                inliers: t.inliers,
+                rms_error: t.rms_error,
+                points: vec![],
+                keyframe: f == child_ref,
+            },
+        );
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::apply;
+
+    fn moving_parent() -> Layer {
+        let mut p = Layer::new(1, 0, Shape::rect(0.0, 0.0, 100.0, 100.0));
+        for f in 1..10 {
+            let t = f as f64;
+            p.tracks.insert(
+                f,
+                FrameTrack {
+                    h_from_ref: [1.0, 0.0, 5.0 * t, 0.0, 1.0, 2.0 * t, 0.0, 0.0, 1.0],
+                    ..FrameTrack::reference()
+                },
+            );
+        }
+        p
+    }
+
+    #[test]
+    fn linked_layer_follows_parent() {
+        let mut pr = Project::default();
+        pr.layers.push(moving_parent());
+        pr.next_layer_id = 2;
+        // Child drawn at frame 4 follows the parent relative to that frame.
+        let mut child = Layer::new(2, 4, Shape::rect(20.0, 20.0, 10.0, 10.0));
+        child.link = Some(1);
+        pr.layers.push(child);
+        pr.next_layer_id = 3;
+        pr.resolve_links();
+        let c = pr.layer(2).unwrap();
+        assert_eq!(c.tracks.len(), 10);
+        let p4 = apply(&c.h_at(4).unwrap(), [20.0, 20.0]);
+        let p9 = apply(&c.h_at(9).unwrap(), [20.0, 20.0]);
+        assert!(
+            (p4[0] - 20.0).abs() < 1e-9
+                && (p9[0] - 45.0).abs() < 1e-9
+                && (p9[1] - 30.0).abs() < 1e-9
+        );
+        // Cycles are refused.
+        assert!(pr.link_creates_cycle(1, 2));
+    }
+
+    #[test]
+    fn duplicate_and_insert_frames() {
+        let mut pr = Project::default();
+        let id = pr.add_layer(0, Shape::rect(0.0, 0.0, 5.0, 5.0));
+        let d = pr.duplicate_layer(id).unwrap();
+        assert_eq!(pr.layers.len(), 2);
+        assert_eq!(pr.layer(d).unwrap().name, "Layer 1 copy");
+        let ins = Insert {
+            source: String::new(),
+            frames: vec!["a".into(), "b".into(), "c".into()],
+            width: 1,
+            height: 1,
+            opacity: 1.0,
+            start_frame: 5,
+            looped: true,
+        };
+        assert_eq!(ins.frame_for(5), Some("a"));
+        assert_eq!(ins.frame_for(9), Some("b"));
+        assert_eq!(ins.frame_for(4), Some("c"));
     }
 }

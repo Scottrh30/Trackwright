@@ -63,6 +63,47 @@ impl Shape {
         }
     }
 
+    /// Nearest point on the outline to `p`: (index of the control segment it lies on,
+    /// the point on the outline, distance). Inserting a control point at `segment + 1`
+    /// puts it on that segment.
+    pub fn nearest_edge(&self, p: Point) -> Option<(usize, Point, f64)> {
+        let n = self.points.len();
+        if n < 2 {
+            return None;
+        }
+        let steps = if self.smooth { 10 } else { 1 };
+        let poly = self.flatten(steps);
+        let m = poly.len();
+        let mut best: Option<(usize, Point, f64)> = None;
+        for i in 0..m {
+            let (a, b) = (poly[i], poly[(i + 1) % m]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 {
+                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let q = [a[0] + t * dx, a[1] + t * dy];
+            let d = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt();
+            if best.map_or(true, |b| d < b.2) {
+                best = Some((i / steps, q, d));
+            }
+        }
+        best
+    }
+
+    pub fn translated(&self, d: Point) -> Shape {
+        Shape {
+            points: self
+                .points
+                .iter()
+                .map(|p| [p[0] + d[0], p[1] + d[1]])
+                .collect(),
+            ..self.clone()
+        }
+    }
+
     pub fn bbox(&self) -> Option<[f64; 4]> {
         bbox(&self.points)
     }
@@ -112,6 +153,15 @@ pub fn default_surface(shape: &Shape) -> [Point; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_edge_segments() {
+        let s = Shape::rect(0.0, 0.0, 10.0, 10.0);
+        let (seg, q, d) = s.nearest_edge([5.0, -1.0]).unwrap();
+        assert_eq!((seg, q, d), (0, [5.0, 0.0], 1.0));
+        assert_eq!(s.nearest_edge([11.0, 5.0]).unwrap().0, 1);
+        assert_eq!(s.nearest_edge([-1.0, 5.0]).unwrap().0, 3);
+    }
 
     #[test]
     fn pip_square() {

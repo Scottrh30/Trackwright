@@ -1,7 +1,7 @@
 //! Viewport and timeline rendering on 2D canvases.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use trackwright_core::geometry::{apply, homography_from_corners, Point};
 use trackwright_core::Project;
 use wasm_bindgen::prelude::*;
@@ -58,53 +58,55 @@ pub struct Overlays {
     pub grid: bool,
     pub points: bool,
     pub shapes: bool,
+    pub inserts: bool,
 }
 
 pub struct Scene<'a> {
     pub project: &'a Project,
     pub frame: usize,
     pub selected: Option<u32>,
+    pub sel_point: Option<usize>,
     pub tool: Tool,
     pub draft: &'a [Point],
     pub hover: Option<Point>,
     pub view: View,
     pub overlays: Overlays,
+    /// Loaded insert images for this frame, by layer id.
+    pub inserts: Vec<(u32, HtmlImageElement)>,
 }
 
+const IMAGE_CACHE: usize = 96;
+
 thread_local! {
-    static IMAGES: RefCell<(String, HashMap<usize, HtmlImageElement>)> = RefCell::new((String::new(), HashMap::new()));
+    static IMAGES: RefCell<(HashMap<String, HtmlImageElement>, VecDeque<String>)> = RefCell::new((HashMap::new(), VecDeque::new()));
     static LAST_GOOD: RefCell<Option<HtmlImageElement>> = const { RefCell::new(None) };
 }
 
-/// Get (and start loading) the image for `frame`. `on_load` fires once it is ready.
-pub fn frame_image(
-    project: &Project,
-    frame: usize,
-    on_load: impl Fn() + 'static + Clone,
-) -> Option<HtmlImageElement> {
-    let f = project.footage.as_ref()?;
-    let path = f.frames.get(frame)?.clone();
+/// Get (and start loading) the image at `path`. `on_load` fires once it is ready.
+pub fn image_for(path: &str, on_load: impl Fn() + 'static) -> Option<HtmlImageElement> {
     IMAGES.with(|cell| {
         let mut c = cell.borrow_mut();
-        if c.0 != f.source {
-            c.0 = f.source.clone();
-            c.1.clear();
-        }
-        // Evict far-away frames to bound memory.
-        if c.1.len() > 48 {
-            c.1.retain(|&k, _| k.abs_diff(frame) < 16);
-        }
-        if let Some(img) = c.1.get(&frame) {
+        if let Some(img) = c.0.get(path) {
             return Some(img.clone());
         }
         let img = HtmlImageElement::new().ok()?;
         let cb = Closure::<dyn Fn()>::new(on_load);
         img.set_onload(Some(cb.as_ref().unchecked_ref()));
         cb.forget();
-        img.set_src(&crate::tauri::convert_file_src(&path));
-        c.1.insert(frame, img.clone());
+        img.set_src(&crate::tauri::convert_file_src(path));
+        c.0.insert(path.to_string(), img.clone());
+        c.1.push_back(path.to_string());
+        while c.1.len() > IMAGE_CACHE {
+            if let Some(old) = c.1.pop_front() {
+                c.0.remove(&old);
+            }
+        }
         Some(img)
     })
+}
+
+pub fn is_ready(img: &HtmlImageElement) -> bool {
+    img.complete() && img.natural_width() > 0
 }
 
 fn ctx_of(canvas: &HtmlCanvasElement) -> Option<CanvasRenderingContext2d> {
@@ -163,7 +165,7 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
         ctx.set_font("15px system-ui, sans-serif");
         ctx.set_text_align("center");
         let _ = ctx.fill_text(
-            "Open a video or image sequence to start tracking",
+            "Open a video or image sequence to start tracking (or drag it here)",
             cw / 2.0,
             ch / 2.0,
         );
@@ -174,8 +176,7 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
     let z = v.zoom;
     let _ = ctx.set_transform(dpr * z, 0.0, 0.0, dpr * z, dpr * v.pan[0], dpr * v.pan[1]);
     let (w, h) = (footage.width as f64, footage.height as f64);
-    let img = image.filter(|i| i.complete() && i.natural_width() > 0);
-    let img = match img {
+    let img = match image.filter(is_ready) {
         Some(i) => {
             LAST_GOOD.with(|l| *l.borrow_mut() = Some(i.clone()));
             Some(i)
@@ -183,6 +184,7 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
         None => LAST_GOOD.with(|l| l.borrow().clone()),
     };
     if let Some(i) = img {
+        // Proxies are smaller than the footage; always draw at footage size.
         let _ = ctx.draw_image_with_html_image_element_and_dw_and_dh(&i, 0.0, 0.0, w, h);
     } else {
         ctx.set_fill_style_str("#1b1d22");
@@ -193,6 +195,24 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
     ctx.stroke_rect(0.0, 0.0, w, h);
 
     let px = 1.0 / z; // one screen pixel in image units
+
+    // Inserts sit on the footage, under every overlay.
+    if scene.overlays.inserts {
+        for (id, ins_img) in &scene.inserts {
+            let Some(layer) = scene.project.layer(*id) else {
+                continue;
+            };
+            if !layer.visible || !is_ready(ins_img) {
+                continue;
+            }
+            let (Some(corners), Some(ins)) = (layer.surface_at(scene.frame), layer.insert.as_ref())
+            else {
+                continue;
+            };
+            draw_insert(&ctx, ins_img, &corners, ins.opacity, px);
+        }
+    }
+
     for layer in scene.project.layers.iter().filter(|l| l.visible) {
         let selected = scene.selected == Some(layer.id);
         let Some(shape) = layer.shape_at(scene.frame) else {
@@ -211,11 +231,23 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
             }
             ctx.set_stroke_style_str(&layer.color);
             ctx.set_line_width(if selected { 2.0 } else { 1.2 } * px);
+            if layer.link.is_some() {
+                let _ =
+                    ctx.set_line_dash(&js_sys::Array::of2(&(5.0 * px).into(), &(3.0 * px).into()));
+            }
             ctx.stroke();
+            let _ = ctx.set_line_dash(&js_sys::Array::new());
             if selected && scene.tool == Tool::EditShape {
                 ctx.set_line_width(1.5 * px);
-                for p in &shape.points {
-                    handle(&ctx, *p, 5.0 * px, "#15171c", &layer.color);
+                for (i, p) in shape.points.iter().enumerate() {
+                    let on = scene.sel_point == Some(i);
+                    handle(
+                        &ctx,
+                        *p,
+                        if on { 6.5 } else { 5.0 } * px,
+                        if on { &layer.color } else { "#15171c" },
+                        &layer.color,
+                    );
                 }
             }
         }
@@ -283,14 +315,112 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
     }
 }
 
-/// Checkerboard-ish grid warped onto the surface to judge track quality (like Mocha's insert).
+/// Affine transform (canvas a..f) mapping triangle `s` onto triangle `d`.
+fn tri_affine(s: [Point; 3], d: [Point; 3]) -> Option<[f64; 6]> {
+    let den = s[0][0] * (s[1][1] - s[2][1])
+        + s[1][0] * (s[2][1] - s[0][1])
+        + s[2][0] * (s[0][1] - s[1][1]);
+    if den.abs() < 1e-12 {
+        return None;
+    }
+    let row = |k: usize| {
+        let a = (d[0][k] * (s[1][1] - s[2][1])
+            + d[1][k] * (s[2][1] - s[0][1])
+            + d[2][k] * (s[0][1] - s[1][1]))
+            / den;
+        let c = (d[0][k] * (s[2][0] - s[1][0])
+            + d[1][k] * (s[0][0] - s[2][0])
+            + d[2][k] * (s[1][0] - s[0][0]))
+            / den;
+        let e = (d[0][k] * (s[1][0] * s[2][1] - s[2][0] * s[1][1])
+            + d[1][k] * (s[2][0] * s[0][1] - s[0][0] * s[2][1])
+            + d[2][k] * (s[0][0] * s[1][1] - s[1][0] * s[0][1]))
+            / den;
+        (a, c, e)
+    };
+    let (a, c, e) = row(0);
+    let (b, d_, f) = row(1);
+    Some([a, b, c, d_, e, f])
+}
+
+/// Draw `img` perspective-warped onto `corners` (TL, TR, BR, BL) by subdividing the
+/// quad into small affine triangles, which 2D canvas can draw exactly.
+fn draw_insert(
+    ctx: &CanvasRenderingContext2d,
+    img: &HtmlImageElement,
+    corners: &[Point; 4],
+    opacity: f64,
+    px: f64,
+) {
+    let unit = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let Some(h) = homography_from_corners(&unit, corners) else {
+        return;
+    };
+    let (sw, sh) = (img.natural_width() as f64, img.natural_height() as f64);
+    const N: usize = 12;
+    let mut grid = vec![[0.0; 2]; (N + 1) * (N + 1)];
+    for j in 0..=N {
+        for i in 0..=N {
+            grid[j * (N + 1) + i] = apply(&h, [i as f64 / N as f64, j as f64 / N as f64]);
+        }
+    }
+    let src = |i: usize, j: usize| [i as f64 / N as f64 * sw, j as f64 / N as f64 * sh];
+    let dst = |i: usize, j: usize| grid[j * (N + 1) + i];
+    ctx.save();
+    ctx.set_global_alpha(opacity.clamp(0.0, 1.0));
+    for j in 0..N {
+        for i in 0..N {
+            for tri in [
+                [(i, j), (i + 1, j), (i + 1, j + 1)],
+                [(i, j), (i + 1, j + 1), (i, j + 1)],
+            ] {
+                let s = tri.map(|(a, b)| src(a, b));
+                let d = tri.map(|(a, b)| dst(a, b));
+                let Some(m) = tri_affine(s, d) else { continue };
+                // Grow the clip slightly so neighbouring triangles overlap (no seams).
+                let c = [
+                    (d[0][0] + d[1][0] + d[2][0]) / 3.0,
+                    (d[0][1] + d[1][1] + d[2][1]) / 3.0,
+                ];
+                let grow = |p: Point| {
+                    let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    [p[0] + dx / l * 0.8 * px, p[1] + dy / l * 0.8 * px]
+                };
+                ctx.save();
+                path(ctx, &d.map(grow), true);
+                ctx.clip();
+                let _ = ctx.transform(m[0], m[1], m[2], m[3], m[4], m[5]);
+                let x0 = (s.iter().map(|p| p[0]).fold(f64::MAX, f64::min) - 1.0).max(0.0);
+                let y0 = (s.iter().map(|p| p[1]).fold(f64::MAX, f64::min) - 1.0).max(0.0);
+                let x1 = (s.iter().map(|p| p[0]).fold(f64::MIN, f64::max) + 1.0).min(sw);
+                let y1 = (s.iter().map(|p| p[1]).fold(f64::MIN, f64::max) + 1.0).min(sh);
+                let _ = ctx
+                    .draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                        img,
+                        x0,
+                        y0,
+                        x1 - x0,
+                        y1 - y0,
+                        x0,
+                        y0,
+                        x1 - x0,
+                        y1 - y0,
+                    );
+                ctx.restore();
+            }
+        }
+    }
+    ctx.restore();
+}
+
+/// Checkerboard grid warped onto the surface to judge track quality.
 fn draw_grid(ctx: &CanvasRenderingContext2d, corners: &[Point; 4], px: f64) {
     let unit = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     let Some(h) = homography_from_corners(&unit, corners) else {
         return;
     };
     let n = 8;
-    // Alternate filled cells.
     ctx.set_global_alpha(0.28);
     for i in 0..n {
         for j in 0..n {
@@ -336,7 +466,6 @@ pub fn draw_timeline(
     let fw = cw / n as f64;
     let x_of = |f: usize| (f as f64 + 0.5) * fw;
 
-    // Tracked-frame bars for every layer, selected layer drawn tallest.
     let lane_h = 6.0;
     for (li, layer) in project.layers.iter().enumerate() {
         let sel = selected == Some(layer.id);
@@ -362,7 +491,6 @@ pub fn draw_timeline(
         }
     }
 
-    // Ticks.
     ctx.set_fill_style_str("#7a8090");
     let step = (n as f64 / (cw / 60.0)).ceil().max(1.0) as usize;
     let step = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000]
@@ -378,7 +506,6 @@ pub fn draw_timeline(
         let _ = ctx.fill_text(&(first + f as i64).to_string(), x + 3.0, ch - 2.0);
     }
 
-    // Playhead.
     ctx.set_fill_style_str("#ffb020");
     ctx.fill_rect(x_of(frame) - 1.0, 0.0, 2.0, ch);
 }

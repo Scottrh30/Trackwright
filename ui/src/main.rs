@@ -5,7 +5,7 @@
 mod draw;
 mod tauri;
 
-use draw::{draw_timeline, draw_viewport, frame_image, Overlays, Scene, Tool, View};
+use draw::{draw_timeline, draw_viewport, image_for, Overlays, Scene, Tool, View};
 use leptos::ev;
 use leptos::html;
 use leptos::prelude::*;
@@ -14,7 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 use trackwright_core::geometry::{MotionModel, Point};
-use trackwright_core::{ExportFormat, FrameTrack, Layer, Project};
+use trackwright_core::shape::point_in_polygon;
+use trackwright_core::{ExportFormat, FrameTrack, Layer, Project, Shape};
+use wasm_bindgen::JsCast;
+
+// ---------------------------------------------------------------------------
+// Types mirrored from the backend
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct AppSettings {
@@ -22,6 +27,8 @@ struct AppSettings {
     forma3d_dir: String,
     tidefire_dir: String,
     default_format: ExportFormat,
+    #[serde(default)]
+    recent_projects: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -31,8 +38,32 @@ impl Default for AppSettings {
             forma3d_dir: String::new(),
             tidefire_dir: String::new(),
             default_format: ExportFormat::Reelforge,
+            recent_projects: vec![],
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AppView {
+    project: Project,
+    can_undo: bool,
+    can_redo: bool,
+    dirty: bool,
+    path: Option<String>,
+    recent: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+struct ProxyInfo {
+    prefix: Option<String>,
+    ready: usize,
+    total: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct RecoveryInfo {
+    original_path: Option<String>,
+    saved_at: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -44,90 +75,232 @@ struct TrackFrameEvent {
 
 #[derive(Clone, Deserialize)]
 struct TrackDoneEvent {
-    #[allow(dead_code)]
-    layer_id: u32,
     ok: bool,
-    #[allow(dead_code)]
-    cancelled: bool,
     message: String,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+// ---------------------------------------------------------------------------
+// UI state
+
+#[derive(Clone, PartialEq)]
 enum Drag {
     None,
     Pan { start: Point, pan: Point },
     ShapePoint(usize),
     SurfaceCorner(usize),
+    MoveShape { start: Point, orig: Shape },
+    MoveSurface { start: Point, orig: [Point; 4] },
 }
 
-fn main() {
-    console_error_panic_hook::set_once();
-    leptos::mount::mount_to_body(App);
+/// Something that would throw away unsaved work.
+#[derive(Clone, Debug, PartialEq)]
+enum Pending {
+    Close,
+    New,
+    OpenProject(Option<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Modal {
+    None,
+    About,
+    Unsaved(Pending),
+    Recovery(RecoveryInfo),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerRes {
+    Auto,
+    Proxy,
+    Full,
+}
+
+/// All shared UI state. Everything inside is a cheap, `Copy` handle.
+#[derive(Clone, Copy)]
+struct Ctx {
+    project: RwSignal<Project>,
+    can_undo: RwSignal<bool>,
+    can_redo: RwSignal<bool>,
+    dirty: RwSignal<bool>,
+    path: RwSignal<Option<String>>,
+    recent: RwSignal<Vec<String>>,
+    recent_open: RwSignal<bool>,
+    frame: RwSignal<usize>,
+    selected: RwSignal<Option<u32>>,
+    sel_point: RwSignal<Option<usize>>,
+    renaming: RwSignal<Option<u32>>,
+    tool: RwSignal<Tool>,
+    draft: RwSignal<Vec<Point>>,
+    hover: RwSignal<Option<Point>>,
+    view: RwSignal<View>,
+    redraw: RwSignal<u32>,
+    tracking: RwSignal<bool>,
+    playing: RwSignal<bool>,
+    scrubbing: RwSignal<bool>,
+    status: RwSignal<String>,
+    status_err: RwSignal<bool>,
+    show_surface: RwSignal<bool>,
+    show_grid: RwSignal<bool>,
+    show_points: RwSignal<bool>,
+    show_shapes: RwSignal<bool>,
+    show_inserts: RwSignal<bool>,
+    viewer_res: RwSignal<ViewerRes>,
+    proxy: RwSignal<ProxyInfo>,
+    settings: RwSignal<AppSettings>,
+    export_format: RwSignal<ExportFormat>,
+    modal: RwSignal<Modal>,
+    drag: StoredValue<Drag>,
+    play_handle: StoredValue<Option<IntervalHandle>>,
+    viewport: NodeRef<html::Canvas>,
+    timeline: NodeRef<html::Canvas>,
 }
 
 fn dist2(a: Point, b: Point) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
 }
 
-fn format_id(f: ExportFormat) -> String {
-    serde_json::to_value(f)
+fn enum_id<T: Serialize>(v: T) -> String {
+    serde_json::to_value(v)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default()
 }
 
-fn format_from_id(s: &str) -> ExportFormat {
-    serde_json::from_value(json!(s)).unwrap_or(ExportFormat::Reelforge)
+fn file_name(p: &str) -> String {
+    p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()
 }
 
-fn model_id(m: MotionModel) -> String {
-    serde_json::to_value(m)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default()
-}
+impl Ctx {
+    fn new() -> Self {
+        Self {
+            project: RwSignal::new(Project::default()),
+            can_undo: RwSignal::new(false),
+            can_redo: RwSignal::new(false),
+            dirty: RwSignal::new(false),
+            path: RwSignal::new(None),
+            recent: RwSignal::new(vec![]),
+            recent_open: RwSignal::new(false),
+            frame: RwSignal::new(0),
+            selected: RwSignal::new(None),
+            sel_point: RwSignal::new(None),
+            renaming: RwSignal::new(None),
+            tool: RwSignal::new(Tool::Pan),
+            draft: RwSignal::new(vec![]),
+            hover: RwSignal::new(None),
+            view: RwSignal::new(View::default()),
+            redraw: RwSignal::new(0),
+            tracking: RwSignal::new(false),
+            playing: RwSignal::new(false),
+            scrubbing: RwSignal::new(false),
+            status: RwSignal::new("Ready".into()),
+            status_err: RwSignal::new(false),
+            show_surface: RwSignal::new(true),
+            show_grid: RwSignal::new(false),
+            show_points: RwSignal::new(true),
+            show_shapes: RwSignal::new(true),
+            show_inserts: RwSignal::new(true),
+            viewer_res: RwSignal::new(ViewerRes::Auto),
+            proxy: RwSignal::new(ProxyInfo::default()),
+            settings: RwSignal::new(AppSettings::default()),
+            export_format: RwSignal::new(ExportFormat::Reelforge),
+            modal: RwSignal::new(Modal::None),
+            drag: StoredValue::new(Drag::None),
+            play_handle: StoredValue::new(None),
+            viewport: NodeRef::new(),
+            timeline: NodeRef::new(),
+        }
+    }
 
-#[component]
-fn App() -> impl IntoView {
-    let project = RwSignal::new(Project::default());
-    let frame = RwSignal::new(0usize);
-    let selected = RwSignal::new(None::<u32>);
-    let tool = RwSignal::new(Tool::Pan);
-    let draft = RwSignal::new(Vec::<Point>::new());
-    let hover = RwSignal::new(None::<Point>);
-    let view = RwSignal::new(View::default());
-    let redraw = RwSignal::new(0u32);
-    let tracking = RwSignal::new(false);
-    let status = RwSignal::new(String::from("Ready"));
-    let status_err = RwSignal::new(false);
-    let show_surface = RwSignal::new(true);
-    let show_grid = RwSignal::new(false);
-    let show_points = RwSignal::new(true);
-    let show_shapes = RwSignal::new(true);
-    let settings = RwSignal::new(AppSettings::default());
-    let export_format = RwSignal::new(ExportFormat::Reelforge);
-    let about_open = RwSignal::new(false);
-    let playing = RwSignal::new(false);
-    let drag = StoredValue::new(Drag::None);
-    let play_handle = StoredValue::new(None::<IntervalHandle>);
+    fn say(self, msg: impl Into<String>, err: bool) {
+        self.status.set(msg.into());
+        self.status_err.set(err);
+    }
 
-    let viewport_ref = NodeRef::<html::Canvas>::new();
-    let timeline_ref = NodeRef::<html::Canvas>::new();
+    fn bump(self) {
+        self.redraw.update(|n| *n = n.wrapping_add(1));
+    }
 
-    let say = move |msg: String, err: bool| {
-        status.set(msg);
-        status_err.set(err);
-    };
+    fn frame_count(self) -> usize {
+        self.project
+            .with(|p| p.footage.as_ref().map_or(0, |f| f.frames.len()))
+    }
 
-    let frame_count = move || project.with(|p| p.footage.as_ref().map_or(0, |f| f.frames.len()));
+    fn frame_count_untracked(self) -> usize {
+        self.project
+            .with_untracked(|p| p.footage.as_ref().map_or(0, |f| f.frames.len()))
+    }
 
-    let fit_view = move || {
-        let Some(c) = viewport_ref.get_untracked() else {
+    fn apply_view(self, v: AppView) {
+        let n = v.project.footage.as_ref().map_or(0, |f| f.frames.len());
+        let ids: Vec<u32> = v.project.layers.iter().map(|l| l.id).collect();
+        self.project.set(v.project);
+        self.can_undo.set(v.can_undo);
+        self.can_redo.set(v.can_redo);
+        self.dirty.set(v.dirty);
+        self.path.set(v.path);
+        self.recent.set(v.recent);
+        if self.frame.get_untracked() >= n {
+            self.frame.set(n.saturating_sub(1));
+        }
+        match self.selected.get_untracked() {
+            Some(s) if ids.contains(&s) => {}
+            _ => self.selected.set(ids.last().copied()),
+        }
+    }
+
+    /// Run a backend command that returns an `AppView`.
+    fn call(self, cmd: &'static str, args: serde_json::Value, ok_msg: Option<&'static str>) {
+        spawn_local(async move {
+            match tauri::call::<AppView>(cmd, args).await {
+                Ok(v) => {
+                    self.apply_view(v);
+                    if let Some(m) = ok_msg {
+                        self.say(m, false);
+                    }
+                }
+                Err(e) => self.say(e, true),
+            }
+        });
+    }
+
+    /// Change the selected layer locally and push it to the backend (one undo step).
+    fn edit_layer(self, f: impl FnOnce(&mut Layer) + 'static) {
+        let Some(id) = self.selected.get_untracked() else {
             return;
         };
-        project.with_untracked(|p| {
+        let mut edited = None;
+        self.project.update(|p| {
+            if let Some(l) = p.layer_mut(id) {
+                f(l);
+                edited = Some(l.clone());
+            }
+        });
+        if let Some(l) = edited {
+            self.call("update_layer", json!({ "layer": l }), None);
+        }
+    }
+
+    fn undo(self) {
+        if !self.can_undo.get_untracked() {
+            return;
+        }
+        self.call("undo", json!({}), Some("Undone"));
+    }
+
+    fn redo(self) {
+        if !self.can_redo.get_untracked() {
+            return;
+        }
+        self.call("redo", json!({}), Some("Redone"));
+    }
+
+    fn fit_view(self) {
+        let Some(c) = self.viewport.get_untracked() else {
+            return;
+        };
+        self.project.with_untracked(|p| {
             if let Some(f) = &p.footage {
-                view.set(View::fit(
+                self.view.set(View::fit(
                     f.width as f64,
                     f.height as f64,
                     c.client_width() as f64,
@@ -135,290 +308,177 @@ fn App() -> impl IntoView {
                 ));
             }
         });
-    };
+    }
 
-    // Apply a project returned by the backend.
-    let apply_project = move |p: Project| {
-        let n = p.footage.as_ref().map_or(0, |f| f.frames.len());
-        project.set(p);
-        if frame.get_untracked() >= n {
-            frame.set(n.saturating_sub(1));
-        }
-        let ids: Vec<u32> = project.with_untracked(|p| p.layers.iter().map(|l| l.id).collect());
-        if let Some(s) = selected.get_untracked() {
-            if !ids.contains(&s) {
-                selected.set(ids.last().copied());
-            }
-        }
-    };
-
-    // Run a command that returns a Project.
-    let run_project_cmd =
-        move |cmd: &'static str, args: serde_json::Value, ok_msg: Option<&'static str>| {
-            spawn_local(async move {
-                match tauri::call::<Project>(cmd, args).await {
-                    Ok(p) => {
-                        apply_project(p);
-                        if let Some(m) = ok_msg {
-                            say(m.into(), false);
-                        }
-                    }
-                    Err(e) => say(e, true),
-                }
-            });
-        };
-
-    // Edit the selected layer locally and push it to the backend.
-    let edit_layer = move |f: Box<dyn FnOnce(&mut Layer)>| {
-        let Some(id) = selected.get_untracked() else {
-            return;
-        };
-        let mut edited = None;
-        project.update(|p| {
-            if let Some(l) = p.layer_mut(id) {
-                f(l);
-                edited = Some(l.clone());
-            }
-        });
-        if let Some(l) = edited {
-            run_project_cmd("update_layer", json!({ "layer": l }), None);
-        }
-    };
-
-    // ---- startup ----
-    spawn_local(async move {
-        if !tauri::in_tauri() {
-            say(
-                "Preview mode: start with `cargo tauri dev` to load footage".into(),
-                true,
-            );
-            return;
-        }
-        if let Ok(p) = tauri::call::<Project>("get_project", json!({})).await {
-            apply_project(p);
-        }
-        if let Ok(s) = tauri::call::<AppSettings>("get_settings", json!({})).await {
-            export_format.set(s.default_format);
-            settings.set(s);
-        }
-    });
-
-    tauri::listen::<TrackFrameEvent>("track-frame", move |e| {
-        project.update(|p| {
-            if let Some(l) = p.layer_mut(e.layer_id) {
-                l.tracks.insert(e.frame, e.track.clone());
-            }
-        });
-        frame.set(e.frame);
-        status.set(format!(
-            "Tracking… frame {}  ({} points, {:.2}px error)",
-            e.frame, e.track.inliers, e.track.rms_error
-        ));
-        status_err.set(false);
-    });
-    tauri::listen::<Project>("project-changed", move |p| {
-        apply_project(p);
-        say(
-            "Footage loaded. Choose Draw Shape (D) and outline a flat surface".into(),
-            false,
-        );
-    });
-    tauri::listen::<String>("app-error", move |m| say(m, true));
-    tauri::listen::<String>("app-status", move |m| say(m, false));
-    tauri::listen::<TrackDoneEvent>("track-done", move |e| {
-        tracking.set(false);
-        say(e.message, !e.ok);
-        spawn_local(async move {
-            if let Ok(p) = tauri::call::<Project>("get_project", json!({})).await {
-                apply_project(p);
-            }
-        });
-    });
-
-    // ---- rendering ----
-    Effect::new(move |_| {
-        redraw.track();
-        let Some(canvas) = viewport_ref.get() else {
-            return;
-        };
-        let fr = frame.get();
-        let draft_pts = draft.get();
-        let scene_view = view.get();
-        let (sel, t, hv) = (selected.get(), tool.get(), hover.get());
-        let ov = Overlays {
-            surface: show_surface.get(),
-            grid: show_grid.get(),
-            points: show_points.get(),
-            shapes: show_shapes.get(),
-        };
-        project.with(|p| {
-            let bump = move || redraw.update(|n| *n = n.wrapping_add(1));
-            let img = frame_image(p, fr, bump);
-            // Preload upcoming frames for smooth scrubbing and playback.
-            for k in 1..=3 {
-                let _ = frame_image(p, fr + k, || {});
-            }
-            if fr > 0 {
-                let _ = frame_image(p, fr - 1, || {});
-            }
-            let scene = Scene {
-                project: p,
-                frame: fr,
-                selected: sel,
-                tool: t,
-                draft: &draft_pts,
-                hover: hv,
-                view: scene_view,
-                overlays: ov,
-            };
-            draw_viewport(&canvas, &scene, img);
-        });
-    });
-    Effect::new(move |_| {
-        redraw.track();
-        let Some(canvas) = timeline_ref.get() else {
-            return;
-        };
-        let (fr, sel) = (frame.get(), selected.get());
-        project.with(|p| draw_timeline(&canvas, p, fr, sel));
-    });
-    let _resize = window_event_listener(ev::resize, move |_| {
-        redraw.update(|n| *n = n.wrapping_add(1))
-    });
-
-    // Fit the view whenever new footage is loaded.
-    Effect::new(move |prev: Option<String>| {
-        let src = project.with(|p| {
-            p.footage
-                .as_ref()
-                .map(|f| f.source.clone())
-                .unwrap_or_default()
-        });
-        if prev.as_deref() != Some(src.as_str()) && !src.is_empty() {
-            fit_view();
-        }
-        src
-    });
-
-    // ---- actions ----
-    let open_footage = move |kind: &'static str| {
-        say(
-            "Opening footage… (video is decoded to frames first)".into(),
-            false,
-        );
-        run_project_cmd(
+    fn open_footage(self, kind: &'static str) {
+        self.say("Opening footage… (video is decoded to frames first)", false);
+        self.call(
             "open_footage",
             json!({ "kind": kind, "path": null }),
             Some("Footage loaded. Choose Draw Shape (D) and outline a flat surface"),
         );
-    };
+    }
 
-    let start_track = move |direction: i32, steps: Option<usize>| {
-        if tracking.get_untracked() {
+    /// Run `action` now, or ask about unsaved changes first.
+    fn guard(self, action: Pending) {
+        if self.dirty.get_untracked()
+            && self
+                .project
+                .with_untracked(|p| p.footage.is_some() || !p.layers.is_empty())
+        {
+            self.modal.set(Modal::Unsaved(action));
+        } else {
+            self.perform(action);
+        }
+    }
+
+    fn perform(self, action: Pending) {
+        self.modal.set(Modal::None);
+        match action {
+            Pending::Close => spawn_local(async move {
+                let _ = tauri::call::<()>("quit_app", json!({})).await;
+            }),
+            Pending::New => {
+                self.selected.set(None);
+                self.call("new_project", json!({}), Some("New project"));
+            }
+            Pending::OpenProject(path) => {
+                self.selected.set(None);
+                self.call(
+                    "open_project",
+                    json!({ "path": path }),
+                    Some("Project opened"),
+                );
+            }
+        }
+    }
+
+    /// Save; `then(true)` runs after a successful save.
+    fn save_then(self, save_as: bool, then: impl FnOnce(bool) + 'static) {
+        spawn_local(async move {
+            match tauri::call::<Option<AppView>>("save_project", json!({ "saveAs": save_as })).await
+            {
+                Ok(Some(v)) => {
+                    let p = v.path.clone().unwrap_or_default();
+                    self.apply_view(v);
+                    self.say(format!("Saved {p}"), false);
+                    then(true);
+                }
+                Ok(None) => then(false),
+                Err(e) => {
+                    self.say(e, true);
+                    then(false);
+                }
+            }
+        });
+    }
+
+    fn save(self, save_as: bool) {
+        self.save_then(save_as, |_| {});
+    }
+
+    fn start_track(self, direction: i32, steps: Option<usize>) {
+        if self.tracking.get_untracked() {
             return;
         }
-        let Some(id) = selected.get_untracked() else {
-            say("Select or draw a layer to track".into(), true);
+        let Some(id) = self.selected.get_untracked() else {
+            self.say("Select or draw a layer to track", true);
             return;
         };
-        let fr = frame.get_untracked();
-        let tracked = project.with_untracked(|p| {
+        let fr = self.frame.get_untracked();
+        let (tracked, linked) = self.project.with_untracked(|p| {
             p.layer(id)
-                .map(|l| l.tracks.contains_key(&fr))
-                .unwrap_or(false)
+                .map(|l| (l.tracks.contains_key(&fr), l.link.is_some()))
+                .unwrap_or((false, false))
         });
-        if !tracked {
-            say("This frame isn't tracked for the layer. Move to a tracked frame (coloured on the timeline)".into(), true);
+        if linked {
+            self.say("This layer follows another layer's motion. Set Motion source to “Own track” to track it", true);
             return;
         }
-        tracking.set(true);
-        say("Tracking…".into(), false);
+        if !tracked {
+            self.say("This frame isn't tracked for the layer. Move to a tracked frame (coloured on the timeline)", true);
+            return;
+        }
+        self.tracking.set(true);
+        self.say("Tracking…", false);
         spawn_local(async move {
             let args = json!({ "id": id, "from": fr, "direction": direction, "steps": steps });
             if let Err(e) = tauri::call::<()>("start_tracking", args).await {
-                tracking.set(false);
-                say(e, true);
+                self.tracking.set(false);
+                self.say(e, true);
             }
         });
-    };
-    let stop_track = move || {
+    }
+
+    fn stop_track(self) {
         spawn_local(async move {
             let _ = tauri::call::<()>("stop_tracking", json!({})).await;
         });
-    };
+    }
 
-    let finish_draft = move || {
-        let pts = draft.get_untracked();
+    fn finish_draft(self) {
+        let pts = self.draft.get_untracked();
         if pts.len() < 3 {
-            say("A shape needs at least 3 points".into(), true);
+            self.say("A shape needs at least 3 points", true);
             return;
         }
-        draft.set(vec![]);
-        let fr = frame.get_untracked();
+        self.draft.set(vec![]);
+        let fr = self.frame.get_untracked();
         spawn_local(async move {
-            match tauri::call::<Project>("add_layer", json!({ "frame": fr, "points": pts })).await {
-                Ok(p) => {
-                    let id = p.layers.last().map(|l| l.id);
-                    apply_project(p);
-                    selected.set(id);
-                    tool.set(Tool::Surface);
-                    say("Layer created. Adjust the blue surface corners if needed, then Track Forward (Shift+→ steps)".into(), false);
+            match tauri::call::<AppView>("add_layer", json!({ "frame": fr, "points": pts })).await {
+                Ok(v) => {
+                    let id = v.project.layers.last().map(|l| l.id);
+                    self.apply_view(v);
+                    self.selected.set(id);
+                    self.tool.set(Tool::Surface);
+                    self.say("Layer created. Adjust the blue surface corners if needed, then Track Forward (Shift+→ steps)", false);
                 }
-                Err(e) => say(e, true),
+                Err(e) => self.say(e, true),
             }
         });
-    };
+    }
 
-    let step_frame = move |d: i64| {
-        let n = frame_count() as i64;
+    fn step_frame(self, d: i64) {
+        let n = self.frame_count_untracked() as i64;
         if n == 0 {
             return;
         }
-        frame.update(|f| *f = (*f as i64 + d).clamp(0, n - 1) as usize);
-    };
+        self.frame
+            .update(|f| *f = (*f as i64 + d).clamp(0, n - 1) as usize);
+    }
 
-    let toggle_play = move || {
-        if playing.get_untracked() {
-            playing.set(false);
-            if let Some(h) = play_handle.get_value() {
+    fn toggle_play(self) {
+        if self.playing.get_untracked() {
+            self.playing.set(false);
+            if let Some(h) = self.play_handle.get_value() {
                 h.clear();
             }
-            play_handle.set_value(None);
+            self.play_handle.set_value(None);
             return;
         }
-        let fps = project
+        let fps = self
+            .project
             .with_untracked(|p| p.footage.as_ref().map_or(24.0, |f| f.fps))
             .clamp(1.0, 120.0);
-        playing.set(true);
+        self.playing.set(true);
         let h = set_interval_with_handle(
             move || {
-                let n = frame_count();
+                let n = self.frame_count_untracked();
                 if n > 0 {
-                    frame.update(|f| *f = (*f + 1) % n);
+                    self.frame.update(|f| *f = (*f + 1) % n);
                 }
             },
             Duration::from_millis((1000.0 / fps) as u64),
         );
-        play_handle.set_value(h.ok());
-    };
+        self.play_handle.set_value(h.ok());
+    }
 
-    let save = move |save_as: bool| {
-        spawn_local(async move {
-            match tauri::call::<Option<String>>("save_project", json!({ "saveAs": save_as })).await
-            {
-                Ok(Some(p)) => say(format!("Saved {p}"), false),
-                Ok(None) => {}
-                Err(e) => say(e, true),
-            }
-        });
-    };
-
-    let do_export = move |destination: &'static str| {
-        let Some(id) = selected.get_untracked() else {
-            say("Select a tracked layer to export".into(), true);
+    fn export(self, destination: &'static str) {
+        let Some(id) = self.selected.get_untracked() else {
+            self.say("Select a tracked layer to export", true);
             return;
         };
-        let fmt = export_format.get_untracked();
+        let fmt = self.export_format.get_untracked();
         spawn_local(async move {
             match tauri::call::<Option<String>>(
                 "export_layer",
@@ -426,138 +486,833 @@ fn App() -> impl IntoView {
             )
             .await
             {
-                Ok(Some(p)) => say(format!("Exported to {p}"), false),
+                Ok(Some(p)) => self.say(format!("Exported to {p}"), false),
                 Ok(None) => {}
-                Err(e) => say(e, true),
+                Err(e) => self.say(e, true),
             }
         });
-    };
+    }
 
-    let change_dir = move |which: &'static str| {
+    fn change_dir(self, which: &'static str) {
         spawn_local(async move {
             let title = format!("Choose the {which} import folder");
             if let Ok(Some(dir)) =
                 tauri::call::<Option<String>>("pick_folder", json!({ "title": title })).await
             {
-                let mut s = settings.get_untracked();
+                let mut s = self.settings.get_untracked();
                 match which {
                     "Reelforge" => s.reelforge_dir = dir,
                     "Forma3D" => s.forma3d_dir = dir,
                     _ => s.tidefire_dir = dir,
                 }
                 match tauri::call::<AppSettings>("set_settings", json!({ "settings": s })).await {
-                    Ok(s) => settings.set(s),
-                    Err(e) => say(e, true),
+                    Ok(s) => self.settings.set(s),
+                    Err(e) => self.say(e, true),
                 }
             }
         });
-    };
+    }
+
+    fn duplicate_selected(self) {
+        let Some(id) = self.selected.get_untracked() else {
+            return;
+        };
+        spawn_local(async move {
+            match tauri::call::<AppView>("duplicate_layer", json!({ "id": id })).await {
+                Ok(v) => {
+                    let new_id = v.project.next_layer_id.saturating_sub(1);
+                    self.apply_view(v);
+                    self.selected.set(Some(new_id));
+                    self.say("Layer duplicated", false);
+                }
+                Err(e) => self.say(e, true),
+            }
+        });
+    }
+
+    fn delete_selected_point(self) {
+        let Some(i) = self.sel_point.get_untracked() else {
+            return;
+        };
+        let n = self.selected.get_untracked().and_then(|id| {
+            self.project
+                .with_untracked(|p| p.layer(id).map(|l| l.shape.points.len()))
+        });
+        if n.unwrap_or(0) <= 3 {
+            self.say("A shape needs at least 3 points", true);
+            return;
+        }
+        self.sel_point.set(None);
+        self.edit_layer(move |l| {
+            if i < l.shape.points.len() {
+                l.shape.points.remove(i);
+            }
+        });
+    }
+
+    fn choose_insert(self, kind: &'static str) {
+        let Some(id) = self.selected.get_untracked() else {
+            return;
+        };
+        let start = self.frame.get_untracked();
+        self.say("Loading insert…", false);
+        spawn_local(async move {
+            match tauri::call::<Option<AppView>>(
+                "choose_insert",
+                json!({ "id": id, "kind": kind, "start": start }),
+            )
+            .await
+            {
+                Ok(Some(v)) => {
+                    self.apply_view(v);
+                    self.show_inserts.set(true);
+                    self.say(
+                        "Insert pinned to the surface. Scrub or play to check the track",
+                        false,
+                    );
+                }
+                Ok(None) => self.say("Ready", false),
+                Err(e) => self.say(e, true),
+            }
+        });
+    }
+
+    fn use_proxy(self) -> bool {
+        match self.viewer_res.get() {
+            ViewerRes::Full => false,
+            ViewerRes::Proxy => true,
+            ViewerRes::Auto => self.playing.get() || self.scrubbing.get() || self.tracking.get(),
+        }
+    }
+
+    /// File to display for `frame`: a proxy when wanted and available, else the original.
+    fn display_path(self, p: &Project, frame: usize, proxy: bool) -> Option<String> {
+        let f = p.footage.as_ref()?;
+        let original = f.frames.get(frame)?;
+        if proxy {
+            let info = self.proxy.get_untracked();
+            if let Some(prefix) = info.prefix.as_ref() {
+                if info.total == f.frames.len() && frame < info.ready {
+                    return Some(format!("{prefix}{frame:06}.jpg"));
+                }
+            }
+        }
+        Some(original.clone())
+    }
+}
+
+fn main() {
+    console_error_panic_hook::set_once();
+    leptos::mount::mount_to_body(App);
+}
+
+// ---------------------------------------------------------------------------
+// App
+
+#[component]
+fn App() -> impl IntoView {
+    let ctx = Ctx::new();
+    provide_context(ctx);
+
+    // ---- backend events & startup ----
+    tauri::listen::<TrackFrameEvent>("track-frame", move |e| {
+        ctx.project.update(|p| {
+            if let Some(l) = p.layer_mut(e.layer_id) {
+                l.tracks.insert(e.frame, e.track.clone());
+            }
+        });
+        ctx.frame.set(e.frame);
+        ctx.say(
+            format!(
+                "Tracking… frame {}  ({} points, {:.2}px error)",
+                e.frame, e.track.inliers, e.track.rms_error
+            ),
+            false,
+        );
+    });
+    tauri::listen::<TrackDoneEvent>("track-done", move |e| {
+        ctx.tracking.set(false);
+        ctx.say(e.message, !e.ok);
+        spawn_local(async move {
+            if let Ok(v) = tauri::call::<AppView>("get_view", json!({})).await {
+                ctx.apply_view(v);
+            }
+        });
+    });
+    tauri::listen::<AppView>("view-changed", move |v| {
+        ctx.apply_view(v);
+        ctx.say(
+            "Opened. Choose Draw Shape (D) and outline a flat surface",
+            false,
+        );
+    });
+    tauri::listen::<ProxyInfo>("proxy-progress", move |p| ctx.proxy.set(p));
+    tauri::listen::<String>("app-error", move |m| ctx.say(m, true));
+    tauri::listen::<String>("app-status", move |m| ctx.say(m, false));
+    tauri::listen::<serde_json::Value>("confirm-close", move |_| ctx.guard(Pending::Close));
+
+    spawn_local(async move {
+        if !tauri::in_tauri() {
+            ctx.say(
+                "Preview mode: start with `cargo tauri dev` to load footage",
+                true,
+            );
+            return;
+        }
+        if let Ok(v) = tauri::call::<AppView>("get_view", json!({})).await {
+            ctx.apply_view(v);
+        }
+        if let Ok(s) = tauri::call::<AppSettings>("get_settings", json!({})).await {
+            ctx.export_format.set(s.default_format);
+            ctx.settings.set(s);
+        }
+        if let Ok(Some(info)) =
+            tauri::call::<Option<RecoveryInfo>>("recovery_info", json!({})).await
+        {
+            ctx.modal.set(Modal::Recovery(info));
+        }
+    });
+
+    // Refit and refresh proxy status whenever new footage is loaded.
+    Effect::new(move |prev: Option<String>| {
+        let src = ctx.project.with(|p| {
+            p.footage
+                .as_ref()
+                .map(|f| f.source.clone())
+                .unwrap_or_default()
+        });
+        if prev.as_deref() != Some(src.as_str()) && !src.is_empty() {
+            ctx.fit_view();
+            spawn_local(async move {
+                if let Ok(p) = tauri::call::<ProxyInfo>("get_proxy_info", json!({})).await {
+                    ctx.proxy.set(p);
+                }
+            });
+        }
+        src
+    });
+
+    // ---- rendering ----
+    Effect::new(move |_| {
+        ctx.redraw.track();
+        let Some(canvas) = ctx.viewport.get() else {
+            return;
+        };
+        let fr = ctx.frame.get();
+        let draft_pts = ctx.draft.get();
+        let use_proxy = ctx.use_proxy();
+        ctx.proxy.track();
+        let ov = Overlays {
+            surface: ctx.show_surface.get(),
+            grid: ctx.show_grid.get(),
+            points: ctx.show_points.get(),
+            shapes: ctx.show_shapes.get(),
+            inserts: ctx.show_inserts.get(),
+        };
+        let (sel, sel_point, tool, hover, view) = (
+            ctx.selected.get(),
+            ctx.sel_point.get(),
+            ctx.tool.get(),
+            ctx.hover.get(),
+            ctx.view.get(),
+        );
+        let playing = ctx.playing.get();
+        ctx.project.with(|p| {
+            let bump = move || ctx.bump();
+            let img = ctx
+                .display_path(p, fr, use_proxy)
+                .and_then(|path| image_for(&path, bump));
+            // Preload upcoming frames for smooth scrubbing and playback.
+            let ahead = if playing { 8 } else { 3 };
+            for k in 1..=ahead {
+                if let Some(path) = ctx.display_path(p, fr + k, use_proxy) {
+                    let _ = image_for(&path, || {});
+                }
+            }
+            if fr > 0 {
+                if let Some(path) = ctx.display_path(p, fr - 1, use_proxy) {
+                    let _ = image_for(&path, || {});
+                }
+            }
+            let mut inserts = vec![];
+            if ov.inserts {
+                for l in p.layers.iter().filter(|l| l.visible) {
+                    if let Some(path) = l.insert.as_ref().and_then(|i| i.frame_for(fr)) {
+                        if let Some(img) = image_for(path, bump) {
+                            inserts.push((l.id, img));
+                        }
+                        if let Some(next) = l.insert.as_ref().and_then(|i| i.frame_for(fr + 1)) {
+                            let _ = image_for(next, || {});
+                        }
+                    }
+                }
+            }
+            let scene = Scene {
+                project: p,
+                frame: fr,
+                selected: sel,
+                sel_point,
+                tool,
+                draft: &draft_pts,
+                hover,
+                view,
+                overlays: ov,
+                inserts,
+            };
+            draw_viewport(&canvas, &scene, img);
+        });
+    });
+    Effect::new(move |_| {
+        ctx.redraw.track();
+        let Some(canvas) = ctx.timeline.get() else {
+            return;
+        };
+        let (fr, sel) = (ctx.frame.get(), ctx.selected.get());
+        ctx.project.with(|p| draw_timeline(&canvas, p, fr, sel));
+    });
+    let _resize = window_event_listener(ev::resize, move |_| ctx.bump());
+    let _up = window_event_listener(ev::mouseup, move |_| {
+        if ctx.scrubbing.get_untracked() {
+            ctx.scrubbing.set(false);
+        }
+    });
 
     // ---- keyboard ----
     let _keys = window_event_listener(ev::keydown, move |e: web_sys::KeyboardEvent| {
         let in_field = e
             .target()
-            .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
             .map(|el| matches!(el.tag_name().as_str(), "INPUT" | "SELECT" | "TEXTAREA"))
             .unwrap_or(false);
         if in_field {
             return;
         }
-        let key = e.key();
+        let key = e.key().to_lowercase();
+        let cmd = e.ctrl_key() || e.meta_key();
+        if cmd {
+            let handled = match key.as_str() {
+                "z" if e.shift_key() => {
+                    ctx.redo();
+                    true
+                }
+                "z" => {
+                    ctx.undo();
+                    true
+                }
+                "y" => {
+                    ctx.redo();
+                    true
+                }
+                "s" => {
+                    ctx.save(e.shift_key());
+                    true
+                }
+                "o" => {
+                    ctx.guard(Pending::OpenProject(None));
+                    true
+                }
+                "n" => {
+                    ctx.guard(Pending::New);
+                    true
+                }
+                "d" => {
+                    ctx.duplicate_selected();
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                e.prevent_default();
+            }
+            return;
+        }
         match key.as_str() {
-            "ArrowRight" if e.shift_key() => start_track(1, Some(1)),
-            "ArrowLeft" if e.shift_key() => start_track(-1, Some(1)),
-            "ArrowRight" => step_frame(1),
-            "ArrowLeft" => step_frame(-1),
-            "Home" => frame.set(0),
-            "End" => frame.set(frame_count().saturating_sub(1)),
+            "arrowright" if e.shift_key() => ctx.start_track(1, Some(1)),
+            "arrowleft" if e.shift_key() => ctx.start_track(-1, Some(1)),
+            "arrowright" => ctx.step_frame(1),
+            "arrowleft" => ctx.step_frame(-1),
+            "home" => ctx.frame.set(0),
+            "end" => ctx.frame.set(ctx.frame_count_untracked().saturating_sub(1)),
             " " => {
                 e.prevent_default();
-                toggle_play();
+                ctx.toggle_play();
             }
-            "Escape" => {
-                if tracking.get_untracked() {
-                    stop_track();
+            "escape" => {
+                if ctx.tracking.get_untracked() {
+                    ctx.stop_track();
                 }
-                draft.set(vec![]);
+                ctx.draft.set(vec![]);
+                ctx.sel_point.set(None);
+                ctx.recent_open.set(false);
             }
-            "Enter" if !draft.get_untracked().is_empty() => finish_draft(),
-            "d" | "D" => tool.set(Tool::Draw),
-            "e" | "E" => tool.set(Tool::EditShape),
-            "s" | "S" if !e.ctrl_key() => tool.set(Tool::Surface),
-            "h" | "H" => tool.set(Tool::Pan),
-            "f" | "F" => fit_view(),
-            "s" if e.ctrl_key() => {
-                e.prevent_default();
-                save(false);
+            "enter" if !ctx.draft.get_untracked().is_empty() => ctx.finish_draft(),
+            "delete" | "backspace" if ctx.tool.get_untracked() == Tool::EditShape => {
+                ctx.delete_selected_point()
             }
+            "d" => ctx.tool.set(Tool::Draw),
+            "e" => ctx.tool.set(Tool::EditShape),
+            "s" => ctx.tool.set(Tool::Surface),
+            "h" => ctx.tool.set(Tool::Pan),
+            "f" => ctx.fit_view(),
             _ => {}
         }
     });
 
-    // ---- viewport mouse ----
+    view! {
+        <div class="app">
+            <TopBar/>
+            <LeftPanel/>
+            <Viewport/>
+            <RightPanel/>
+            <Bottom/>
+            <Modals/>
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top bar
+
+#[component]
+fn TopBar() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let tool_btn = move |t: Tool, label: &'static str, key: &'static str| {
+        view! {
+            <button class="tool" class:active=move || ctx.tool.get() == t title=format!("{label} ({key})")
+                on:click=move |_| { ctx.tool.set(t); if t != Tool::Draw { ctx.draft.set(vec![]); ctx.hover.set(None); } }>
+                {label}<kbd>{key}</kbd>
+            </button>
+        }
+    };
+    let title = move || {
+        let name = ctx
+            .path
+            .get()
+            .map(|p| file_name(&p))
+            .unwrap_or_else(|| "Untitled".into());
+        format!("{name}{}", if ctx.dirty.get() { " •" } else { "" })
+    };
+
+    view! {
+        <header class="topbar">
+            <div class="brand"><span class="logo">"◆"</span>"Trackwright"<span class="doc" title=move || ctx.path.get().unwrap_or_default()>{title}</span></div>
+            <div class="group">
+                <button title="New project (Ctrl+N)" on:click=move |_| ctx.guard(Pending::New)>"New"</button>
+                <button on:click=move |_| ctx.open_footage("file")>"Open Footage…"</button>
+                <button on:click=move |_| ctx.open_footage("folder")>"Sequence Folder…"</button>
+                <button title="Open project (Ctrl+O)" on:click=move |_| ctx.guard(Pending::OpenProject(None))>"Open Project…"</button>
+                <div class="menu-wrap">
+                    <button disabled=move || ctx.recent.get().is_empty() on:click=move |_| ctx.recent_open.update(|v| *v = !*v)>"Recent ▾"</button>
+                    <Show when=move || ctx.recent_open.get()>
+                        <div class="menu-backdrop" on:click=move |_| ctx.recent_open.set(false)></div>
+                        <ul class="menu">
+                            {move || ctx.recent.get().into_iter().map(|p| {
+                                let name = file_name(&p);
+                                let full = p.clone();
+                                view! {
+                                    <li title=full.clone() on:click=move |_| { ctx.recent_open.set(false); ctx.guard(Pending::OpenProject(Some(full.clone()))); }>
+                                        <span>{name}</span><small>{p.clone()}</small>
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ul>
+                    </Show>
+                </div>
+                <button title="Save (Ctrl+S)" on:click=move |_| ctx.save(false)>"Save"</button>
+                <button title="Save As (Ctrl+Shift+S)" on:click=move |_| ctx.save(true)>"Save As…"</button>
+            </div>
+            <div class="group">
+                <button title="Undo (Ctrl+Z)" disabled=move || !ctx.can_undo.get() || ctx.tracking.get() on:click=move |_| ctx.undo()>"↶ Undo"</button>
+                <button title="Redo (Ctrl+Shift+Z / Ctrl+Y)" disabled=move || !ctx.can_redo.get() || ctx.tracking.get() on:click=move |_| ctx.redo()>"↷ Redo"</button>
+            </div>
+            <div class="group tools">
+                {tool_btn(Tool::Pan, "Pan", "H")}
+                {tool_btn(Tool::Draw, "Draw", "D")}
+                {tool_btn(Tool::EditShape, "Edit Shape", "E")}
+                {tool_btn(Tool::Surface, "Surface", "S")}
+            </div>
+            <div class="spacer"></div>
+            <button on:click=move |_| ctx.modal.set(Modal::About)>"About"</button>
+        </header>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Left panel: layers, layer, insert, track settings
+
+#[component]
+fn LeftPanel() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let sel_layer = move || {
+        ctx.selected
+            .get()
+            .and_then(|id| ctx.project.with(|p| p.layer(id).cloned()))
+    };
+
+    let commit_rename = move |id: u32, name: String| {
+        ctx.renaming.set(None);
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        ctx.selected.set(Some(id));
+        ctx.edit_layer(move |l| l.name = name);
+    };
+
+    view! {
+        <aside class="panel left">
+            <section>
+                <h3>"Layers"
+                    <span class="h-actions">
+                        <button class="small" title="Duplicate selected layer (Ctrl+D)" disabled=move || ctx.selected.get().is_none() on:click=move |_| ctx.duplicate_selected()>"Duplicate"</button>
+                        <button class="small" on:click=move |_| { ctx.tool.set(Tool::Draw); ctx.say("Click points around a flat surface; click the first point (or Enter) to close", false); }>"+ New"</button>
+                    </span>
+                </h3>
+                <ul class="layers">
+                    {move || ctx.project.with(|p| p.layers.iter().map(|l| {
+                        let id = l.id;
+                        let name = l.name.clone();
+                        let color = l.color.clone();
+                        let vis = l.visible;
+                        let tracked = l.tracks.len();
+                        let parent = l.link.and_then(|pid| p.layer(pid).map(|pl| pl.name.clone()));
+                        let has_insert = l.insert.is_some();
+                        let editing = ctx.renaming.get() == Some(id);
+                        view! {
+                            <li class:selected=move || ctx.selected.get() == Some(id) on:click=move |_| { if ctx.selected.get_untracked() != Some(id) { ctx.sel_point.set(None); } ctx.selected.set(Some(id)) }>
+                                <span class="swatch" style=format!("background:{color}")></span>
+                                {if editing {
+                                    let start = name.clone();
+                                    view! {
+                                        <input id="rename-input" class="rename" type="text" prop:value=start
+                                            on:click=|e| e.stop_propagation()
+                                            on:keydown=move |e: web_sys::KeyboardEvent| {
+                                                e.stop_propagation();
+                                                if e.key() == "Enter" { commit_rename(id, event_target_value(&e)); }
+                                                if e.key() == "Escape" { ctx.renaming.set(None); }
+                                            }
+                                            on:blur=move |e| { if ctx.renaming.get_untracked() == Some(id) { commit_rename(id, event_target_value(&e)); } } />
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <span class="lname" title="Double-click to rename" on:dblclick=move |e| {
+                                            e.stop_propagation();
+                                            ctx.renaming.set(Some(id));
+                                            request_animation_frame(|| {
+                                                if let Some(el) = document().get_element_by_id("rename-input") {
+                                                    if let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() {
+                                                        let _ = input.focus();
+                                                        input.select();
+                                                    }
+                                                }
+                                            });
+                                        }>
+                                            {name.clone()}
+                                            {parent.map(|pn| view! { <small class="link">{format!("↳ {pn}")}</small> })}
+                                        </span>
+                                    }.into_any()
+                                }}
+                                {has_insert.then(|| view! { <span class="badge" title="Has an insert">"▣"</span> })}
+                                <span class="muted">{format!("{tracked}f")}</span>
+                                <button class="icon" title="Show / hide" on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    ctx.selected.set(Some(id));
+                                    ctx.edit_layer(|l| l.visible = !l.visible);
+                                }>{if vis { "👁" } else { "–" }}</button>
+                                <button class="icon" title="Delete layer" on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    ctx.call("delete_layer", json!({ "id": id }), Some("Layer deleted (Ctrl+Z to undo)"));
+                                }>"✕"</button>
+                            </li>
+                        }
+                    }).collect_view())}
+                </ul>
+            </section>
+
+            {move || sel_layer().map(|l| view! {
+                <LayerSection layer=l.clone()/>
+                <InsertSection layer=l.clone()/>
+                <TrackSettingsSection layer=l/>
+            })}
+        </aside>
+    }
+}
+
+#[component]
+fn LayerSection(layer: Layer) -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let l = layer;
+    let id = l.id;
+    let name = l.name.clone();
+    let ref_label = ctx.project.with_untracked(|p| {
+        p.footage
+            .as_ref()
+            .map_or(0, |f| f.frame_number(l.ref_frame))
+    });
+    let others: Vec<(u32, String)> = ctx.project.with_untracked(|p| {
+        p.layers
+            .iter()
+            .filter(|o| o.id != id)
+            .map(|o| (o.id, o.name.clone()))
+            .collect()
+    });
+    let link = l.link;
+    let linked = link.is_some();
+    view! {
+        <section>
+            <h3>"Layer"</h3>
+            <label class="field">"Name"
+                <input type="text" prop:value=name on:change=move |ev| { let v = event_target_value(&ev); ctx.edit_layer(move |l| l.name = v); } />
+            </label>
+            <label class="field">"Motion source"
+                <select on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    let parent: Option<u32> = v.parse().ok();
+                    ctx.call("set_link", json!({ "id": id, "parent": parent }), Some(if parent.is_some() { "Layer now follows the chosen layer" } else { "Layer tracks on its own again" }));
+                }>
+                    <option value="" selected=!linked>"Own track"</option>
+                    {others.into_iter().map(|(oid, oname)| view! {
+                        <option value=oid.to_string() selected=link == Some(oid)>{format!("Follow {oname}")}</option>
+                    }).collect_view()}
+                </select>
+            </label>
+            <p class="muted">{format!("Reference frame {ref_label}")}</p>
+            <div class="row">
+                <button on:click=move |_| ctx.call("set_reference_frame", json!({ "id": id, "frame": ctx.frame.get_untracked() }), Some("Reference frame set"))>"Set Reference Here"</button>
+            </div>
+            <div class="row">
+                <button disabled=linked on:click=move |_| ctx.call("clear_track", json!({ "id": id, "frame": ctx.frame.get_untracked(), "forward": false }), Some("Cleared track before this frame"))>"Clear ◀"</button>
+                <button disabled=linked on:click=move |_| ctx.call("clear_track", json!({ "id": id, "frame": null, "forward": true }), Some("Track cleared"))>"Clear All"</button>
+                <button disabled=linked on:click=move |_| ctx.call("clear_track", json!({ "id": id, "frame": ctx.frame.get_untracked(), "forward": true }), Some("Cleared track after this frame"))>"Clear ▶"</button>
+            </div>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=l.shape.smooth on:change=move |_| ctx.edit_layer(|l| l.shape.smooth = !l.shape.smooth) />
+                "Smooth (spline) outline"
+            </label>
+            <button class="wide" on:click=move |_| ctx.edit_layer(|l| l.surface = trackwright_core::shape::default_surface(&l.shape))>"Reset Surface to Shape Bounds"</button>
+            <p class="hint">"Edit Shape (E): drag points, click an edge to add a point, drag inside to move the shape, Delete removes the selected point. Surface (S): drag corners or drag inside to move it."</p>
+        </section>
+    }
+}
+
+#[component]
+fn InsertSection(layer: Layer) -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let body = match layer.insert.clone() {
+        None => view! {
+            <div class="row">
+                <button on:click=move |_| ctx.choose_insert("file")>"Image / Clip…"</button>
+                <button on:click=move |_| ctx.choose_insert("folder")>"Sequence…"</button>
+            </div>
+            <p class="hint">"Pin a picture or video onto the surface to see how well the track holds."</p>
+        }
+        .into_any(),
+        Some(ins) => {
+            let first = ctx.project.with_untracked(|p| p.footage.as_ref().map_or(0, |f| f.first_frame));
+            let multi = ins.frames.len() > 1;
+            let opacity = ins.opacity;
+            let start_label = first + ins.start_frame as i64;
+            let looped = ins.looped;
+            view! {
+                <p class="fname" title=ins.source.clone()>{file_name(&ins.source)}</p>
+                <p class="muted">{format!("{} × {}{}", ins.width, ins.height, if multi { format!(" · {} frames", ins.frames.len()) } else { String::new() })}</p>
+                <label class="field">{move || format!("Opacity {:.0}%", opacity * 100.0)}
+                    <input type="range" min="0" max="1" step="0.05" prop:value=opacity.to_string() on:change=move |ev| {
+                        if let Ok(v) = event_target_value(&ev).parse::<f64>() {
+                            ctx.edit_layer(move |l| if let Some(i) = l.insert.as_mut() { i.opacity = v.clamp(0.0, 1.0) });
+                        }
+                    } />
+                </label>
+                {multi.then(|| view! {
+                    <div class="row">
+                        <label class="field">"Starts at frame"
+                            <input type="number" step="1" prop:value=start_label.to_string() on:change=move |ev| {
+                                if let Ok(v) = event_target_value(&ev).parse::<i64>() {
+                                    let idx = (v - first).max(0) as usize;
+                                    ctx.edit_layer(move |l| if let Some(i) = l.insert.as_mut() { i.start_frame = idx });
+                                }
+                            } />
+                        </label>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" prop:checked=looped on:change=move |_| ctx.edit_layer(|l| if let Some(i) = l.insert.as_mut() { i.looped = !i.looped }) />
+                        "Loop clip"
+                    </label>
+                })}
+                <div class="row">
+                    <button on:click=move |_| ctx.choose_insert("file")>"Replace…"</button>
+                    <button on:click=move |_| ctx.edit_layer(|l| l.insert = None)>"Remove"</button>
+                </div>
+            }
+            .into_any()
+        }
+    };
+    view! { <section><h3>"Insert Preview"</h3>{body}</section> }
+}
+
+#[component]
+fn TrackSettingsSection(layer: Layer) -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let s = layer.settings.clone();
+    let model = enum_id(s.model);
+    let num = move |label: &'static str,
+                    value: String,
+                    step: &'static str,
+                    apply: fn(&mut Layer, f64)| {
+        view! {
+            <label class="field">{label}
+                <input type="number" step=step prop:value=value on:change=move |ev| {
+                    if let Ok(v) = event_target_value(&ev).parse::<f64>() {
+                        ctx.edit_layer(move |l| apply(l, v));
+                    }
+                } />
+            </label>
+        }
+    };
+    view! {
+        <section class:disabled=layer.link.is_some()>
+            <h3>"Track Settings"</h3>
+            <label class="field">"Motion"
+                <select on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    if let Ok(m) = serde_json::from_value::<MotionModel>(json!(v)) {
+                        ctx.edit_layer(move |l| l.settings.model = m);
+                    }
+                }>
+                    {MotionModel::ALL.iter().map(|m| {
+                        let id = enum_id(*m);
+                        let sel = id == model;
+                        view! { <option value=id.clone() selected=sel>{m.label()}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            {num("Max points", s.max_features.to_string(), "10", |l, v| l.settings.max_features = v.clamp(20.0, 3000.0) as usize)}
+            {num("Min point spacing (px)", s.min_distance.to_string(), "1", |l, v| l.settings.min_distance = v.clamp(2.0, 50.0) as f32)}
+            {num("Search window radius (px)", s.search_radius.to_string(), "1", |l, v| l.settings.search_radius = v.clamp(3.0, 31.0) as i32)}
+            {num("Pyramid levels", s.pyramid_levels.to_string(), "1", |l, v| l.settings.pyramid_levels = v.clamp(1.0, 7.0) as usize)}
+            {num("Inlier threshold (px)", s.ransac_threshold.to_string(), "0.1", |l, v| l.settings.ransac_threshold = v.clamp(0.2, 10.0))}
+            {num("Min good points", s.min_inliers.to_string(), "1", |l, v| l.settings.min_inliers = v.clamp(4.0, 500.0) as usize)}
+            <label class="toggle">
+                <input type="checkbox" prop:checked=s.refine_against_reference on:change=move |_| ctx.edit_layer(|l| l.settings.refine_against_reference = !l.settings.refine_against_reference) />
+                "Anti-drift (re-solve against reference)"
+            </label>
+        </section>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Viewport
+
+#[component]
+fn Viewport() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
     let mouse_pos = |e: &web_sys::MouseEvent| [e.offset_x() as f64, e.offset_y() as f64];
 
     let on_down = move |e: web_sys::MouseEvent| {
         let s = mouse_pos(&e);
-        let v = view.get_untracked();
+        let v = ctx.view.get_untracked();
         let ip = v.to_image(s);
-        if e.button() == 1 || e.button() == 2 || tool.get_untracked() == Tool::Pan || e.alt_key() {
-            if e.button() == 2 && !draft.get_untracked().is_empty() {
-                draft.update(|d| {
-                    d.pop();
-                });
-                return;
-            }
-            drag.set_value(Drag::Pan {
+        let tool = ctx.tool.get_untracked();
+        if e.button() == 2 && !ctx.draft.get_untracked().is_empty() {
+            ctx.draft.update(|d| {
+                d.pop();
+            });
+            return;
+        }
+        if e.button() == 1 || e.button() == 2 || tool == Tool::Pan || e.alt_key() {
+            ctx.drag.set_value(Drag::Pan {
                 start: s,
                 pan: v.pan,
             });
             return;
         }
-        if e.button() != 0 || project.with_untracked(|p| p.footage.is_none()) {
+        if e.button() != 0 || ctx.project.with_untracked(|p| p.footage.is_none()) {
             return;
         }
-        let fr = frame.get_untracked();
+        let fr = ctx.frame.get_untracked();
         let hit_r2 = 9.0f64.powi(2);
-        match tool.get_untracked() {
+        match tool {
             Tool::Draw => {
-                let d = draft.get_untracked();
+                let d = ctx.draft.get_untracked();
                 if d.len() >= 3 && dist2(v.to_screen(d[0]), s) < hit_r2 * 1.5 {
-                    finish_draft();
+                    ctx.finish_draft();
                 } else {
-                    draft.update(|d| d.push(ip));
+                    ctx.draft.update(|d| d.push(ip));
                 }
             }
             Tool::EditShape | Tool::Surface => {
-                if tracking.get_untracked() {
+                if ctx.tracking.get_untracked() {
                     return;
                 }
-                let Some(id) = selected.get_untracked() else {
-                    return;
-                };
-                let hit = project.with_untracked(|p| {
-                    let l = p.layer(id)?;
-                    if tool.get_untracked() == Tool::EditShape {
-                        let sh = l.shape_at(fr)?;
-                        sh.points
-                            .iter()
-                            .position(|&q| dist2(v.to_screen(q), s) < hit_r2)
-                            .map(Drag::ShapePoint)
-                    } else {
-                        let c = l.surface_at(fr)?;
-                        c.iter()
-                            .position(|&q| dist2(v.to_screen(q), s) < hit_r2 * 1.4)
-                            .map(Drag::SurfaceCorner)
-                    }
-                });
-                match hit {
-                    Some(d) => drag.set_value(d),
-                    None => drag.set_value(Drag::Pan {
+                let Some(id) = ctx.selected.get_untracked() else {
+                    ctx.drag.set_value(Drag::Pan {
                         start: s,
                         pan: v.pan,
-                    }),
-                }
+                    });
+                    return;
+                };
+                let drag = if tool == Tool::EditShape {
+                    let shape = ctx
+                        .project
+                        .with_untracked(|p| p.layer(id).and_then(|l| l.shape_at(fr)));
+                    match shape {
+                        None => None,
+                        Some(sh) => {
+                            if let Some(i) = sh
+                                .points
+                                .iter()
+                                .position(|&q| dist2(v.to_screen(q), s) < hit_r2)
+                            {
+                                ctx.sel_point.set(Some(i));
+                                Some(Drag::ShapePoint(i))
+                            } else if let Some((seg, q, d)) =
+                                sh.nearest_edge(ip).filter(|(_, _, d)| d * v.zoom < 7.0)
+                            {
+                                // Click on an edge: add a point there and start dragging it.
+                                let _ = d;
+                                let at = seg + 1;
+                                ctx.project.update(|p| {
+                                    if let Some(l) = p.layer_mut(id) {
+                                        let mut ns = sh.clone();
+                                        ns.points.insert(at, q);
+                                        l.set_shape_at(fr, ns);
+                                    }
+                                });
+                                ctx.sel_point.set(Some(at));
+                                Some(Drag::ShapePoint(at))
+                            } else if point_in_polygon(&sh.flatten(10), ip) {
+                                ctx.sel_point.set(None);
+                                Some(Drag::MoveShape {
+                                    start: ip,
+                                    orig: sh,
+                                })
+                            } else {
+                                ctx.sel_point.set(None);
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    let corners = ctx
+                        .project
+                        .with_untracked(|p| p.layer(id).and_then(|l| l.surface_at(fr)));
+                    corners.and_then(|c| {
+                        if let Some(i) = c
+                            .iter()
+                            .position(|&q| dist2(v.to_screen(q), s) < hit_r2 * 1.4)
+                        {
+                            Some(Drag::SurfaceCorner(i))
+                        } else if point_in_polygon(&c, ip) {
+                            Some(Drag::MoveSurface { start: ip, orig: c })
+                        } else {
+                            None
+                        }
+                    })
+                };
+                ctx.drag.set_value(drag.unwrap_or(Drag::Pan {
+                    start: s,
+                    pan: v.pan,
+                }));
             }
             Tool::Pan => {}
         }
@@ -565,57 +1320,74 @@ fn App() -> impl IntoView {
 
     let on_move = move |e: web_sys::MouseEvent| {
         let s = mouse_pos(&e);
-        let v = view.get_untracked();
+        let v = ctx.view.get_untracked();
         let ip = v.to_image(s);
-        if tool.get_untracked() == Tool::Draw {
-            hover.set(Some(ip));
+        if ctx.tool.get_untracked() == Tool::Draw {
+            ctx.hover.set(Some(ip));
         }
-        let fr = frame.get_untracked();
-        match drag.get_value() {
-            Drag::None => {}
-            Drag::Pan { start, pan } => {
-                view.update(|v| v.pan = [pan[0] + s[0] - start[0], pan[1] + s[1] - start[1]])
+        let fr = ctx.frame.get_untracked();
+        let Some(id) = ctx.selected.get_untracked() else {
+            if let Drag::Pan { start, pan } = ctx.drag.get_value() {
+                ctx.view
+                    .update(|v| v.pan = [pan[0] + s[0] - start[0], pan[1] + s[1] - start[1]]);
             }
-            Drag::ShapePoint(i) => {
-                let Some(id) = selected.get_untracked() else {
-                    return;
-                };
-                project.update(|p| {
-                    if let Some(l) = p.layer_mut(id) {
-                        if let Some(mut sh) = l.shape_at(fr) {
-                            if i < sh.points.len() {
-                                sh.points[i] = ip;
-                                l.set_shape_at(fr, sh);
-                            }
+            return;
+        };
+        match ctx.drag.get_value() {
+            Drag::None => {}
+            Drag::Pan { start, pan } => ctx
+                .view
+                .update(|v| v.pan = [pan[0] + s[0] - start[0], pan[1] + s[1] - start[1]]),
+            Drag::ShapePoint(i) => ctx.project.update(|p| {
+                if let Some(l) = p.layer_mut(id) {
+                    if let Some(mut sh) = l.shape_at(fr) {
+                        if i < sh.points.len() {
+                            sh.points[i] = ip;
+                            l.set_shape_at(fr, sh);
                         }
                     }
-                });
-            }
-            Drag::SurfaceCorner(i) => {
-                let Some(id) = selected.get_untracked() else {
-                    return;
-                };
-                project.update(|p| {
-                    if let Some(l) = p.layer_mut(id) {
-                        l.set_surface_corner(fr, i, ip);
+                }
+            }),
+            Drag::SurfaceCorner(i) => ctx.project.update(|p| {
+                if let Some(l) = p.layer_mut(id) {
+                    l.set_surface_corner(fr, i, ip);
+                }
+            }),
+            Drag::MoveShape { start, orig } => ctx.project.update(|p| {
+                if let Some(l) = p.layer_mut(id) {
+                    l.set_shape_at(fr, orig.translated([ip[0] - start[0], ip[1] - start[1]]));
+                }
+            }),
+            Drag::MoveSurface { start, orig } => ctx.project.update(|p| {
+                if let Some(l) = p.layer_mut(id) {
+                    let d = [ip[0] - start[0], ip[1] - start[1]];
+                    for (i, c) in orig.iter().enumerate() {
+                        l.set_surface_corner(fr, i, [c[0] + d[0], c[1] + d[1]]);
                     }
-                });
-            }
+                }
+            }),
         }
     };
 
     let on_up = move |_e: web_sys::MouseEvent| {
-        let d = drag.get_value();
-        drag.set_value(Drag::None);
-        if matches!(d, Drag::ShapePoint(_) | Drag::SurfaceCorner(_)) {
-            edit_layer(Box::new(|_| {}));
+        let d = ctx.drag.get_value();
+        ctx.drag.set_value(Drag::None);
+        if matches!(
+            d,
+            Drag::ShapePoint(_)
+                | Drag::SurfaceCorner(_)
+                | Drag::MoveShape { .. }
+                | Drag::MoveSurface { .. }
+        ) {
+            // Push the edited layer as one undo step.
+            ctx.edit_layer(|_| {});
         }
     };
 
     let on_wheel = move |e: web_sys::WheelEvent| {
         e.prevent_default();
         let s = [e.offset_x() as f64, e.offset_y() as f64];
-        view.update(|v| {
+        ctx.view.update(|v| {
             let before = v.to_image(s);
             let factor = (-e.delta_y() * 0.0015).exp();
             v.zoom = (v.zoom * factor).clamp(0.05, 32.0);
@@ -626,325 +1398,299 @@ fn App() -> impl IntoView {
     };
 
     let on_dbl = move |_e: web_sys::MouseEvent| {
-        if tool.get_untracked() == Tool::Draw && draft.with_untracked(|d| d.len() >= 3) {
-            draft.update(|d| {
+        if ctx.tool.get_untracked() == Tool::Draw && ctx.draft.with_untracked(|d| d.len() >= 3) {
+            ctx.draft.update(|d| {
                 d.pop(); // the double-click's second point
             });
-            finish_draft();
+            ctx.finish_draft();
         }
     };
 
-    let on_timeline = move |e: web_sys::MouseEvent| {
-        if e.buttons() & 1 == 0 && e.type_() != "mousedown" {
-            return;
-        }
-        let Some(c) = timeline_ref.get_untracked() else {
-            return;
-        };
-        let n = frame_count();
-        if n == 0 {
-            return;
-        }
-        let f = (e.offset_x() as f64 / c.client_width().max(1) as f64 * n as f64).floor() as i64;
-        frame.set(f.clamp(0, n as i64 - 1) as usize);
-    };
-
-    // ---- derived values ----
-    let sel_layer = move || {
-        selected
-            .get()
-            .and_then(|id| project.with(|p| p.layer(id).cloned()))
-    };
-    let frame_label = move || {
-        let f = frame.get();
-        project.with(|p| p.footage.as_ref().map(|ft| ft.frame_number(f)).unwrap_or(0))
-    };
-    let tool_btn = move |t: Tool, label: &'static str, key: &'static str| {
-        view! {
-            <button class="tool" class:active=move || tool.get() == t title=format!("{label} ({key})")
-                on:click=move |_| { tool.set(t); if t != Tool::Draw { draft.set(vec![]); hover.set(None); } }>
-                {label}<kbd>{key}</kbd>
-            </button>
-        }
-    };
     let toggle = move |sig: RwSignal<bool>, label: &'static str| {
         view! {
             <label class="toggle"><input type="checkbox" prop:checked=move || sig.get() on:change=move |_| sig.update(|v| *v = !*v) />{label}</label>
         }
     };
-
     view! {
-        <div class="app">
-            <header class="topbar">
-                <div class="brand"><span class="logo">"◆"</span>"Trackwright"</div>
-                <div class="group">
-                    <button on:click=move |_| run_project_cmd("new_project", json!({}), Some("New project"))>"New"</button>
-                    <button on:click=move |_| open_footage("file")>"Open Footage…"</button>
-                    <button on:click=move |_| open_footage("folder")>"Open Sequence Folder…"</button>
-                    <button on:click=move |_| run_project_cmd("open_project", json!({}), Some("Project opened"))>"Open Project…"</button>
-                    <button on:click=move |_| save(false)>"Save"</button>
-                    <button on:click=move |_| save(true)>"Save As…"</button>
-                </div>
-                <div class="group tools">
-                    {tool_btn(Tool::Pan, "Pan", "H")}
-                    {tool_btn(Tool::Draw, "Draw Shape", "D")}
-                    {tool_btn(Tool::EditShape, "Edit Shape", "E")}
-                    {tool_btn(Tool::Surface, "Surface", "S")}
-                </div>
-                <div class="group">
-                    {toggle(show_shapes, "Shapes")}
-                    {toggle(show_surface, "Surface")}
-                    {toggle(show_grid, "Grid")}
-                    {toggle(show_points, "Points")}
-                    <button on:click=move |_| fit_view() title="Fit (F)">"Fit"</button>
-                    <button on:click=move |_| about_open.set(true)>"About"</button>
-                </div>
-            </header>
+        <main class="viewport">
+            <div class="view-toolbar">
+                {toggle(ctx.show_shapes, "Shapes")}
+                {toggle(ctx.show_surface, "Surface")}
+                {toggle(ctx.show_inserts, "Insert")}
+                {toggle(ctx.show_grid, "Grid")}
+                {toggle(ctx.show_points, "Points")}
+                <button class="small" on:click=move |_| ctx.fit_view() title="Fit (F)">"Fit"</button>
+            </div>
+            <canvas node_ref=ctx.viewport class="view"
+                class:draw=move || ctx.tool.get() == Tool::Draw
+                class:edit=move || matches!(ctx.tool.get(), Tool::EditShape | Tool::Surface)
+                on:mousedown=on_down on:mousemove=on_move on:mouseup=on_up
+                on:mouseleave=move |e| { ctx.hover.set(None); on_up(e) }
+                on:wheel=on_wheel on:dblclick=on_dbl
+                on:contextmenu=|e| e.prevent_default()></canvas>
+        </main>
+    }
+}
 
-            <aside class="panel left">
-                <section>
-                    <h3>"Layers"
-                        <button class="small" on:click=move |_| { tool.set(Tool::Draw); say("Click points around a flat surface; click the first point (or Enter) to close".into(), false); }>"+ New"</button>
-                    </h3>
-                    <ul class="layers">
-                        {move || project.with(|p| p.layers.iter().map(|l| {
-                            let id = l.id;
-                            let name = l.name.clone();
-                            let color = l.color.clone();
-                            let vis = l.visible;
-                            let tracked = l.tracks.len();
-                            view! {
-                                <li class:selected=move || selected.get() == Some(id) on:click=move |_| selected.set(Some(id))>
-                                    <span class="swatch" style=format!("background:{color}")></span>
-                                    <span class="lname">{name}</span>
-                                    <span class="muted">{format!("{tracked}f")}</span>
-                                    <button class="icon" title="Show / hide" on:click=move |ev| {
-                                        ev.stop_propagation();
-                                        selected.set(Some(id));
-                                        edit_layer(Box::new(|l| l.visible = !l.visible));
-                                    }>{if vis { "👁" } else { "–" }}</button>
-                                    <button class="icon" title="Delete layer" on:click=move |ev| {
-                                        ev.stop_propagation();
-                                        run_project_cmd("delete_layer", json!({ "id": id }), Some("Layer deleted"));
-                                    }>"✕"</button>
-                                </li>
-                            }
-                        }).collect_view())}
-                    </ul>
-                </section>
+// ---------------------------------------------------------------------------
+// Right panel
 
-                {move || sel_layer().map(|l| {
-                    let s = l.settings.clone();
-                    let model = model_id(s.model);
-                    let name = l.name.clone();
-                    let ref_label = project.with_untracked(|p| p.footage.as_ref().map_or(0, |f| f.frame_number(l.ref_frame)));
-                    let num = move |label: &'static str, value: String, step: &'static str, apply: fn(&mut Layer, f64)| {
+#[component]
+fn RightPanel() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let res_opt = move |r: ViewerRes, label: &'static str| {
+        view! { <button class="seg" class:active=move || ctx.viewer_res.get() == r on:click=move |_| ctx.viewer_res.set(r)>{label}</button> }
+    };
+    view! {
+        <aside class="panel right">
+            <section>
+                <h3>"Footage"</h3>
+                {move || ctx.project.with(|p| match &p.footage {
+                    None => view! { <p class="muted">"No footage loaded. Drag a video, image or folder onto the window."</p> }.into_any(),
+                    Some(f) => {
+                        let (fps, first) = (f.fps, f.first_frame);
                         view! {
-                            <label class="field">{label}
-                                <input type="number" step=step prop:value=value on:change=move |ev| {
-                                    if let Ok(v) = event_target_value(&ev).parse::<f64>() {
-                                        edit_layer(Box::new(move |l| apply(l, v)));
-                                    }
-                                } />
-                            </label>
-                        }
-                    };
-                    view! {
-                        <section>
-                            <h3>"Layer"</h3>
-                            <label class="field">"Name"
-                                <input type="text" prop:value=name on:change=move |ev| { let v = event_target_value(&ev); edit_layer(Box::new(move |l| l.name = v)); } />
-                            </label>
-                            <p class="muted">{format!("Reference frame {ref_label}")}</p>
+                            <p class="fname" title=f.source.clone()>{file_name(&f.source)}</p>
+                            <p class="muted">{format!("{} × {} · {} frames", f.width, f.height, f.frames.len())}</p>
                             <div class="row">
-                                <button on:click=move |_| {
-                                    let Some(id) = selected.get_untracked() else { return };
-                                    run_project_cmd("set_reference_frame", json!({ "id": id, "frame": frame.get_untracked() }), Some("Reference frame set"));
-                                }>"Set Reference Here"</button>
+                                <label class="field">"FPS"
+                                    <input type="number" step="0.001" prop:value=format!("{fps:.3}") on:change=move |ev| {
+                                        if let Ok(v) = event_target_value(&ev).parse::<f64>() {
+                                            let first = ctx.project.with_untracked(|p| p.footage.as_ref().map_or(0, |f| f.first_frame));
+                                            ctx.call("set_footage_timing", json!({ "fps": v, "firstFrame": first }), None);
+                                        }
+                                    } />
+                                </label>
+                                <label class="field">"First frame"
+                                    <input type="number" step="1" prop:value=first.to_string() on:change=move |ev| {
+                                        if let Ok(v) = event_target_value(&ev).parse::<i64>() {
+                                            let fps = ctx.project.with_untracked(|p| p.footage.as_ref().map_or(24.0, |f| f.fps));
+                                            ctx.call("set_footage_timing", json!({ "fps": fps, "firstFrame": v }), None);
+                                        }
+                                    } />
+                                </label>
                             </div>
-                            <div class="row">
-                                <button on:click=move |_| {
-                                    let Some(id) = selected.get_untracked() else { return };
-                                    run_project_cmd("clear_track", json!({ "id": id, "frame": frame.get_untracked(), "forward": false }), Some("Cleared track before this frame"));
-                                }>"Clear ◀"</button>
-                                <button on:click=move |_| {
-                                    let Some(id) = selected.get_untracked() else { return };
-                                    run_project_cmd("clear_track", json!({ "id": id, "frame": null, "forward": true }), Some("Track cleared"));
-                                }>"Clear All"</button>
-                                <button on:click=move |_| {
-                                    let Some(id) = selected.get_untracked() else { return };
-                                    run_project_cmd("clear_track", json!({ "id": id, "frame": frame.get_untracked(), "forward": true }), Some("Cleared track after this frame"));
-                                }>"Clear ▶"</button>
-                            </div>
-                            <label class="toggle">
-                                <input type="checkbox" prop:checked=l.shape.smooth on:change=move |_| edit_layer(Box::new(|l| l.shape.smooth = !l.shape.smooth)) />
-                                "Smooth (spline) outline"
-                            </label>
-                            <button class="wide" on:click=move |_| edit_layer(Box::new(|l| l.surface = trackwright_core::shape::default_surface(&l.shape)))>"Reset Surface to Shape Bounds"</button>
-                        </section>
-                        <section>
-                            <h3>"Track Settings"</h3>
-                            <label class="field">"Motion"
-                                <select on:change=move |ev| {
-                                    let v = event_target_value(&ev);
-                                    if let Ok(m) = serde_json::from_value::<MotionModel>(json!(v)) {
-                                        edit_layer(Box::new(move |l| l.settings.model = m));
-                                    }
-                                }>
-                                    {MotionModel::ALL.iter().map(|m| {
-                                        let id = model_id(*m);
-                                        let sel = id == model;
-                                        view! { <option value=id.clone() selected=sel>{m.label()}</option> }
-                                    }).collect_view()}
-                                </select>
-                            </label>
-                            {num("Max points", s.max_features.to_string(), "10", |l, v| l.settings.max_features = v.clamp(20.0, 3000.0) as usize)}
-                            {num("Min point spacing (px)", s.min_distance.to_string(), "1", |l, v| l.settings.min_distance = v.clamp(2.0, 50.0) as f32)}
-                            {num("Search window radius (px)", s.search_radius.to_string(), "1", |l, v| l.settings.search_radius = v.clamp(3.0, 31.0) as i32)}
-                            {num("Pyramid levels", s.pyramid_levels.to_string(), "1", |l, v| l.settings.pyramid_levels = v.clamp(1.0, 7.0) as usize)}
-                            {num("Inlier threshold (px)", s.ransac_threshold.to_string(), "0.1", |l, v| l.settings.ransac_threshold = v.clamp(0.2, 10.0))}
-                            {num("Min good points", s.min_inliers.to_string(), "1", |l, v| l.settings.min_inliers = v.clamp(4.0, 500.0) as usize)}
-                            <label class="toggle">
-                                <input type="checkbox" prop:checked=s.refine_against_reference on:change=move |_| edit_layer(Box::new(|l| l.settings.refine_against_reference = !l.settings.refine_against_reference)) />
-                                "Anti-drift (re-solve against reference)"
-                            </label>
-                        </section>
+                        }.into_any()
                     }
                 })}
-            </aside>
-
-            <main class="viewport">
-                <canvas node_ref=viewport_ref class="view"
-                    class:draw=move || tool.get() == Tool::Draw
-                    on:mousedown=on_down on:mousemove=on_move on:mouseup=on_up
-                    on:mouseleave=move |e| { hover.set(None); on_up(e) }
-                    on:wheel=on_wheel on:dblclick=on_dbl
-                    on:contextmenu=|e| e.prevent_default()></canvas>
-            </main>
-
-            <aside class="panel right">
-                <section>
-                    <h3>"Footage"</h3>
-                    {move || project.with(|p| match &p.footage {
-                        None => view! { <p class="muted">"No footage loaded. Drag a video, image or folder onto the window."</p> }.into_any(),
-                        Some(f) => {
-                            let name = std::path::Path::new(&f.source).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                            let (fps, first) = (f.fps, f.first_frame);
-                            view! {
-                                <p class="fname" title=f.source.clone()>{name}</p>
-                                <p class="muted">{format!("{} × {} · {} frames", f.width, f.height, f.frames.len())}</p>
-                                <div class="row">
-                                    <label class="field">"FPS"
-                                        <input type="number" step="0.001" prop:value=format!("{fps:.3}") on:change=move |ev| {
-                                            if let Ok(v) = event_target_value(&ev).parse::<f64>() {
-                                                let first = project.with_untracked(|p| p.footage.as_ref().map_or(0, |f| f.first_frame));
-                                                run_project_cmd("set_footage_timing", json!({ "fps": v, "firstFrame": first }), None);
-                                            }
-                                        } />
-                                    </label>
-                                    <label class="field">"First frame"
-                                        <input type="number" step="1" prop:value=first.to_string() on:change=move |ev| {
-                                            if let Ok(v) = event_target_value(&ev).parse::<i64>() {
-                                                let fps = project.with_untracked(|p| p.footage.as_ref().map_or(24.0, |f| f.fps));
-                                                run_project_cmd("set_footage_timing", json!({ "fps": fps, "firstFrame": v }), None);
-                                            }
-                                        } />
-                                    </label>
-                                </div>
-                            }.into_any()
-                        }
-                    })}
-                </section>
-
-                <section>
-                    <h3>"Export Track"</h3>
-                    <label class="field">"Format"
-                        <select on:change=move |ev| export_format.set(format_from_id(&event_target_value(&ev)))>
-                            {move || ExportFormat::ALL.iter().map(|f| {
-                                let id = format_id(*f);
-                                let sel = *f == export_format.get();
-                                view! { <option value=id selected=sel>{f.label()}</option> }
-                            }).collect_view()}
-                        </select>
-                    </label>
-                    <div class="export-grid">
-                        <button class="primary" on:click=move |_| do_export("desktop")>"Save to Desktop"</button>
-                        <button on:click=move |_| do_export("reelforge")>"Send to Reelforge"</button>
-                        <button on:click=move |_| do_export("forma3d")>"Send to Forma3D"</button>
-                        <button on:click=move |_| do_export("tidefire")>"Send to Tidefire"</button>
-                        <button on:click=move |_| do_export("choose")>"Save As…"</button>
-                    </div>
-                    <p class="hint">"Tip: pick the matching format (Reelforge track for Reelforge, etc.). Nuke and After Effects corner pins are available too."</p>
-                </section>
-
-                <section>
-                    <h3>"App Folders"</h3>
-                    {move || {
-                        let s = settings.get();
-                        [("Reelforge", s.reelforge_dir), ("Forma3D", s.forma3d_dir), ("Tidefire", s.tidefire_dir)].into_iter().map(|(app, dir)| view! {
-                            <div class="dir">
-                                <div class="dir-head"><strong>{app}</strong><button class="small" on:click=move |_| change_dir(app)>"Change…"</button></div>
-                                <code title=dir.clone()>{dir.clone()}</code>
-                            </div>
-                        }).collect_view()
-                    }}
-                </section>
-
-                <section>
-                    <h3>"Shortcuts"</h3>
-                    <dl class="keys">
-                        <dt>"← / →"</dt><dd>"Previous / next frame"</dd>
-                        <dt>"Shift + ← / →"</dt><dd>"Track one frame"</dd>
-                        <dt>"Space"</dt><dd>"Play / pause"</dd>
-                        <dt>"Enter / dbl-click"</dt><dd>"Close shape"</dd>
-                        <dt>"Right-click"</dt><dd>"Undo last shape point"</dd>
-                        <dt>"Esc"</dt><dd>"Stop tracking / cancel shape"</dd>
-                        <dt>"Wheel / middle-drag"</dt><dd>"Zoom / pan"</dd>
-                    </dl>
-                </section>
-            </aside>
-
-            <footer class="bottom">
-                <div class="transport">
-                    <button title="First frame (Home)" on:click=move |_| frame.set(0)>"⏮"</button>
-                    <button class="track" title="Track backward" disabled=move || tracking.get() on:click=move |_| start_track(-1, None)>"◀◀ Track"</button>
-                    <button class="track" title="Track one frame backward (Shift+←)" disabled=move || tracking.get() on:click=move |_| start_track(-1, Some(1))>"◀|"</button>
-                    <button class="stop" title="Stop (Esc)" disabled=move || !tracking.get() on:click=move |_| stop_track()>"■"</button>
-                    <button class="track" title="Track one frame forward (Shift+→)" disabled=move || tracking.get() on:click=move |_| start_track(1, Some(1))>"|▶"</button>
-                    <button class="track" title="Track forward" disabled=move || tracking.get() on:click=move |_| start_track(1, None)>"Track ▶▶"</button>
-                    <button title="Last frame (End)" on:click=move |_| frame.set(frame_count().saturating_sub(1))>"⏭"</button>
-                    <span class="sep"></span>
-                    <button title="Previous frame (←)" on:click=move |_| step_frame(-1)>"‹"</button>
-                    <button title="Play / pause (Space)" on:click=move |_| toggle_play()>{move || if playing.get() { "❚❚" } else { "▶" }}</button>
-                    <button title="Next frame (→)" on:click=move |_| step_frame(1)>"›"</button>
-                    <span class="frame">{move || format!("Frame {}", frame_label())}</span>
-                    <span class="muted">{move || format!("{} / {}", frame.get() + 1, frame_count())}</span>
-                    <span class="sep"></span>
-                    <span class="status" class:error=move || status_err.get()>{move || status.get()}</span>
+                <label class="field">"Viewer resolution"</label>
+                <div class="segmented">
+                    {res_opt(ViewerRes::Auto, "Auto")}
+                    {res_opt(ViewerRes::Proxy, "Proxy")}
+                    {res_opt(ViewerRes::Full, "Full")}
                 </div>
-                <div class="timeline-wrap"><canvas node_ref=timeline_ref class="timeline" on:mousedown=on_timeline on:mousemove=on_timeline></canvas></div>
-            </footer>
+                <p class="hint">{move || {
+                    let p = ctx.proxy.get();
+                    if ctx.project.with(|pr| pr.footage.is_none()) {
+                        String::new()
+                    } else if p.prefix.is_none() {
+                        "Footage is small enough to play at full resolution.".to_string()
+                    } else if p.ready < p.total {
+                        format!("Building playback proxies… {} / {}", p.ready, p.total)
+                    } else {
+                        "Proxies ready. Auto uses them while playing, scrubbing and tracking.".to_string()
+                    }
+                }}</p>
+            </section>
 
-            <Show when=move || about_open.get()>
-                <div class="modal-bg" on:click=move |_| about_open.set(false)>
-                    <div class="modal" on:click=|e| e.stop_propagation()>
-                        <h2>"Trackwright " {env!("CARGO_PKG_VERSION")}</h2>
-                        <p>"Planar motion tracking. Camera tracking is coming next."</p>
-                        <p class="legal">"© 2026 Scott Hambach. All rights reserved."<br/>"Trackwright is a trademark of Scott Hambach."</p>
-                        <h3>"Open-source components"</h3>
-                        <ul class="licenses">
-                            <li>"Tauri (MIT / Apache-2.0)"</li>
-                            <li>"Leptos (MIT)"</li>
-                            <li>"image-rs (MIT / Apache-2.0)"</li>
-                            <li>"serde, serde_json (MIT / Apache-2.0)"</li>
-                            <li>"wasm-bindgen, js-sys, web-sys (MIT / Apache-2.0)"</li>
-                            <li>"dirs (MIT / Apache-2.0)"</li>
-                            <li>"FFmpeg, if installed, is used as a separate program for video decoding (LGPL/GPL)"</li>
-                        </ul>
-                        <button class="primary" on:click=move |_| about_open.set(false)>"Close"</button>
+            <section>
+                <h3>"Export Track"</h3>
+                <label class="field">"Format"
+                    <select on:change=move |ev| {
+                        let v = event_target_value(&ev);
+                        if let Ok(f) = serde_json::from_value::<ExportFormat>(json!(v)) { ctx.export_format.set(f); }
+                    }>
+                        {move || ExportFormat::ALL.iter().map(|f| {
+                            let id = enum_id(*f);
+                            let sel = *f == ctx.export_format.get();
+                            view! { <option value=id selected=sel>{f.label()}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
+                <div class="export-grid">
+                    <button class="primary" on:click=move |_| ctx.export("desktop")>"Save to Desktop"</button>
+                    <button on:click=move |_| ctx.export("reelforge")>"Send to Reelforge"</button>
+                    <button on:click=move |_| ctx.export("forma3d")>"Send to Forma3D"</button>
+                    <button on:click=move |_| ctx.export("tidefire")>"Send to Tidefire"</button>
+                    <button on:click=move |_| ctx.export("choose")>"Save As…"</button>
+                </div>
+            </section>
+
+            <section>
+                <h3>"App Folders"</h3>
+                {move || {
+                    let s = ctx.settings.get();
+                    [("Reelforge", s.reelforge_dir), ("Forma3D", s.forma3d_dir), ("Tidefire", s.tidefire_dir)].into_iter().map(|(app, dir)| view! {
+                        <div class="dir">
+                            <div class="dir-head"><strong>{app}</strong><button class="small" on:click=move |_| ctx.change_dir(app)>"Change…"</button></div>
+                            <code title=dir.clone()>{dir.clone()}</code>
+                        </div>
+                    }).collect_view()
+                }}
+            </section>
+
+            <section>
+                <h3>"Shortcuts"</h3>
+                <dl class="keys">
+                    <dt>"Ctrl+Z / Ctrl+Y"</dt><dd>"Undo / redo"</dd>
+                    <dt>"Ctrl+S / Ctrl+O"</dt><dd>"Save / open project"</dd>
+                    <dt>"Ctrl+D"</dt><dd>"Duplicate layer"</dd>
+                    <dt>"← / →"</dt><dd>"Previous / next frame"</dd>
+                    <dt>"Shift + ← / →"</dt><dd>"Track one frame"</dd>
+                    <dt>"Space"</dt><dd>"Play / pause"</dd>
+                    <dt>"Enter / dbl-click"</dt><dd>"Close shape"</dd>
+                    <dt>"Delete"</dt><dd>"Remove selected shape point"</dd>
+                    <dt>"Right-click"</dt><dd>"Undo last point while drawing"</dd>
+                    <dt>"Esc"</dt><dd>"Stop tracking / cancel"</dd>
+                    <dt>"Wheel / middle-drag"</dt><dd>"Zoom / pan"</dd>
+                </dl>
+            </section>
+        </aside>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport + timeline
+
+#[component]
+fn Bottom() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let frame_label = move || {
+        let f = ctx.frame.get();
+        ctx.project
+            .with(|p| p.footage.as_ref().map(|ft| ft.frame_number(f)).unwrap_or(0))
+    };
+    let on_timeline = move |e: web_sys::MouseEvent| {
+        let down = e.type_() == "mousedown";
+        if !down && e.buttons() & 1 == 0 {
+            return;
+        }
+        if down {
+            ctx.scrubbing.set(true);
+        }
+        let Some(c) = ctx.timeline.get_untracked() else {
+            return;
+        };
+        let n = ctx.frame_count_untracked();
+        if n == 0 {
+            return;
+        }
+        let f = (e.offset_x() as f64 / c.client_width().max(1) as f64 * n as f64).floor() as i64;
+        ctx.frame.set(f.clamp(0, n as i64 - 1) as usize);
+    };
+    view! {
+        <footer class="bottom">
+            <div class="transport">
+                <button title="First frame (Home)" on:click=move |_| ctx.frame.set(0)>"⏮"</button>
+                <button class="track" title="Track backward" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(-1, None)>"◀◀ Track"</button>
+                <button class="track" title="Track one frame backward (Shift+←)" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(-1, Some(1))>"◀|"</button>
+                <button class="stop" title="Stop (Esc)" disabled=move || !ctx.tracking.get() on:click=move |_| ctx.stop_track()>"■"</button>
+                <button class="track" title="Track one frame forward (Shift+→)" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(1, Some(1))>"|▶"</button>
+                <button class="track" title="Track forward" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(1, None)>"Track ▶▶"</button>
+                <button title="Last frame (End)" on:click=move |_| ctx.frame.set(ctx.frame_count_untracked().saturating_sub(1))>"⏭"</button>
+                <span class="sep"></span>
+                <button title="Previous frame (←)" on:click=move |_| ctx.step_frame(-1)>"‹"</button>
+                <button title="Play / pause (Space)" on:click=move |_| ctx.toggle_play()>{move || if ctx.playing.get() { "❚❚" } else { "▶" }}</button>
+                <button title="Next frame (→)" on:click=move |_| ctx.step_frame(1)>"›"</button>
+                <span class="frame">{move || format!("Frame {}", frame_label())}</span>
+                <span class="muted">{move || format!("{} / {}", ctx.frame.get() + 1, ctx.frame_count())}</span>
+                <span class="sep"></span>
+                <span class="status" class:error=move || ctx.status_err.get()>{move || ctx.status.get()}</span>
+            </div>
+            <div class="timeline-wrap"><canvas node_ref=ctx.timeline class="timeline" on:mousedown=on_timeline on:mousemove=on_timeline></canvas></div>
+        </footer>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modals
+
+#[component]
+fn Modals() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    move || {
+        match ctx.modal.get() {
+        Modal::None => ().into_any(),
+        Modal::About => view! {
+            <div class="modal-bg" on:click=move |_| ctx.modal.set(Modal::None)>
+                <div class="modal" on:click=|e| e.stop_propagation()>
+                    <h2>"Trackwright " {env!("CARGO_PKG_VERSION")}</h2>
+                    <p>"Planar motion tracking. Camera tracking is coming next."</p>
+                    <p class="legal">"© 2026 Scott Hambach. All rights reserved."<br/>"Trackwright is a trademark of Scott Hambach."</p>
+                    <h3>"Open-source components"</h3>
+                    <ul class="licenses">
+                        <li>"Tauri (MIT / Apache-2.0)"</li>
+                        <li>"Leptos (MIT)"</li>
+                        <li>"image-rs (MIT / Apache-2.0)"</li>
+                        <li>"serde, serde_json (MIT / Apache-2.0)"</li>
+                        <li>"wasm-bindgen, js-sys, web-sys (MIT / Apache-2.0)"</li>
+                        <li>"dirs (MIT / Apache-2.0)"</li>
+                        <li>"FFmpeg, if installed, is used as a separate program for video decoding (LGPL/GPL)"</li>
+                    </ul>
+                    <div class="modal-actions"><button class="primary" on:click=move |_| ctx.modal.set(Modal::None)>"Close"</button></div>
+                </div>
+            </div>
+        }
+        .into_any(),
+        Modal::Unsaved(action) => {
+            let what = match &action {
+                Pending::Close => "before closing",
+                Pending::New => "before starting a new project",
+                Pending::OpenProject(_) => "before opening another project",
+            };
+            let (a1, a2) = (action.clone(), action.clone());
+            view! {
+                <div class="modal-bg">
+                    <div class="modal">
+                        <h2>"Save changes?"</h2>
+                        <p>{format!("This project has unsaved changes. Save them {what}?")}</p>
+                        <div class="modal-actions">
+                            <button on:click=move |_| ctx.modal.set(Modal::None)>"Cancel"</button>
+                            <button on:click=move |_| {
+                                let a = a1.clone();
+                                spawn_local(async move {
+                                    let _ = tauri::call::<()>("discard_autosave", json!({})).await;
+                                    ctx.perform(a);
+                                });
+                            }>"Don't Save"</button>
+                            <button class="primary" on:click=move |_| {
+                                let a = a2.clone();
+                                ctx.save_then(false, move |ok| if ok { ctx.perform(a) });
+                            }>"Save"</button>
+                        </div>
                     </div>
                 </div>
-            </Show>
-        </div>
+            }
+            .into_any()
+        }
+        Modal::Recovery(info) => {
+            let when = if info.saved_at > 0 {
+                let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(info.saved_at as f64 * 1000.0));
+                String::from(d.to_locale_string("default", &wasm_bindgen::JsValue::UNDEFINED))
+            } else {
+                "earlier".into()
+            };
+            let name = info.original_path.as_deref().map(file_name).unwrap_or_else(|| "an unsaved project".into());
+            view! {
+                <div class="modal-bg">
+                    <div class="modal">
+                        <h2>"Recover unsaved work?"</h2>
+                        <p>{format!("Trackwright closed without saving {name}. An autosave from {when} is available.")}</p>
+                        <div class="modal-actions">
+                            <button on:click=move |_| {
+                                ctx.modal.set(Modal::None);
+                                spawn_local(async move { let _ = tauri::call::<()>("discard_autosave", json!({})).await; });
+                            }>"Discard"</button>
+                            <button class="primary" on:click=move |_| {
+                                ctx.modal.set(Modal::None);
+                                ctx.call("recover_autosave", json!({}), Some("Recovered from autosave. Save to keep it"));
+                            }>"Recover"</button>
+                        </div>
+                    </div>
+                </div>
+            }
+            .into_any()
+        }
+    }
     }
 }

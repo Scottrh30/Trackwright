@@ -30,7 +30,15 @@ Built in Rust with Tauri 2 and a Leptos UI.
 
 "Send to Reelforge / Forma3D / Tidefire" writes into each app's import folder (default `Documents/<App>/Imports/Tracks`, change it in **App Folders**).
 
-* **Projects:** `.twproj` (JSON) save/load.
+* **Projects:** `.twproj` (JSON) save/load, **Recent** menu, autosave every 30 s with crash recovery on the next launch, and a Save / Don't Save / Cancel prompt before closing, starting a new project or opening another one with unsaved changes.
+
+### Workflow
+
+* **Undo / redo** for every edit, including whole tracking runs (Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y).
+* **Insert preview:** pin an image, video or image sequence onto a layer's surface with perspective, opacity, start frame and loop, so you can judge the track the way you would in Mocha.
+* **Proxy playback:** footage larger than 1280 px gets low-res JPEG proxies built in the background. Viewer resolution is Auto (proxies while playing, scrubbing or tracking), Proxy or Full. Tracking always uses full resolution.
+* **Shape editing (E):** drag points, click an edge to add a point, drag inside to move the whole shape, Delete removes the selected point. **Surface (S):** drag corners, or drag inside to move the whole surface.
+* **Layers:** duplicate (Ctrl+D), double-click to rename, and **Motion source** to make a layer follow another layer's track (for example, a small screen inside a tracked wall).
 
 ### Measured accuracy
 
