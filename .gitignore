@@ -1,0 +1,6 @@
+/target
+/dist
+/src-tauri/gen
+/src-tauri/target
+*.twproj.bak
+.DS_Store

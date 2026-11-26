@@ -1,0 +1,33 @@
+[package]
+name = "trackwright-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+leptos = { version = "0.7", features = ["csr"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+console_error_panic_hook = "0.1"
+trackwright-core = { path = "../crates/trackwright-core" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
+  "HtmlImageElement",
+  "HtmlInputElement",
+  "MouseEvent",
+  "WheelEvent",
+  "KeyboardEvent",
+  "Element",
+  "EventTarget",
+  "Window",
+  "Document",
+  "console",
+]

@@ -1,0 +1,11 @@
+[package]
+name = "trackwright-core"
+description = "Planar tracking engine for Trackwright: pyramidal KLT, robust motion fitting, corner-pin solving and exporters."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
