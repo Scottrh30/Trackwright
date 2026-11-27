@@ -418,9 +418,25 @@ pub fn track_layer<S: FrameSource>(
     // How much the surface usually looks like the reference (running average), to
     // notice it being covered even while points still track (an eyelid closing).
     let mut look: Option<f64> = None;
-    let hidden_from = |look: Option<f64>, score: Option<f64>| match (look, score) {
-        (Some(avg), Some(sc)) => avg >= 0.7 && sc < 0.45 && sc < avg - 0.3,
-        _ => false,
+    // How much each frame usually looks like the one before it (running average). A
+    // cover arrives suddenly (a lid coming down changes it a lot in one frame), where
+    // a head turning or light changing drifts slowly, so this stays high for those.
+    let mut steady: Option<f64> = None;
+    // Recent frames' frame-to-frame scores, to start a prediction from the last clean frame.
+    let mut recent: Vec<(usize, f64, Option<f64>)> = Vec::new();
+    // Appearance memory: a few clean frames along the way (how it looked at different
+    // angles and moments), to recognise it again after a cover.
+    let mut memory: Vec<(usize, Mat3)> = vec![(start, h_cur)];
+    // Scores compare fine detail: relative to how this surface usually scores. `look`
+    // is the best recent score, fading 1% a frame, so a head turning over seconds is
+    // fine but a lid closing over a few frames is not.
+    let hidden_from = |look: Option<f64>,
+                       steady: Option<f64>,
+                       sc: Option<f64>,
+                       cons: Option<f64>| {
+        let gone = matches!((look, sc), (Some(peak), Some(sc)) if peak >= 0.3 && sc < 0.45 * peak);
+        let sudden = matches!((steady, cons), (Some(avg), Some(c)) if avg >= 0.5 && c < 0.7 * avg);
+        gone || sudden
     };
 
     while cur != end {
@@ -477,19 +493,29 @@ pub fn track_layer<S: FrameSource>(
         let lost = match &result {
             Err(TrackError::Lost { .. } | TrackError::NoFeatures(_)) => true,
             Ok(r) if s.bridge_occlusions => {
-                let sc = appearance(
-                    layer,
-                    &ref_pyr.levels[0],
-                    &next_pyr.levels[0],
-                    &r.h_next,
-                    next,
-                    exclude,
+                let sc = appearance(layer, &ref_pyr, &next_pyr, &r.h_next, next, exclude);
+                let cons = appearance_vs(
+                    layer, &prev_pyr, &h_cur, cur, &next_pyr, &r.h_next, next, exclude,
                 );
-                if hidden_from(look, sc) {
+                if hidden_from(look, steady, sc, cons) {
                     true
                 } else {
                     if let Some(sc) = sc {
-                        look = Some(look.map_or(sc, |a| a * 0.8 + sc * 0.2));
+                        look = Some(look.map_or(sc, |p| (p * 0.99).max(sc)));
+                    }
+                    if let Some(c) = cons {
+                        let clean = steady.is_none_or(|a| c >= 0.9 * a);
+                        if clean && memory.last().is_none_or(|m| m.0.abs_diff(next) >= 8) {
+                            memory.push((next, r.h_next));
+                            if memory.len() > 6 {
+                                memory.remove(1); // keep the first (where the user started)
+                            }
+                        }
+                        steady = Some(steady.map_or(c, |a| a * 0.8 + c * 0.2));
+                        recent.push((next, c, sc));
+                        if recent.len() > 8 {
+                            recent.remove(0);
+                        }
                     }
                     false
                 }
@@ -497,6 +523,28 @@ pub fn track_layer<S: FrameSource>(
             _ => false,
         };
         if lost && s.bridge_occlusions {
+            // The cover may have started a frame or two earlier (a lid starting to drop):
+            // back up to the last frame that still looked normal and predict from there.
+            if let Some(base) = steady {
+                let peak = look.unwrap_or(0.0);
+                let mut backed = 0;
+                while backed < 8 {
+                    match recent.last() {
+                        Some(&(f, c, sc))
+                            if f == cur
+                                && f != start
+                                && (c < 0.9 * base || sc.is_some_and(|v| v < 0.75 * peak))
+                                && layer.tracks.get(&f).is_some_and(|t| !t.keyframe) =>
+                        {
+                            recent.pop();
+                            layer.tracks.remove(&f);
+                            cur = (cur as isize - step) as usize;
+                            backed += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
             match bridge(
                 source,
                 layer,
@@ -509,12 +557,19 @@ pub fn track_layer<S: FrameSource>(
                 step,
                 exclude,
                 cancel,
+                &memory,
                 &mut on_frame,
             )? {
                 Bridged::Found { frame, velocity: v } => {
                     h_cur = layer.h_at(frame).unwrap_or(h_cur);
                     velocity = v;
                     cur = frame;
+                    // Keep the usual look from before the cover; carry on from how it looks now.
+                    let found = source.pyramid(frame, levels).map_err(TrackError::Source)?;
+                    // It may look different now (an eye turned during a blink): that is the
+                    // new normal to compare against.
+                    look = appearance(layer, &ref_pyr, &found, &h_cur, frame, exclude);
+                    recent.clear();
                     continue;
                 }
                 Bridged::ToEnd => return Ok(StopReason::Finished),
@@ -564,20 +619,61 @@ pub fn track_layer<S: FrameSource>(
 /// How much the frame looks like the reference under `h` inside the layer's shape:
 /// normalised cross-correlation, 1 = identical (brightness and contrast don't matter).
 /// `None` when too little of the shape is visible to judge.
+/// Detail at `(x, y)` of pyramid level `lvl`: the pixel minus the local average (the
+/// same spot two levels coarser). Comparing detail, not raw brightness, keeps soft
+/// shading (a shadow across skin) from looking like the target.
+fn detail(p: &Pyramid, lvl: usize, x: f32, y: f32) -> f32 {
+    let lvl = lvl.min(p.levels.len() - 1);
+    let coarse = (lvl + 2).min(p.levels.len() - 1);
+    if coarse == lvl {
+        return p.levels[lvl].sample(x, y);
+    }
+    let k = (1u32 << (coarse - lvl)) as f32;
+    p.levels[lvl].sample(x, y) - p.levels[coarse].sample((x + 0.5) / k - 0.5, (y + 0.5) / k - 0.5)
+}
+
 fn appearance(
     layer: &Layer,
-    reference: &GrayImage,
-    frame: &GrayImage,
+    reference_pyr: &Pyramid,
+    frame_pyr: &Pyramid,
     h: &Mat3,
     index: usize,
     exclude: ExcludeFn,
 ) -> Option<f64> {
+    appearance_vs(
+        layer,
+        reference_pyr,
+        &IDENTITY,
+        layer.ref_frame,
+        frame_pyr,
+        h,
+        index,
+        exclude,
+    )
+}
+
+/// Like [`appearance`], but compared with another frame `src_index` (its pyramid and
+/// its ref->frame transform `h_src`) instead of the reference frame.
+#[allow(clippy::too_many_arguments)]
+fn appearance_vs(
+    layer: &Layer,
+    reference_pyr: &Pyramid,
+    h_src: &Mat3,
+    src_index: usize,
+    frame_pyr: &Pyramid,
+    h: &Mat3,
+    index: usize,
+    exclude: ExcludeFn,
+) -> Option<f64> {
+    let reference = &reference_pyr.levels[0];
+    let frame = &frame_pyr.levels[0];
     use crate::shape::point_in_polygon;
-    let hi = invert(h)?;
+    // frame -> source frame
+    let hi = mul(h_src, &invert(h)?);
     let poly = layer.shape_ref_at(index).transformed(h).flatten(8);
     let b = crate::shape::bbox(&poly)?;
     let excl = exclude(index);
-    let ref_excl = exclude(layer.ref_frame);
+    let ref_excl = exclude(src_index);
     let area = (b[2] - b[0]).max(1.0) * (b[3] - b[1]).max(1.0);
     let stride = (area / 3000.0).sqrt().max(1.0);
     let (mut n, mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -600,8 +696,8 @@ fn appearance(
                     && r[0] < reference.width as f64 - 2.0
                     && r[1] < reference.height as f64 - 2.0;
                 if inside_ref && !ref_excl.iter().any(|e| point_in_polygon(e, r)) {
-                    let a = frame.sample(x as f32, y as f32) as f64;
-                    let c = reference.sample(r[0] as f32, r[1] as f32) as f64;
+                    let a = detail(frame_pyr, 0, x as f32, y as f32) as f64;
+                    let c = detail(reference_pyr, 0, r[0] as f32, r[1] as f32) as f64;
                     n += 1.0;
                     sa += a;
                     sb += c;
@@ -623,6 +719,43 @@ fn appearance(
         return Some(0.0);
     }
     Some((sab - sa * sb / n) / (va * vb).sqrt())
+}
+
+/// How much frame `index` (its pyramid `frame`) looks like the layer's reference
+/// frame (`reference`) under `h`: 1 = identical, below ~0.5 = something else is
+/// there. `None` when too little of the shape is in view. For tools and tests.
+pub fn appearance_score(
+    layer: &Layer,
+    reference: &Pyramid,
+    frame: &Pyramid,
+    h: &Mat3,
+    index: usize,
+) -> Option<f64> {
+    appearance(layer, reference, frame, h, index, &no_exclusions)
+}
+
+/// How much frame `index` (pyramid `frame`, transform `h`) looks like another frame
+/// `src_index` (pyramid `src`, transform `h_src`) inside the layer's shape. For tools and tests.
+#[allow(clippy::too_many_arguments)]
+pub fn appearance_between(
+    layer: &Layer,
+    src: &Pyramid,
+    h_src: &Mat3,
+    src_index: usize,
+    frame: &Pyramid,
+    h: &Mat3,
+    index: usize,
+) -> Option<f64> {
+    appearance_vs(
+        layer,
+        src,
+        h_src,
+        src_index,
+        frame,
+        h,
+        index,
+        &no_exclusions,
+    )
 }
 
 /// Motion of the area around the shape (a ring 2.5x its size, the shape itself
@@ -695,6 +828,211 @@ fn context_motion(
     (fit.inlier_count >= 10 && fit.inlier_count * 3 >= feats.len()).then_some(fit.model)
 }
 
+/// Search frame `b` for the shape's look in frame `a` (under `h_a`), shifted
+/// anywhere within `radius` pixels of where `h_pred` puts it. The look is carried
+/// to `b` the way the prediction moves it (turned and sized), compared as detail
+/// (masked normalised cross-correlation), coarse level first, then refined at full
+/// resolution. Returns the best shift (pixels, added to `h_pred`) and its score.
+#[allow(clippy::too_many_arguments)]
+fn search_shift(
+    layer: &Layer,
+    a: &Pyramid,
+    _ai: usize,
+    h_a: &Mat3,
+    b: &Pyramid,
+    bi: usize,
+    h_pred: &Mat3,
+    radius: f64,
+) -> Option<(Point, f64)> {
+    use crate::shape::point_in_polygon;
+    // b -> a is h_a * h_pred^-1.
+    let to_a = mul(h_a, &invert(h_pred)?);
+    let poly_b = layer.shape_ref_at(bi).transformed(h_pred).flatten(8);
+    let bb = crate::shape::bbox(&poly_b)?;
+    let w = (bb[2] - bb[0]).max(bb[3] - bb[1]);
+    let levels = a.levels.len().min(b.levels.len());
+    // Level where the template is about 48 px across.
+    let mut lvl = 0;
+    while lvl + 1 < levels
+        && w / (1u32 << (lvl + 1)) as f64 >= 24.0
+        && w / (1u32 << lvl) as f64 > 48.0
+    {
+        lvl += 1;
+    }
+    let (aw, ah) = (a.levels[0].width as f64, a.levels[0].height as f64);
+
+    // Template on level `l`'s pixel grid, centred on pixel (cx, cy): (i, j, value), with
+    // `step` thinning it out.
+    let template = |l: usize, cx: i64, cy: i64, step: i64| -> Vec<(i64, i64, f64)> {
+        let k = (1u32 << l) as f64;
+        let (i0, i1) = (
+            (bb[0] / k).floor() as i64 - cx,
+            (bb[2] / k).ceil() as i64 - cx,
+        );
+        let (j0, j1) = (
+            (bb[1] / k).floor() as i64 - cy,
+            (bb[3] / k).ceil() as i64 - cy,
+        );
+        let mut t = Vec::new();
+        let mut j = j0;
+        while j <= j1 {
+            let mut i = i0;
+            while i <= i1 {
+                let p = [(cx + i) as f64 * k, (cy + j) as f64 * k];
+                if point_in_polygon(&poly_b, p) {
+                    let q = apply(&to_a, p);
+                    if q[0] >= 1.0 && q[1] >= 1.0 && q[0] < aw - 2.0 && q[1] < ah - 2.0 {
+                        t.push((
+                            i,
+                            j,
+                            detail(a, l, (q[0] / k) as f32, (q[1] / k) as f32) as f64,
+                        ));
+                    }
+                }
+                i += step;
+            }
+            j += step;
+        }
+        t
+    };
+    // Detail of `b` on level `l` over a window, computed once and then looked up.
+    struct Window {
+        x0: i64,
+        y0: i64,
+        w: i64,
+        h: i64,
+        v: Vec<f32>,
+    }
+    let window = |l: usize, x0: i64, y0: i64, x1: i64, y1: i64| -> Window {
+        let img = &b.levels[l];
+        let (x0, y0) = (x0.max(1), y0.max(1));
+        let (x1, y1) = (x1.min(img.width as i64 - 3), y1.min(img.height as i64 - 3));
+        let (w, h) = ((x1 - x0 + 1).max(0), (y1 - y0 + 1).max(0));
+        let mut v = vec![0.0f32; (w * h) as usize];
+        crate::par::rows(&mut v, w.max(1) as usize, |y, row| {
+            for (x, o) in row.iter_mut().enumerate() {
+                *o = detail(b, l, (x0 + x as i64) as f32, (y0 + y as i64) as f32);
+            }
+        });
+        Window { x0, y0, w, h, v }
+    };
+    let score = |t: &[(i64, i64, f64)], win: &Window, cx: i64, cy: i64| -> Option<f64> {
+        let (mut n, mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(i, j, v) in t {
+            let (x, y) = (cx + i - win.x0, cy + j - win.y0);
+            if x < 0 || y < 0 || x >= win.w || y >= win.h {
+                continue;
+            }
+            let u = win.v[(y * win.w + x) as usize] as f64;
+            n += 1.0;
+            sa += v;
+            sb += u;
+            saa += v * v;
+            sbb += u * u;
+            sab += v * u;
+        }
+        if n < t.len() as f64 * 0.7 || n < 20.0 {
+            return None;
+        }
+        let va = saa - sa * sa / n;
+        let vb = sbb - sb * sb / n;
+        (va > 1e-6 && vb > 1e-6).then(|| (sab - sa * sb / n) / (va * vb).sqrt())
+    };
+    let extent = |t: &[(i64, i64, f64)]| {
+        t.iter().fold((0i64, 0i64, 0i64, 0i64), |e, &(i, j, _)| {
+            (e.0.min(i), e.1.min(j), e.2.max(i), e.3.max(j))
+        })
+    };
+
+    // Coarse pass.
+    let k = (1u32 << lvl) as f64;
+    let (cx, cy) = (
+        ((bb[0] + bb[2]) / 2.0 / k).round() as i64,
+        ((bb[1] + bb[3]) / 2.0 / k).round() as i64,
+    );
+    let t = template(lvl, cx, cy, 1);
+    if t.len() < 20 {
+        return None;
+    }
+    let r = (radius / k).ceil() as i64;
+    let e = extent(&t);
+    let win = window(lvl, cx + e.0 - r, cy + e.1 - r, cx + e.2 + r, cy + e.3 + r);
+    let rows: Vec<i64> = (-r..=r).collect();
+    let best = crate::par::map(&rows, |&dy| {
+        let mut best: Option<(i64, i64, f64)> = None;
+        for dx in -r..=r {
+            if dx * dx + dy * dy > r * r {
+                continue;
+            }
+            if let Some(sc) = score(&t, &win, cx + dx, cy + dy) {
+                if best.is_none_or(|b| sc > b.2) {
+                    best = Some((dx, dy, sc));
+                }
+            }
+        }
+        best
+    })
+    .into_iter()
+    .flatten()
+    .fold(None, |acc: Option<(i64, i64, f64)>, b| {
+        if acc.is_none_or(|a| b.2 > a.2) {
+            Some(b)
+        } else {
+            acc
+        }
+    });
+    let (bx, by, coarse) = best?;
+    if lvl == 0 {
+        return Some((
+            [
+                (cx + bx) as f64 - (bb[0] + bb[2]) / 2.0,
+                (cy + by) as f64 - (bb[1] + bb[3]) / 2.0,
+            ],
+            coarse,
+        ));
+    }
+    // Refine at full resolution around the coarse answer (template thinned to ~3000 px).
+    let (fx, fy) = (
+        ((bb[0] + bb[2]) / 2.0).round() as i64,
+        ((bb[1] + bb[3]) / 2.0).round() as i64,
+    );
+    let area = (bb[2] - bb[0]) * (bb[3] - bb[1]);
+    let step = ((area / 3000.0).sqrt().floor() as i64).max(1);
+    let t0 = template(0, fx, fy, step);
+    let (sx, sy) = (fx + bx * k as i64, fy + by * k as i64);
+    let rr = k as i64 + 1;
+    let e0 = extent(&t0);
+    let win0 = window(
+        0,
+        sx + e0.0 - rr,
+        sy + e0.1 - rr,
+        sx + e0.2 + rr,
+        sy + e0.3 + rr,
+    );
+    let mut found: Option<(i64, i64, f64)> = None;
+    for dy in -rr..=rr {
+        for dx in -rr..=rr {
+            if let Some(sc) = score(&t0, &win0, sx + dx, sy + dy) {
+                if found.is_none_or(|f| sc > f.2) {
+                    found = Some((sx + dx, sy + dy, sc));
+                }
+            }
+        }
+    }
+    let (x, y, sc) = found?;
+    Some((
+        [
+            x as f64 - (bb[0] + bb[2]) / 2.0,
+            y as f64 - (bb[1] + bb[3]) / 2.0,
+        ],
+        sc,
+    ))
+}
+
+fn translate(m: &Mat3, d: Point) -> Mat3 {
+    mul(&[1.0, 0.0, d[0], 0.0, 1.0, d[1], 0.0, 0.0, 1.0], m)
+}
+
 enum Bridged {
     /// Seen again at `frame`; `velocity` is the last frame-to-frame motion.
     Found {
@@ -721,6 +1059,7 @@ fn bridge<S: FrameSource>(
     step: isize,
     exclude: ExcludeFn,
     cancel: &AtomicBool,
+    memory: &[(usize, Mat3)],
     on_frame: &mut impl FnMut(usize, &FrameTrack),
 ) -> Result<Bridged, TrackError> {
     let s = layer.settings.clone();
@@ -769,12 +1108,20 @@ fn bridge<S: FrameSource>(
         d(anchor_corners[0], anchor_corners[2]).max(d(anchor_corners[1], anchor_corners[3]))
     };
     let anchor_pyr = source.pyramid(anchor, levels).map_err(TrackError::Source)?;
+    // What it looked like: just before the cover, and the remembered clean frames.
+    let mut looks: Vec<(usize, Mat3, Arc<Pyramid>)> = vec![(anchor, h_anchor, anchor_pyr.clone())];
+    for &(f, h) in memory.iter().rev() {
+        if f != anchor && looks.len() < 6 {
+            looks.push((f, h, source.pyramid(f, levels).map_err(TrackError::Source)?));
+        }
+    }
     let seed_base = layer.id as u64 * 7_000_003;
     let mut ctx_vel = IDENTITY;
     let mut prev = anchor;
     let mut drift = [[0.0f64; 2]; 4]; // displacement from the anchor by own motion
     let mut damp_sum = 0.0;
     let mut k = 0usize;
+    let mut last_shift: Option<Point> = None;
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Ok(Bridged::Cancelled);
@@ -805,6 +1152,19 @@ fn bridge<S: FrameSource>(
         ) {
             Some(m) => {
                 ctx_vel = m;
+                // Only the kinds of motion the layer allows: a translation-only layer just
+                // moves with the surroundings, it doesn't turn or grow with them.
+                let m = if s.model == MotionModel::Translation {
+                    let c = layer.shape_ref_at(prev).transformed(&h_prev).flatten(8);
+                    let n = c.len().max(1) as f64;
+                    let o = c
+                        .iter()
+                        .fold([0.0, 0.0], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
+                    let q = apply(&m, o);
+                    [1.0, 0.0, q[0] - o[0], 0.0, 1.0, q[1] - o[1], 0.0, 0.0, 1.0]
+                } else {
+                    m
+                };
                 let h = mul(&m, &h_prev);
                 // Keep the own-motion estimate in step with where the surroundings put it.
                 let c = corners(&h, layer);
@@ -829,36 +1189,128 @@ fn bridge<S: FrameSource>(
         layer.tracks.insert(g, ft.clone());
         on_frame(g, &ft);
 
-        // 2. Seen again? Track straight from the anchor with the prediction as the guess.
-        let guess = invert(&h_anchor)
-            .map(|hi| mul(&h_pred, &hi))
-            .unwrap_or(IDENTITY);
-        let found = [normal, retry].iter().enumerate().find_map(|(i, pass)| {
-            let r = solve_step(
+        // 2. Seen again? Where the prediction says, or (if it moved while hidden, like an
+        //    eye turning during a blink) wherever its last look matches best nearby; then
+        //    track straight from the anchor with that as the guess.
+        let radius = 0.6 * size + 4.0 * k as f64 + 8.0;
+        // How well it matches the last frame it was seen, and how much match a spot
+        // needs: more the further it is from the prediction (the surroundings' motion
+        // is good evidence; a look-alike off to one side is not).
+        let like_anchor = |h: &Mat3| {
+            looks
+                .iter()
+                .filter_map(|(f, hf, p)| appearance_vs(layer, p, hf, *f, &g_pyr, h, g, exclude))
+                .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
+        };
+        let needed = |d: Point| 0.40 + 0.3 * d[0].hypot(d[1]) / size.max(1.0);
+        // The best spot for any remembered look, by how far it clears what it needs.
+        let searched = looks
+            .iter()
+            .filter_map(|(f, hf, p)| search_shift(layer, p, *f, hf, &g_pyr, g, &h_pred, radius))
+            .filter(|(d, sc)| *sc >= needed(*d))
+            .max_by(|a, b| (a.1 - needed(a.0)).total_cmp(&(b.1 - needed(b.0))));
+        // Nothing nearby looks like it and the predicted spot doesn't either (an eye
+        // fully shut): don't spend time trying to track points that aren't there.
+        let hopeless = searched.is_none() && like_anchor(&h_pred).is_none_or(|v| v < 0.25);
+        let mut guesses = if hopeless { vec![] } else { vec![h_pred] };
+        if let Some((d, _)) = searched {
+            if d[0].hypot(d[1]) > 2.0 {
+                guesses.insert(0, translate(&h_pred, d));
+            }
+        }
+        let found = guesses.iter().enumerate().find_map(|(gi, start)| {
+            let guess = invert(&h_anchor)
+                .map(|hi| mul(start, &hi))
+                .unwrap_or(IDENTITY);
+            [normal, retry].iter().enumerate().find_map(|(i, pass)| {
+                let r = solve_step(
+                    layer,
+                    pass,
+                    &anchor_pyr,
+                    &g_pyr,
+                    ref_pyr,
+                    anchor,
+                    g,
+                    &h_anchor,
+                    &guess,
+                    exclude,
+                    seed_base ^ (g as u64 * 31 + gi as u64 * 7 + i as u64),
+                )
+                .ok()?;
+                let jump = max_corner_delta(&layer.surface, &r.h_next, start);
+                let near = jump <= 0.25 * size + 2.0 * k as f64 + 6.0;
+                let look = appearance(layer, &ref_pyr, &g_pyr, &r.h_next, g, exclude)?
+                    .max(like_anchor(&r.h_next)?);
+                (near && look >= 0.5 && r.inliers >= s.min_inliers).then_some(r)
+            })
+        });
+        // It changed too much to match point by point (an eye that turned while closed)
+        // but the search finds it clearly, at the same place on two frames running:
+        // take the searched position.
+        let steady = |d: Point| {
+            last_shift
+                .is_some_and(|p: Point| (p[0] - d[0]).hypot(p[1] - d[1]) <= (0.04 * size).max(3.0))
+        };
+        let found = found.or_else(|| {
+            let (d, _) = searched?;
+            let h = translate(&h_pred, d);
+            (steady(d) && like_anchor(&h)? >= 0.4).then(|| StepResult {
+                h_next: h,
+                step: IDENTITY,
+                inliers: 0,
+                rms: 0.0,
+                shown: vec![],
+            })
+        });
+        last_shift = searched.map(|(d, _)| d);
+        // Confirm on the next frame: still there and looking no worse (an eye opening or
+        // open), not getting worse (an eye still closing).
+        let found = found.filter(|r| {
+            if g == end {
+                return true;
+            }
+            let nxt = (g as isize + step) as usize;
+            let (Ok(np), Some(now)) = (
+                source.pyramid(nxt, levels),
+                appearance(layer, &ref_pyr, &g_pyr, &r.h_next, g, exclude),
+            ) else {
+                return false;
+            };
+            let ahead = solve_step(
                 layer,
-                pass,
-                &anchor_pyr,
+                normal,
                 &g_pyr,
+                &np,
                 ref_pyr,
-                anchor,
                 g,
-                &h_anchor,
-                &guess,
-                exclude,
-                seed_base ^ (g as u64 * 31 + i as u64),
-            )
-            .ok()?;
-            let jump = max_corner_delta(&layer.surface, &r.h_next, &h_pred);
-            let near = jump <= 0.35 * size + 3.0 * k as f64 + 8.0;
-            let look = appearance(
-                layer,
-                &ref_pyr.levels[0],
-                &g_pyr.levels[0],
+                nxt,
                 &r.h_next,
-                g,
+                &IDENTITY,
                 exclude,
-            )?;
-            (near && look >= 0.6 && r.inliers >= s.min_inliers.max(12)).then_some(r)
+                seed_base ^ 0x5151 ^ g as u64,
+            )
+            .or_else(|_| {
+                solve_step(
+                    layer,
+                    retry,
+                    &g_pyr,
+                    &np,
+                    ref_pyr,
+                    g,
+                    nxt,
+                    &r.h_next,
+                    &IDENTITY,
+                    exclude,
+                    seed_base ^ 0x5152 ^ g as u64,
+                )
+            });
+            match ahead {
+                Ok(a) => appearance(layer, &ref_pyr, &np, &a.h_next, nxt, exclude)
+                    .is_some_and(|next| next >= now - 0.05),
+                // Too plain to track a step: judge it by the look where it is.
+                Err(_) => appearance(layer, &ref_pyr, &np, &r.h_next, nxt, exclude)
+                    .is_some_and(|next| next >= now - 0.05),
+            }
         });
         if let Some(r) = found {
             // Spread the miss at the found frame back over the predicted frames.

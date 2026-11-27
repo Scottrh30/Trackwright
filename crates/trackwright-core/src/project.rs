@@ -451,6 +451,27 @@ impl Layer {
         true
     }
 
+    /// Fewer good points than this is worth a look: normally twice the minimum, but
+    /// for a small target that never has many (an eye, a pupil) half what it usually
+    /// gets, so the warning still means something. Sampled, so it stays cheap.
+    pub fn few_points_limit(&self) -> usize {
+        let base = (self.settings.min_inliers * 2).max(16);
+        let seen: Vec<u32> = self
+            .tracks
+            .values()
+            .filter(|t| !t.predicted && !t.keyframe)
+            .map(|t| t.inliers)
+            .collect();
+        if seen.len() < 8 {
+            return base;
+        }
+        let stride = (seen.len() / 64).max(1);
+        let mut sample: Vec<u32> = seen.iter().step_by(stride).copied().collect();
+        sample.sort_unstable();
+        let typical = sample[sample.len() / 2] as usize;
+        base.min((typical / 2).max(self.settings.min_inliers + 2))
+    }
+
     /// Frames that look unreliable, for the quality graph and "next problem" button.
     pub fn problem_at(&self, frame: usize) -> Option<Problem> {
         let t = self.tracks.get(&frame)?;
@@ -461,7 +482,7 @@ impl Layer {
             Some(Problem::Predicted)
         } else if t.rms_error > 1.0 {
             Some(Problem::HighError)
-        } else if (t.inliers as usize) < (self.settings.min_inliers * 2).max(16) {
+        } else if (t.inliers as usize) < self.few_points_limit() {
             Some(Problem::FewPoints)
         } else if t.retried {
             Some(Problem::Retried)

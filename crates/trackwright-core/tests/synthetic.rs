@@ -619,6 +619,17 @@ fn blink_footage(
     closed: std::ops::Range<usize>,
     face_textured: bool,
 ) -> (Vec<Arc<Pyramid>>, [f64; 4]) {
+    blink_footage_moving(n, closed, face_textured, &|_| [0.0, 0.0])
+}
+
+/// As `blink_footage`, with the pupil shifted by `gaze(k)` (face pixels) inside the
+/// eye on frame k: an eye that looks somewhere else.
+fn blink_footage_moving(
+    n: usize,
+    closed: std::ops::Range<usize>,
+    face_textured: bool,
+    gaze: &dyn Fn(usize) -> [f64; 2],
+) -> (Vec<Arc<Pyramid>>, [f64; 4]) {
     let face = if face_textured {
         noise_texture(61, W, H)
     } else {
@@ -649,6 +660,7 @@ fn blink_footage(
             } else {
                 0.0
             };
+            let gz = gaze(k);
             let mut img = GrayImage::new(W, H);
             for y in 0..H {
                 for x in 0..W {
@@ -660,12 +672,12 @@ fn blink_footage(
                     let lid_edge = rect[1] - 6.0 + down * (rect[3] - rect[1] + 12.0);
                     img.data[y * W + x] = if in_eye && s[1] <= lid_edge && down > 0.0 {
                         lid.sample(s[0] as f32, s[1] as f32)
-                    } else if s[0] >= rect[0]
-                        && s[0] <= rect[2]
-                        && s[1] >= rect[1]
-                        && s[1] <= rect[3]
+                    } else if s[0] >= rect[0] + gz[0]
+                        && s[0] <= rect[2] + gz[0]
+                        && s[1] >= rect[1] + gz[1]
+                        && s[1] <= rect[3] + gz[1]
                     {
-                        pupil.sample(s[0] as f32, s[1] as f32)
+                        pupil.sample((s[0] - gz[0]) as f32, (s[1] - gz[1]) as f32)
                     } else {
                         face.sample(s[0] as f32, s[1] as f32)
                     };
@@ -829,4 +841,54 @@ fn occlusion_solver_gives_up_after_the_limit() {
         l.tracks.values().all(|t| !t.predicted),
         "guesses are removed"
     );
+}
+
+/// The eye turns while it's shut: the pupil comes back 16 px to the right of where
+/// it was. The solver searches near the prediction, finds it there, and the track
+/// follows the pupil (not just the face) afterwards.
+#[test]
+fn occlusion_solver_finds_a_target_that_moved_while_hidden() {
+    let n = 32;
+    let closed = 12..18;
+    let gaze = |k: usize| if k >= 15 { [16.0, 0.0] } else { [0.0, 0.0] };
+    let (frames, rect) = blink_footage_moving(n, closed.clone(), true, &gaze);
+    let mut src = Synthetic { frames };
+    let cancel = AtomicBool::new(false);
+    let mut l = plane_layer(rect);
+    l.settings.model = MotionModel::Translation;
+    let r = track_layer(
+        &mut src,
+        &mut l,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
+    // Error of the centre (what a pupil track is for; a translation-only box can't
+    // turn with the face, so its corners can't match) against where the pupil really
+    // is: the face's motion plus the gaze shift.
+    let centre = |p: &[Point; 4]| {
+        [
+            (p[0][0] + p[1][0] + p[2][0] + p[3][0]) / 4.0,
+            (p[0][1] + p[1][1] + p[2][1] + p[3][1]) / 4.0,
+        ]
+    };
+    let err = |k: usize| {
+        let e = centre(&l.surface_at(k).unwrap());
+        let (mid, g) = (centre(&l.surface), gaze(k));
+        let t = apply(&truth_face(k), [mid[0] + g[0], mid[1] + g[1]]);
+        ((t[0] - e[0]).powi(2) + (t[1] - e[1]).powi(2)).sqrt()
+    };
+    let before = (0..closed.start - 1).map(err).fold(0.0, f64::max);
+    let after = (closed.end + 2..n).map(err).fold(0.0, f64::max);
+    let predicted: Vec<usize> = l
+        .tracks
+        .iter()
+        .filter(|(_, t)| t.predicted)
+        .map(|(f, _)| *f)
+        .collect();
+    println!("moved while hidden: predicted {predicted:?}, centre error before {before:.2}px, after {after:.2}px");
+    assert!(after < 1.5, "follows the pupil to where it went: {after}");
 }

@@ -27,7 +27,13 @@ Built in Rust with Tauri 2 and a Leptos UI.
 * **In / Out (I, O, X):** tracking stops at the Out (forward) or In (backward) point. **Re-track In→Out** re-solves just that section and blends it into the existing track so it joins seamlessly at Out.
 * **Lighting:** per-patch brightness/contrast compensation handles fades, flicker and moving light.
 * **Motion blur / hard frames:** a failed frame is retried with a wider, more forgiving search (flagged purple on the graph).
-* **Occlusion solver** (Track Settings, on by default): when the surface is covered (an eyelid over a pupil, a hand or car passing in front) the track carries on instead of stopping. It notices the cover either when tracking fails or when the surface stops looking like the reference (a closing eyelid that points would otherwise follow). Hidden frames are predicted from the area around the shape (a ring 2.5× its size: face, skin, background) when that still tracks, otherwise from the surface's own recent motion. Every hidden frame it tries to find the surface again by tracking straight from the last frame it was seen, accepting only a result that lands near the prediction and matches the reference's appearance; the predicted stretch is then corrected to join that frame seamlessly. Predicted frames are marked cyan on the timeline. *Bridge up to* (default 48 frames) limits the gap; past it the guesses are dropped and tracking stops with a message. On a synthetic blink (pupil covered for 6 frames on a moving face) the covered frames stay within 0.2 px.
+* **Occlusion solver** (Track Settings, on by default): when the surface is covered (an eyelid over a pupil, a hand or car passing in front) the track carries on instead of stopping or quietly sliding off with the cover.
+  * *Noticing the cover:* tracking fails, or the shape suddenly stops looking like it did a frame ago (a lid coming down), or it falls well below how it usually looks (a slower cover). Looks are compared as fine detail, not brightness, so soft shading and lighting changes don't count. If the last frame or two before the cover were already partly covered, the solver backs up to the last clean one.
+  * *Predicting hidden frames:* from the area around the shape (a ring 2.5× its size: face, skin, background) when that still tracks, limited to the layer's motion model; otherwise from the surface's own recent motion, slowing down.
+  * *Finding it again:* every hidden frame it searches near the prediction for the target's look, using the frame just before the cover and a memory of up to six clean frames from along the track, each turned and sized the way the surroundings moved. A match far from the prediction has to be much stronger than one close to it. It is accepted when point tracking confirms it, or when the search finds it in the same place two frames running, and only if it still looks right a frame later. The predicted stretch is then corrected to join up seamlessly.
+  * Predicted frames are cyan on the timeline. *Bridge up to* (default 48 frames) limits the gap; past it the guesses are dropped and tracking stops with a message.
+  * *Tested on real footage* (a 4K, 355-frame portrait with three blinks, eye rolls and a head turn during a blink): an iris-only box (Translation model) and a whole-eye shape (Similarity or Perspective) both carry through all three blinks and stay on the eye for the whole clip, with no false alarms on the iris box. For a pupil or iris, use the **Translation** model; scale and perspective drift on something that small and round. Tracking backwards through an eye that slowly reopens works with the whole-eye shape; a tiny iris box can slide off with the lid in that direction. Synthetic tests: a pupil covered for 6 frames stays within 0.2 px, and one that moves 16 px while hidden is found where it went.
+  * The *few good points* warning now scales to the layer: a small target that always has 10–20 points isn't flagged on every frame.
 * **Speed:** multi-core tracking, cropped anti-drift solve, background decoding of the next frame, and an automatic half-resolution first pass on 2.5K+ footage (full-res refinement keeps the precision).
 * **Export** (Save to Desktop / Send to app / Save As…):
 
@@ -96,6 +102,15 @@ Measured on a ray-traced 640×360 room with a moving camera and k1 = −0.06, tr
 6. Pick a format and **Save to Desktop** or **Send to …**.
 
 Tips: track areas with texture, and leave out things that move differently (people walking in front, reflections). Set the reference frame (**Set Reference Here**) to the frame where the surface is most clearly visible.
+
+## Testing on real footage
+
+`crates/trackwright-core/examples/track_clip.rs` runs the tracker on a folder of frames outside the app and writes every frame's corners, predicted flag and appearance scores to JSON:
+
+```
+cargo run --release -p trackwright-core --features parallel --example track_clip -- \
+    FRAMES_DIR START END x0,y0,x1,y1 out.json model=translation bridge=1
+```
 
 ## Building
 
