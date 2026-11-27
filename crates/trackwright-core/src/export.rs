@@ -17,18 +17,27 @@ pub enum ExportFormat {
     NukeCornerPin,
     /// After Effects Corner Pin keyframe data (paste into AE).
     AfterEffectsCornerPin,
+    /// Fusion / DaVinci Resolve (Fusion page) CornerPositioner, paste-able .setting.
+    FusionCornerPin,
+    /// Blender Python script: four corner tracks (+ plane track) in a Movie Clip.
+    Blender,
+    /// Shake 4.x four-point tracker file, imported by Silhouette (and Shake).
+    SilhouetteShake,
     /// Generic Trackwright JSON.
     Json,
     Csv,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 7] = [
+    pub const ALL: [ExportFormat; 10] = [
         ExportFormat::Reelforge,
         ExportFormat::Forma3d,
         ExportFormat::Tidefire,
         ExportFormat::NukeCornerPin,
         ExportFormat::AfterEffectsCornerPin,
+        ExportFormat::FusionCornerPin,
+        ExportFormat::Blender,
+        ExportFormat::SilhouetteShake,
         ExportFormat::Json,
         ExportFormat::Csv,
     ];
@@ -40,6 +49,9 @@ impl ExportFormat {
             ExportFormat::Tidefire => "Tidefire planar track (.tftrack.json)",
             ExportFormat::NukeCornerPin => "Nuke CornerPin2D (.nk)",
             ExportFormat::AfterEffectsCornerPin => "After Effects Corner Pin (.txt)",
+            ExportFormat::FusionCornerPin => "Fusion / DaVinci Resolve CornerPositioner (.setting)",
+            ExportFormat::Blender => "Blender plane-track script (.py)",
+            ExportFormat::SilhouetteShake => "Silhouette / Shake 4-point tracker (.txt)",
             ExportFormat::Json => "Trackwright JSON (.json)",
             ExportFormat::Csv => "CSV corners (.csv)",
         }
@@ -52,6 +64,9 @@ impl ExportFormat {
             ExportFormat::Tidefire => "tftrack.json",
             ExportFormat::NukeCornerPin => "nk",
             ExportFormat::AfterEffectsCornerPin => "txt",
+            ExportFormat::FusionCornerPin => "setting",
+            ExportFormat::Blender => "py",
+            ExportFormat::SilhouetteShake => "shake.txt",
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
         }
@@ -116,6 +131,9 @@ pub fn export(format: ExportFormat, footage: &Footage, layer: &Layer) -> String 
         ExportFormat::Tidefire => planar_3d(footage, layer, "tidefire"),
         ExportFormat::NukeCornerPin => nuke(footage, layer),
         ExportFormat::AfterEffectsCornerPin => after_effects(footage, layer),
+        ExportFormat::FusionCornerPin => fusion(footage, layer),
+        ExportFormat::Blender => blender(footage, layer),
+        ExportFormat::SilhouetteShake => shake_trackers(footage, layer),
         ExportFormat::Json => generic_json(footage, layer),
         ExportFormat::Csv => csv(footage, layer),
     }
@@ -307,4 +325,173 @@ pub fn file_name(footage: &Footage, layer: &Layer, format: ExportFormat) -> Stri
         clean(&layer.name),
         format.extension()
     )
+}
+
+fn ident(s: &str) -> String {
+    let n: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("Trackwright_{n}")
+}
+
+/// Fusion comp snippet (copy the file contents and paste into the Fusion node view,
+/// or File > Import). Points are normalised 0..1 with the origin at bottom-left; time
+/// is the clip frame index starting at 0, as on Resolve's Fusion page.
+fn fusion(f: &Footage, l: &Layer) -> String {
+    let (w, h) = (f.width.max(1) as f64, f.height.max(1) as f64);
+    let fr = frames(l);
+    let name = ident(&l.name);
+    // Fusion inputs, in our corner order TL, TR, BR, BL.
+    let inputs = ["TopLeft", "TopRight", "BottomRight", "BottomLeft"];
+    let mut out = String::from("{\n\tTools = ordered() {\n");
+    out += &format!("\t\t{name} = CornerPositioner {{\n\t\t\tInputs = {{\n");
+    for inp in inputs {
+        out += &format!(
+            "\t\t\t\t{inp} = Input {{ SourceOp = \"{name}{inp}\", Source = \"Value\", }},\n"
+        );
+    }
+    out += "\t\t\t},\n\t\t\tViewInfo = OperatorInfo { Pos = { 0, 0 } },\n\t\t},\n";
+    for (ci, inp) in inputs.iter().enumerate() {
+        out += &format!(
+            "\t\t{name}{inp} = XYPath {{\n\t\t\tShowKeyPoints = false,\n\t\t\tDrawMode = \"ModifyOnly\",\n\t\t\tInputs = {{\n\t\t\t\tX = Input {{ SourceOp = \"{name}{inp}X\", Source = \"Value\", }},\n\t\t\t\tY = Input {{ SourceOp = \"{name}{inp}Y\", Source = \"Value\", }},\n\t\t\t}},\n\t\t}},\n"
+        );
+        for axis in 0..2 {
+            let suffix = if axis == 0 { "X" } else { "Y" };
+            out += &format!("\t\t{name}{inp}{suffix} = BezierSpline {{\n\t\t\tSplineColor = {{ Red = 255, Green = 176, Blue = 32 }},\n\t\t\tNameSet = true,\n\t\t\tKeyFrames = {{\n");
+            for (i, c, ..) in &fr {
+                let v = if axis == 0 {
+                    c[ci][0] / w
+                } else {
+                    1.0 - c[ci][1] / h
+                };
+                out += &format!("\t\t\t\t[{i}] = {{ {v:.6}, Flags = {{ Linear = true }} }},\n");
+            }
+            out += "\t\t\t}\n\t\t},\n";
+        }
+    }
+    out += "\t},\n\tActiveTool = \"";
+    out += &name;
+    out += "\"\n}\n";
+    out
+}
+
+/// Python for Blender's Text Editor (Run Script): loads the footage as a Movie Clip,
+/// adds four corner tracks and, when possible, a plane track from them.
+fn blender(f: &Footage, l: &Layer) -> String {
+    let fr = frames(l);
+    let video_exts = [
+        "mp4", "mov", "mkv", "avi", "webm", "m4v", "mxf", "mpg", "mpeg", "wmv",
+    ];
+    let is_video = std::path::Path::new(&f.source)
+        .extension()
+        .map(|e| video_exts.contains(&e.to_string_lossy().to_lowercase().as_str()))
+        .unwrap_or(false);
+    let clip_path = if is_video {
+        f.source.clone()
+    } else {
+        f.frames.first().cloned().unwrap_or_default()
+    };
+    let mut corners = String::new();
+    for (i, c, ..) in &fr {
+        corners += &format!(
+            "    {}: (({:.4}, {:.4}), ({:.4}, {:.4}), ({:.4}, {:.4}), ({:.4}, {:.4})),\n",
+            i + 1,
+            c[0][0],
+            c[0][1],
+            c[1][0],
+            c[1][1],
+            c[2][0],
+            c[2][1],
+            c[3][0],
+            c[3][1]
+        );
+    }
+    format!(
+        r#"# Trackwright -> Blender
+# Open Blender's Scripting workspace, open this file in the Text Editor and press Run Script.
+# It loads the footage as a Movie Clip and adds four corner tracks for layer "{layer}".
+# A plane track is created from them when a Movie Clip Editor is open; otherwise select the
+# four tracks in the Movie Clip Editor and choose Track > Create Plane Track.
+import bpy
+
+FOOTAGE = r"{path}"
+WIDTH, HEIGHT = {w}, {h}
+LAYER = "{ident}"
+# clip frame (1 = first frame): (top-left, top-right, bottom-right, bottom-left), pixels, y down
+CORNERS = {{
+{corners}}}
+NAMES = ("TL", "TR", "BR", "BL")
+
+
+def main():
+    clip = bpy.data.movieclips.load(FOOTAGE, check_existing=True)
+    tracks_coll = clip.tracking.objects.active.tracks
+    first = min(CORNERS)
+    tracks = []
+    for i, name in enumerate(NAMES):
+        track = tracks_coll.new(name=LAYER + "_" + name, frame=first)
+        for frame, c in CORNERS.items():
+            x, y = c[i]
+            track.markers.insert_frame(frame, co=(x / WIDTH, 1.0 - y / HEIGHT))
+        tracks.append(track)
+    scene = bpy.context.scene
+    scene.active_clip = clip
+    scene.frame_start = first
+    scene.frame_end = max(CORNERS)
+    for t in tracks_coll:
+        t.select = t in tracks
+    made_plane = False
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "CLIP_EDITOR":
+                area.spaces.active.clip = clip
+                region = next(r for r in area.regions if r.type == "WINDOW")
+                with bpy.context.temp_override(window=window, area=area, region=region):
+                    try:
+                        bpy.ops.clip.create_plane_track()
+                        made_plane = True
+                    except RuntimeError as err:
+                        print("Could not create the plane track automatically:", err)
+                break
+    print("Trackwright: added", len(tracks), "tracks to", clip.name,
+          "and a plane track" if made_plane else "(select them and use Track > Create Plane Track)")
+
+
+main()
+"#,
+        layer = l.name.replace('"', "'"),
+        path = clip_path.replace('"', "\\\""),
+        w = f.width,
+        h = f.height,
+        ident = ident(&l.name),
+        corners = corners,
+    )
+}
+
+/// Shake 4.x tracker text file: four trackers (one per corner), origin bottom-left,
+/// frames numbered from 1. Silhouette imports this as point trackers.
+fn shake_trackers(f: &Footage, l: &Layer) -> String {
+    let h = f.height as f64;
+    let fr = frames(l);
+    let names = ["1_TopLeft", "2_TopRight", "3_BottomRight", "4_BottomLeft"];
+    let mut out = String::new();
+    for (ci, name) in names.iter().enumerate() {
+        out += &format!(
+            "TrackName {}_{}\n   Frame             X             Y   Correlation\n",
+            ident(&l.name),
+            name
+        );
+        for (i, c, ..) in &fr {
+            out += &format!(
+                "   {:.2}   {:.3}   {:.3}   {:.3}\n",
+                (*i + 1) as f64,
+                c[ci][0],
+                h - c[ci][1],
+                1.0
+            );
+        }
+        out += "\n";
+    }
+    out
 }

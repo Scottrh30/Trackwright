@@ -1,9 +1,10 @@
 //! Tiny parallelism helpers: multi-threaded with the `parallel` feature, sequential otherwise.
 
 /// Fill `data` (row-major, `width` per row) by calling `f(y, row)` for every row.
-pub fn rows<F>(data: &mut [f32], width: usize, f: F)
+pub fn rows<T, F>(data: &mut [T], width: usize, f: F)
 where
-    F: Fn(usize, &mut [f32]) + Sync + Send,
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync + Send,
 {
     if width == 0 {
         return;

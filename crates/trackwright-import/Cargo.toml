@@ -1,0 +1,15 @@
+[package]
+name = "trackwright-import"
+description = "Read Trackwright planar tracks (.rftrack.json, .f3dtrack.json, .tftrack.json) and evaluate corner pins at any time. For Reelforge, Forma3D and Tidefire."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+trackwright-core = { path = "../trackwright-core" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

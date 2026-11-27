@@ -36,10 +36,18 @@ Built in Rust with Tauri 2 and a Leptos UI.
 | Forma3D / Tidefire planar track `.f3dtrack.json` / `.tftrack.json` | corners in pixels **and** normalised device coords (-1..1, y up), homography |
 | Nuke `CornerPin2D` `.nk` | paste into Nuke |
 | After Effects Corner Pin `.txt` | copy the file contents, select the layer in AE, paste |
+| Fusion / DaVinci Resolve CornerPositioner `.setting` | copy the contents and paste into the Fusion node view (Fusion page in Resolve). Points are normalised; time starts at 0 |
+| Blender plane-track script `.py` | run in Blender's Text Editor: loads the footage as a Movie Clip, adds four corner tracks and a plane track |
+| Silhouette / Shake 4-point tracker `.shake.txt` | Silhouette: import as Shake trackers (it also reads the AE corner pin and Nuke exports). Trackers are numbered TL, TR, BR, BL |
 | Trackwright JSON / CSV | everything / spreadsheet |
 
 "Send to Reelforge / Forma3D / Tidefire" writes into each app's import folder (default `Documents/<App>/Imports/Tracks`, change it in **App Folders**).
 
+* **Render** (Render panel, uses In/Out when set):
+  * *Insert composited into the footage*: the pinned image/clip rendered into every frame, with the layer's exclusion areas kept in front.
+  * *Stabilize: smooth the motion* (smoothing window in frames) or *lock to the surface*, with zoom to hide the edges.
+  * Output is a PNG sequence, plus an H.264 MP4 when ffmpeg is installed.
+* **Reelforge import:** the `trackwright-import` crate (`crates/trackwright-import`) reads Trackwright tracks and gives corners, transforms or a corner-pin homography at any time. See its README for wiring it into a Reelforge effect.
 * **Projects:** `.twproj` (JSON) save/load, **Recent** menu, autosave every 30 s with crash recovery on the next launch, and a Save / Don't Save / Cancel prompt before closing, starting a new project or opening another one with unsaved changes.
 
 ### Workflow

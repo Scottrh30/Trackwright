@@ -157,3 +157,6 @@ button.inout.set { border-color: #46d17a; color: #46d17a; }
 button.warn { color: #ffb020; }
 .panel .toggle { margin: 4px 0; }
 .panel .toggle .swatch { margin-left: 2px; }
+.progress { height: 6px; background: #121419; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; margin: 6px 0; }
+.progress .bar { height: 100%; background: var(--accent); transition: width 0.15s; }
+.export-grid .primary:only-of-type { grid-column: auto; }

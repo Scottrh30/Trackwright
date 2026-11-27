@@ -74,6 +74,18 @@ struct TrackFrameEvent {
 }
 
 #[derive(Clone, Deserialize)]
+struct RenderProgress {
+    done: usize,
+    total: usize,
+}
+
+#[derive(Clone, Deserialize)]
+struct RenderDone {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct TrackDoneEvent {
     ok: bool,
     message: String,
@@ -153,6 +165,12 @@ struct Ctx {
     modal: RwSignal<Modal>,
     in_point: RwSignal<Option<usize>>,
     out_point: RwSignal<Option<usize>>,
+    render_mode: RwSignal<String>,
+    smooth_frames: RwSignal<usize>,
+    zoom_pct: RwSignal<f64>,
+    make_video: RwSignal<bool>,
+    rendering: RwSignal<bool>,
+    render_progress: RwSignal<(usize, usize)>,
     drag: StoredValue<Drag>,
     play_handle: StoredValue<Option<IntervalHandle>>,
     viewport: NodeRef<html::Canvas>,
@@ -210,6 +228,12 @@ impl Ctx {
             modal: RwSignal::new(Modal::None),
             in_point: RwSignal::new(None),
             out_point: RwSignal::new(None),
+            render_mode: RwSignal::new("insert".into()),
+            smooth_frames: RwSignal::new(15),
+            zoom_pct: RwSignal::new(100.0),
+            make_video: RwSignal::new(true),
+            rendering: RwSignal::new(false),
+            render_progress: RwSignal::new((0, 0)),
             drag: StoredValue::new(Drag::None),
             play_handle: StoredValue::new(None),
             viewport: NodeRef::new(),
@@ -769,6 +793,14 @@ fn App() -> impl IntoView {
         );
     });
     tauri::listen::<ProxyInfo>("proxy-progress", move |p| ctx.proxy.set(p));
+    tauri::listen::<RenderProgress>("render-progress", move |p| {
+        ctx.render_progress.set((p.done, p.total));
+        ctx.say(format!("Rendering… {} / {}", p.done, p.total), false);
+    });
+    tauri::listen::<RenderDone>("render-done", move |d| {
+        ctx.rendering.set(false);
+        ctx.say(d.message, !d.ok);
+    });
     tauri::listen::<String>("app-error", move |m| ctx.say(m, true));
     tauri::listen::<String>("app-status", move |m| ctx.say(m, false));
     tauri::listen::<serde_json::Value>("confirm-close", move |_| ctx.guard(Pending::Close));
@@ -1226,6 +1258,90 @@ fn LayerSection(layer: Layer) -> impl IntoView {
             </label>
             <button class="wide" on:click=move |_| ctx.edit_layer(|l| l.surface = trackwright_core::shape::default_surface(&l.shape))>"Reset Surface to Shape Bounds"</button>
             <p class="hint">"Edit Shape (E): drag points, click an edge to add a point, drag inside to move the shape, Delete removes the selected point. Surface (S): drag corners or drag inside to move it."</p>
+        </section>
+    }
+}
+
+/// Render a stabilized clip or the insert composited into the footage.
+#[component]
+fn RenderSection() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let start = move |destination: &'static str| {
+        let Some(id) = ctx.selected.get_untracked() else {
+            ctx.say("Select a tracked layer to render", true);
+            return;
+        };
+        let request = json!({
+            "id": id,
+            "mode": ctx.render_mode.get_untracked(),
+            "smooth_frames": ctx.smooth_frames.get_untracked(),
+            "zoom": ctx.zoom_pct.get_untracked(),
+            "from": ctx.in_point.get_untracked(),
+            "to": ctx.out_point.get_untracked(),
+            "destination": destination,
+            "make_video": ctx.make_video.get_untracked(),
+            "holdout": true,
+        });
+        ctx.rendering.set(true);
+        ctx.render_progress.set((0, 0));
+        ctx.say("Starting render…", false);
+        spawn_local(async move {
+            if let Err(e) = tauri::call::<()>("render_layer", json!({ "request": request })).await {
+                ctx.rendering.set(false);
+                ctx.say(e, true);
+            }
+        });
+    };
+    let mode_opt = move |id: &'static str, label: &'static str| {
+        view! { <option value=id selected=move || ctx.render_mode.get() == id>{label}</option> }
+    };
+    view! {
+        <section>
+            <h3>"Render"</h3>
+            <label class="field">"Output"
+                <select on:change=move |ev| ctx.render_mode.set(event_target_value(&ev))>
+                    {mode_opt("insert", "Insert composited into the footage")}
+                    {mode_opt("stabilize_smooth", "Stabilize: smooth the motion")}
+                    {mode_opt("stabilize_lock", "Stabilize: lock to the surface")}
+                </select>
+            </label>
+            <Show when=move || ctx.render_mode.get().starts_with("stabilize")>
+                <div class="row">
+                    <Show when=move || ctx.render_mode.get() == "stabilize_smooth">
+                        <label class="field">"Smoothing (frames)"
+                            <input type="number" min="1" max="200" step="1" prop:value=move || ctx.smooth_frames.get().to_string()
+                                on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<usize>() { ctx.smooth_frames.set(v.clamp(1, 200)) } } />
+                        </label>
+                    </Show>
+                    <label class="field">"Zoom %"
+                        <input type="number" min="50" max="300" step="1" prop:value=move || format!("{:.0}", ctx.zoom_pct.get())
+                            on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<f64>() { ctx.zoom_pct.set(v.clamp(50.0, 300.0)) } } />
+                    </label>
+                </div>
+            </Show>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=move || ctx.make_video.get() on:change=move |_| ctx.make_video.update(|v| *v = !*v) />
+                "Also make an MP4 (needs ffmpeg)"
+            </label>
+            <Show when=move || ctx.render_mode.get() == "insert">
+                <p class="hint">"Areas covered by this layer's exclusions stay in front of the insert."</p>
+            </Show>
+            <p class="hint">{move || match (ctx.in_point.get(), ctx.out_point.get()) {
+                (None, None) => "Renders the layer's whole tracked range as a PNG sequence.".to_string(),
+                _ => "Renders the In/Out range (within the tracked frames) as a PNG sequence.".to_string(),
+            }}</p>
+            <Show when=move || !ctx.rendering.get() fallback=move || view! {
+                <div class="progress"><div class="bar" style=move || {
+                    let (d, t) = ctx.render_progress.get();
+                    format!("width:{}%", if t == 0 { 0 } else { d * 100 / t })
+                }></div></div>
+                <button class="wide stop" on:click=move |_| spawn_local(async move { let _ = tauri::call::<()>("stop_render", json!({})).await; })>"Stop Render"</button>
+            }>
+                <div class="export-grid">
+                    <button class="primary" on:click=move |_| start("desktop")>"Render to Desktop"</button>
+                    <button on:click=move |_| start("choose")>"Render To…"</button>
+                </div>
+            </Show>
         </section>
     }
 }
@@ -1782,6 +1898,8 @@ fn RightPanel() -> impl IntoView {
                     <button on:click=move |_| ctx.export("choose")>"Save As…"</button>
                 </div>
             </section>
+
+            <RenderSection/>
 
             <section>
                 <h3>"App Folders"</h3>

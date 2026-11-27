@@ -512,3 +512,81 @@ fn bench_4k() {
         );
     }
 }
+
+#[test]
+fn new_export_formats_are_well_formed() {
+    let mut l = Layer::new(1, 0, Shape::rect(100.0, 100.0, 200.0, 100.0));
+    for k in 1..5 {
+        l.tracks.insert(
+            k,
+            FrameTrack {
+                h_from_ref: truth(k),
+                ..FrameTrack::reference()
+            },
+        );
+    }
+    let footage = Footage {
+        source: "C:\\shots\\plate.mov".into(),
+        frames: vec![String::new(); 5],
+        width: 640,
+        height: 480,
+        fps: 24.0,
+        first_frame: 1001,
+    };
+    let fu = export(ExportFormat::FusionCornerPin, &footage, &l);
+    assert!(
+        fu.contains("CornerPositioner")
+            && fu.contains("Trackwright_Layer_1TopLeftX = BezierSpline")
+            && fu.contains("[4] = {")
+    );
+    assert_eq!(
+        fu.matches('{').count(),
+        fu.matches('}').count(),
+        "balanced braces"
+    );
+    // Top-left of the reference surface is (100,100) -> normalised (0.15625, 1-0.2083).
+    assert!(fu.contains("[0] = { 0.156250,") && fu.contains("[0] = { 0.791667,"));
+    let py = export(ExportFormat::Blender, &footage, &l);
+    assert!(
+        py.contains("bpy.data.movieclips.load")
+            && py.contains(r#"FOOTAGE = r"C:\shots\plate.mov""#)
+            && py.contains("    1: ((100.0000, 100.0000)")
+    );
+    let sh = export(ExportFormat::SilhouetteShake, &footage, &l);
+    assert_eq!(sh.matches("TrackName").count(), 4);
+    assert!(sh.contains("   1.00   100.000   380.000   1.000"));
+}
+
+#[test]
+#[ignore]
+fn dump_new_formats() {
+    let mut l = Layer::new(1, 0, Shape::rect(100.0, 100.0, 200.0, 100.0));
+    for k in 1..3 {
+        l.tracks.insert(
+            k,
+            FrameTrack {
+                h_from_ref: truth(k),
+                ..FrameTrack::reference()
+            },
+        );
+    }
+    let footage = Footage {
+        source: "/tmp/plate.mov".into(),
+        frames: vec![String::new(); 3],
+        width: 640,
+        height: 480,
+        fps: 24.0,
+        first_frame: 1001,
+    };
+    for f in [
+        ExportFormat::FusionCornerPin,
+        ExportFormat::Blender,
+        ExportFormat::SilhouetteShake,
+    ] {
+        std::fs::write(
+            format!("/tmp/twexport.{}", f.extension()),
+            export(f, &footage, &l),
+        )
+        .unwrap();
+    }
+}

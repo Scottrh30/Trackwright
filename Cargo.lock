@@ -4853,6 +4853,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trackwright-import"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde",
+ "serde_json",
+ "trackwright-core",
+]
+
+[[package]]
 name = "trackwright-ui"
 version = "0.1.0"
 dependencies = [

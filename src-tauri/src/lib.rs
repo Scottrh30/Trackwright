@@ -16,6 +16,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use trackwright_core::export::{self, ExportFormat};
 use trackwright_core::project::Insert;
+use trackwright_core::render;
 use trackwright_core::{
     exclusion_polys, retrack_section, track_layer, FrameSource, FrameTrack, GrayImage, Layer,
     Project, Pyramid, Shape, StopReason,
@@ -203,6 +204,8 @@ struct AppState {
     settings: Mutex<AppSettings>,
     proxies: ProxyBuilder,
     allow_close: AtomicBool,
+    rendering: Arc<AtomicBool>,
+    render_cancel: Arc<AtomicBool>,
 }
 
 /// Everything the UI needs after a change.
@@ -1117,6 +1120,282 @@ async fn export_layer(
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// Rendering: stabilized clips and insert composites
+
+#[derive(Deserialize)]
+struct RenderRequest {
+    id: u32,
+    /// "insert", "stabilize_lock" or "stabilize_smooth"
+    mode: String,
+    smooth_frames: Option<usize>,
+    /// Percent, 100 = no zoom.
+    zoom: Option<f64>,
+    from: Option<usize>,
+    to: Option<usize>,
+    /// "desktop" or "choose"
+    destination: String,
+    make_video: bool,
+    /// Put the layer's exclusion areas (occluders) back over the insert.
+    holdout: Option<bool>,
+}
+
+#[derive(Clone, Serialize)]
+struct RenderProgress {
+    done: usize,
+    total: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct RenderDone {
+    ok: bool,
+    message: String,
+    path: Option<String>,
+}
+
+fn load_rgba(path: &str) -> Result<render::Rgba, String> {
+    let img = image::open(path)
+        .map_err(|e| format!("{path}: {e}"))?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    Ok(render::Rgba {
+        width: w as usize,
+        height: h as usize,
+        data: img.into_raw(),
+    })
+}
+
+fn save_png(img: render::Rgba, path: &Path) -> Result<(), String> {
+    image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.data)
+        .ok_or("bad image buffer")?
+        .save(path)
+        .map_err(|e| format!("Could not write {}: {e}", path.display()))
+}
+
+fn unique_dir(base: PathBuf) -> PathBuf {
+    if !base.exists() {
+        return base;
+    }
+    (2..)
+        .map(|n| PathBuf::from(format!("{}_{n}", base.display())))
+        .find(|p| !p.exists())
+        .unwrap()
+}
+
+/// Render the selected layer as a PNG sequence (and optionally an MP4) in the background.
+#[tauri::command]
+async fn render_layer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RenderRequest,
+) -> CmdResult<()> {
+    ensure_not_tracking(&state)?;
+    if state.rendering.load(Ordering::SeqCst) {
+        return Err("A render is already running".into());
+    }
+    let (footage, layer, all_layers) = {
+        let p = state.project.lock().unwrap();
+        let f = p.footage.clone().ok_or("Open footage first")?;
+        let l = p.layer(request.id).ok_or("Layer not found")?.clone();
+        (f, l, p.layers.clone())
+    };
+    let holdout = request.holdout.unwrap_or(true);
+    let insert_mode = request.mode == "insert";
+    if insert_mode && layer.insert.is_none() {
+        return Err("Pick an insert image or clip for this layer first (Insert Preview)".into());
+    }
+    let (t0, t1) = layer.tracked_range().ok_or("Track the layer first")?;
+    let from = request.from.unwrap_or(t0).max(t0);
+    let to = request
+        .to
+        .unwrap_or(t1)
+        .min(t1)
+        .min(footage.frames.len().saturating_sub(1));
+    if to < from || layer.tracks.len() < 2 {
+        return Err("Nothing tracked in that range".into());
+    }
+    let frames: Vec<usize> = (from..=to).collect();
+
+    let suffix = match request.mode.as_str() {
+        "insert" => "insert",
+        "stabilize_lock" => "locked",
+        _ => "stabilized",
+    };
+    let parent = match request.destination.as_str() {
+        "desktop" => dirs::desktop_dir()
+            .or_else(dirs::home_dir)
+            .ok_or("Could not find your Desktop folder")?,
+        _ => {
+            let picked = app
+                .dialog()
+                .file()
+                .set_title("Choose where to render")
+                .blocking_pick_folder();
+            match picked.and_then(|p| p.into_path().ok()) {
+                Some(p) => p,
+                None => return Ok(()),
+            }
+        }
+    };
+    let stem = export::file_name(&footage, &layer, ExportFormat::Csv);
+    let stem = stem.trim_end_matches(".csv");
+    let out_dir = unique_dir(parent.join(format!("{stem}_{suffix}")));
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Could not create {}: {e}", out_dir.display()))?;
+
+    let maps = if insert_mode {
+        vec![]
+    } else {
+        let mode = if request.mode == "stabilize_lock" {
+            render::StabilizeMode::Lock
+        } else {
+            render::StabilizeMode::Smooth {
+                radius: request.smooth_frames.unwrap_or(15).clamp(1, 200),
+            }
+        };
+        let zoom = request.zoom.unwrap_or(100.0) / 100.0;
+        render::stabilize_maps(
+            &layer,
+            &frames,
+            mode,
+            zoom,
+            footage.width as usize,
+            footage.height as usize,
+        )
+    };
+
+    state.rendering.store(true, Ordering::SeqCst);
+    state.render_cancel.store(false, Ordering::SeqCst);
+    let rendering = state.rendering.clone();
+    let cancel = state.render_cancel.clone();
+    let make_video = request.make_video;
+    std::thread::spawn(move || {
+        let total = frames.len();
+        let mut insert_cache: Option<(String, render::Rgba)> = None;
+        let mut last_map = None;
+        let result = (|| -> Result<bool, String> {
+            for (k, &f) in frames.iter().enumerate() {
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                let src = load_rgba(&footage.frames[f])?;
+                let out = if insert_mode {
+                    let original = if holdout && !layer.exclusions.is_empty() {
+                        Some(src.clone())
+                    } else {
+                        None
+                    };
+                    let mut frame = src;
+                    if let (Some(ins), Some(corners)) = (layer.insert.as_ref(), layer.surface_at(f))
+                    {
+                        if let Some(path) = ins.frame_for(f) {
+                            if insert_cache.as_ref().map(|(p, _)| p.as_str()) != Some(path) {
+                                insert_cache = Some((path.to_string(), load_rgba(path)?));
+                            }
+                            render::composite_insert(
+                                &mut frame,
+                                &insert_cache.as_ref().unwrap().1,
+                                &corners,
+                                ins.opacity,
+                            );
+                        }
+                    }
+                    if let Some(orig) = original {
+                        for poly in exclusion_polys(&all_layers, &layer, f) {
+                            render::restore_inside(&mut frame, &orig, &poly);
+                        }
+                    }
+                    frame
+                } else {
+                    // Untracked gaps hold the nearest previous transform.
+                    if let Some((_, m)) = maps.iter().find(|(g, _)| *g == f) {
+                        last_map = Some(*m);
+                    }
+                    let m = last_map
+                        .or_else(|| maps.first().map(|(_, m)| *m))
+                        .ok_or("No tracked frames to stabilize")?;
+                    render::warp(&src, &m, src.width, src.height, [0, 0, 0, 255])
+                };
+                save_png(
+                    out,
+                    &out_dir.join(format!("frame_{:06}.png", footage.frame_number(f))),
+                )?;
+                let _ = app.emit("render-progress", RenderProgress { done: k + 1, total });
+            }
+            Ok(true)
+        })();
+        let done = match result {
+            Ok(false) => RenderDone {
+                ok: true,
+                message: format!("Render stopped. Frames so far are in {}", out_dir.display()),
+                path: Some(out_dir.to_string_lossy().to_string()),
+            },
+            Err(e) => RenderDone {
+                ok: false,
+                message: e,
+                path: None,
+            },
+            Ok(true) if make_video => {
+                let mp4 = out_dir.with_extension("mp4");
+                let first = footage.frame_number(frames[0]);
+                let fps = if footage.fps > 0.0 { footage.fps } else { 24.0 };
+                let status = footage::command("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-y",
+                        "-framerate",
+                        &format!("{fps}"),
+                        "-start_number",
+                        &first.to_string(),
+                        "-i",
+                    ])
+                    .arg(out_dir.join("frame_%06d.png"))
+                    .args([
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-crf",
+                        "18",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-vf",
+                        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                    ])
+                    .arg(&mp4)
+                    .output();
+                match status {
+                    Ok(o) if o.status.success() => RenderDone { ok: true, message: format!("Rendered {total} frames and {}", mp4.display()), path: Some(mp4.to_string_lossy().to_string()) },
+                    Ok(o) => RenderDone {
+                        ok: false,
+                        message: format!("Frames rendered to {}, but the MP4 failed: {}", out_dir.display(), String::from_utf8_lossy(&o.stderr).trim()),
+                        path: Some(out_dir.to_string_lossy().to_string()),
+                    },
+                    Err(_) => RenderDone {
+                        ok: false,
+                        message: format!("Frames rendered to {}. Install ffmpeg (winget install ffmpeg) to also get an MP4", out_dir.display()),
+                        path: Some(out_dir.to_string_lossy().to_string()),
+                    },
+                }
+            }
+            Ok(true) => RenderDone {
+                ok: true,
+                message: format!("Rendered {total} frames to {}", out_dir.display()),
+                path: Some(out_dir.to_string_lossy().to_string()),
+            },
+        };
+        rendering.store(false, Ordering::SeqCst);
+        let _ = app.emit("render-done", done);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_render(state: State<'_, AppState>) {
+    state.render_cancel.store(true, Ordering::SeqCst);
+}
+
 /// Open footage or a project outside a command (drag & drop, command line) and notify the UI.
 fn open_and_emit(app: AppHandle, path: PathBuf) {
     let Some(state) = app.try_state::<AppState>() else {
@@ -1188,6 +1467,8 @@ pub fn run() {
                 settings: Mutex::new(settings),
                 proxies: ProxyBuilder::new(),
                 allow_close: AtomicBool::new(false),
+                rendering: Arc::new(AtomicBool::new(false)),
+                render_cancel: Arc::new(AtomicBool::new(false)),
             });
             let handle = app.handle().clone();
             std::thread::spawn(move || autosave_loop(handle));
@@ -1245,6 +1526,8 @@ pub fn run() {
             set_settings,
             pick_folder,
             export_layer,
+            render_layer,
+            stop_render,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Trackwright");

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/trackwright-core", "src-tauri", "ui"]
+members = ["crates/trackwright-core", "crates/trackwright-import", "src-tauri", "ui"]
 
 [workspace.package]
 version = "0.1.0"

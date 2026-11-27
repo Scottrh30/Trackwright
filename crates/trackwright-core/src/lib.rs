@@ -10,6 +10,7 @@ pub mod klt;
 mod par;
 pub mod planar;
 pub mod project;
+pub mod render;
 pub mod shape;
 
 pub use export::ExportFormat;

@@ -129,7 +129,7 @@ fn ffmpeg_bin(name: &str) -> String {
     name.to_string()
 }
 
-fn command(name: &str) -> Command {
+pub(crate) fn command(name: &str) -> Command {
     #[allow(unused_mut)]
     let mut c = Command::new(ffmpeg_bin(name));
     #[cfg(windows)]
