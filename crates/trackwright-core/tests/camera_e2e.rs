@@ -227,6 +227,15 @@ fn rendered_room_solve() {
     for fmt in trackwright_core::camera_export::CameraFormat::ALL {
         let text =
             trackwright_core::camera_export::export_camera(fmt, &footage, &solve, 36.0, "Room cam");
+        match fmt {
+            trackwright_core::camera_export::CameraFormat::Fbx => {
+                assert!(text.starts_with(b"Kaydara FBX Binary  \x00\x1a\x00"))
+            }
+            trackwright_core::camera_export::CameraFormat::Alembic => {
+                assert!(text.starts_with(b"Ogawa\xff\x00\x01"))
+            }
+            _ => assert!(std::str::from_utf8(&text).is_ok()),
+        }
         std::fs::write(format!("/tmp/twcam.{}", fmt.extension()), text).unwrap();
     }
     assert!((solve.focal_px - focal).abs() / focal < 0.03);
