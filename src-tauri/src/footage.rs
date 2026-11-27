@@ -186,15 +186,25 @@ pub fn open_video(video: &Path, cache_root: &Path) -> Result<Footage, String> {
     if !done_marker.exists() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let out = command("ffmpeg")
-            .args(["-v", "error", "-y", "-i"])
-            .arg(video)
-            .args(["-vsync", "0", "-q:v", "2", "-start_number", "0"])
-            .arg(dir.join("frame_%06d.jpg"))
-            .output()
-            .map_err(|_| {
-                "Video import needs ffmpeg. Install it (winget install ffmpeg) or put ffmpeg.exe next to Trackwright, or export your clip as an image sequence".to_string()
-            })?;
+        // Every frame as decoded, none dropped or doubled. FFmpeg 5.1+ calls this
+        // `-fps_mode passthrough` (8.0 removed the old `-vsync 0`); older builds
+        // only know `-vsync`.
+        let decode = |sync: [&str; 2]| {
+            command("ffmpeg")
+                .args(["-v", "error", "-y", "-i"])
+                .arg(video)
+                .args(sync)
+                .args(["-q:v", "2", "-start_number", "0"])
+                .arg(dir.join("frame_%06d.jpg"))
+                .output()
+                .map_err(|_| {
+                    "Video import needs ffmpeg. Run get-ffmpeg.bat, put ffmpeg.exe next to Trackwright, or export your clip as an image sequence".to_string()
+                })
+        };
+        let mut out = decode(["-fps_mode", "passthrough"])?;
+        if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("fps_mode") {
+            out = decode(["-vsync", "0"])?;
+        }
         if !out.status.success() {
             return Err(format!(
                 "ffmpeg could not decode the video: {}",
