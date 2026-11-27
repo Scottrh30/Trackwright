@@ -90,6 +90,8 @@ enum Drag {
     SurfaceCorner(usize),
     MoveShape { start: Point, orig: Shape },
     MoveSurface { start: Point, orig: [Point; 4] },
+    AdjustCorner(usize),
+    MoveAdjust { start: Point, orig: [Point; 4] },
 }
 
 /// Something that would throw away unsaved work.
@@ -149,6 +151,8 @@ struct Ctx {
     settings: RwSignal<AppSettings>,
     export_format: RwSignal<ExportFormat>,
     modal: RwSignal<Modal>,
+    in_point: RwSignal<Option<usize>>,
+    out_point: RwSignal<Option<usize>>,
     drag: StoredValue<Drag>,
     play_handle: StoredValue<Option<IntervalHandle>>,
     viewport: NodeRef<html::Canvas>,
@@ -204,6 +208,8 @@ impl Ctx {
             settings: RwSignal::new(AppSettings::default()),
             export_format: RwSignal::new(ExportFormat::Reelforge),
             modal: RwSignal::new(Modal::None),
+            in_point: RwSignal::new(None),
+            out_point: RwSignal::new(None),
             drag: StoredValue::new(Drag::None),
             play_handle: StoredValue::new(None),
             viewport: NodeRef::new(),
@@ -401,13 +407,131 @@ impl Ctx {
         }
         self.tracking.set(true);
         self.say("Tracking…", false);
+        // Stop at the Out point going forward, the In point going backward.
+        let until = if direction >= 0 {
+            self.out_point.get_untracked()
+        } else {
+            self.in_point.get_untracked()
+        };
         spawn_local(async move {
-            let args = json!({ "id": id, "from": fr, "direction": direction, "steps": steps });
+            let args = json!({ "id": id, "from": fr, "direction": direction, "steps": steps, "until": until, "blend": false });
             if let Err(e) = tauri::call::<()>("start_tracking", args).await {
                 self.tracking.set(false);
                 self.say(e, true);
             }
         });
+    }
+
+    /// Re-track In..Out and blend it into the existing track at Out.
+    fn retrack_section(self) {
+        if self.tracking.get_untracked() {
+            return;
+        }
+        let Some(id) = self.selected.get_untracked() else {
+            self.say("Select a layer first", true);
+            return;
+        };
+        let (Some(a), Some(b)) = (
+            self.in_point.get_untracked(),
+            self.out_point.get_untracked(),
+        ) else {
+            self.say("Set an In point (I) at a good frame and an Out point (O) where the track is good again", true);
+            return;
+        };
+        let ok = self.project.with_untracked(|p| {
+            p.layer(id)
+                .map(|l| l.tracks.contains_key(&a) && l.link.is_none())
+                .unwrap_or(false)
+        });
+        if !ok {
+            self.say(
+                "The In frame must already be tracked (and the layer must use its own track)",
+                true,
+            );
+            return;
+        }
+        if b <= a {
+            self.say("The Out point must be after the In point", true);
+            return;
+        }
+        self.tracking.set(true);
+        self.say("Re-tracking section…", false);
+        spawn_local(async move {
+            let args = json!({ "id": id, "from": a, "direction": 1, "steps": null, "until": b, "blend": true });
+            if let Err(e) = tauri::call::<()>("start_tracking", args).await {
+                self.tracking.set(false);
+                self.say(e, true);
+            }
+        });
+    }
+
+    /// Jump to the next frame flagged on the quality graph (wraps around).
+    fn next_problem(self) {
+        let Some(id) = self.selected.get_untracked() else {
+            return;
+        };
+        let fr = self.frame.get_untracked();
+        let found = self.project.with_untracked(|p| {
+            let l = p.layer(id)?;
+            let probs: Vec<(usize, trackwright_core::Problem)> = l
+                .tracks
+                .keys()
+                .filter_map(|&f| l.problem_at(f).map(|pr| (f, pr)))
+                .collect();
+            probs
+                .iter()
+                .find(|(f, _)| *f > fr)
+                .or(probs.first())
+                .copied()
+        });
+        match found {
+            Some((f, pr)) => {
+                self.frame.set(f);
+                let why = match pr {
+                    trackwright_core::Problem::HighError => "high error",
+                    trackwright_core::Problem::FewPoints => "few good points",
+                    trackwright_core::Problem::Retried => "needed a second, wider search (blur?)",
+                };
+                self.say(
+                    format!(
+                        "Check this frame: {why}. Fix with Adjust (A), or set In/Out and Re-track"
+                    ),
+                    false,
+                );
+            }
+            None => self.say("No problem frames on this layer", false),
+        }
+    }
+
+    fn problem_count(self) -> usize {
+        let Some(id) = self.selected.get() else {
+            return 0;
+        };
+        self.project.with(|p| {
+            p.layer(id)
+                .map(|l| {
+                    l.tracks
+                        .keys()
+                        .filter(|&&f| l.problem_at(f).is_some())
+                        .count()
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    fn set_in_out(self, is_in: bool) {
+        let f = self.frame.get_untracked();
+        if is_in {
+            if self.out_point.get_untracked().is_some_and(|o| o <= f) {
+                self.out_point.set(None);
+            }
+            self.in_point.set(Some(f));
+        } else {
+            if self.in_point.get_untracked().is_some_and(|i| i >= f) {
+                self.in_point.set(None);
+            }
+            self.out_point.set(Some(f));
+        }
     }
 
     fn stop_track(self) {
@@ -544,9 +668,7 @@ impl Ctx {
         }
         self.sel_point.set(None);
         self.edit_layer(move |l| {
-            if i < l.shape.points.len() {
-                l.shape.points.remove(i);
-            }
+            l.remove_shape_point(i);
         });
     }
 
@@ -768,7 +890,9 @@ fn App() -> impl IntoView {
             return;
         };
         let (fr, sel) = (ctx.frame.get(), ctx.selected.get());
-        ctx.project.with(|p| draw_timeline(&canvas, p, fr, sel));
+        let (ip, op) = (ctx.in_point.get(), ctx.out_point.get());
+        ctx.project
+            .with(|p| draw_timeline(&canvas, p, fr, sel, ip, op));
     });
     let _resize = window_event_listener(ev::resize, move |_| ctx.bump());
     let _up = window_event_listener(ev::mouseup, move |_| {
@@ -850,6 +974,14 @@ fn App() -> impl IntoView {
                 ctx.delete_selected_point()
             }
             "d" => ctx.tool.set(Tool::Draw),
+            "a" => ctx.tool.set(Tool::Adjust),
+            "i" => ctx.set_in_out(true),
+            "o" => ctx.set_in_out(false),
+            "x" => {
+                ctx.in_point.set(None);
+                ctx.out_point.set(None);
+            }
+            "n" => ctx.next_problem(),
             "e" => ctx.tool.set(Tool::EditShape),
             "s" => ctx.tool.set(Tool::Surface),
             "h" => ctx.tool.set(Tool::Pan),
@@ -899,7 +1031,7 @@ fn TopBar() -> impl IntoView {
             <div class="group">
                 <button title="New project (Ctrl+N)" on:click=move |_| ctx.guard(Pending::New)>"New"</button>
                 <button on:click=move |_| ctx.open_footage("file")>"Open Footage…"</button>
-                <button on:click=move |_| ctx.open_footage("folder")>"Sequence Folder…"</button>
+                <button on:click=move |_| ctx.open_footage("folder")>"Sequence…"</button>
                 <button title="Open project (Ctrl+O)" on:click=move |_| ctx.guard(Pending::OpenProject(None))>"Open Project…"</button>
                 <div class="menu-wrap">
                     <button disabled=move || ctx.recent.get().is_empty() on:click=move |_| ctx.recent_open.update(|v| *v = !*v)>"Recent ▾"</button>
@@ -928,8 +1060,9 @@ fn TopBar() -> impl IntoView {
             <div class="group tools">
                 {tool_btn(Tool::Pan, "Pan", "H")}
                 {tool_btn(Tool::Draw, "Draw", "D")}
-                {tool_btn(Tool::EditShape, "Edit Shape", "E")}
+                {tool_btn(Tool::EditShape, "Edit", "E")}
                 {tool_btn(Tool::Surface, "Surface", "S")}
+                {tool_btn(Tool::Adjust, "Adjust", "A")}
             </div>
             <div class="spacer"></div>
             <button on:click=move |_| ctx.modal.set(Modal::About)>"About"</button>
@@ -1031,6 +1164,8 @@ fn LeftPanel() -> impl IntoView {
 
             {move || sel_layer().map(|l| view! {
                 <LayerSection layer=l.clone()/>
+                <KeysSection layer=l.clone()/>
+                <ExclusionsSection layer=l.clone()/>
                 <InsertSection layer=l.clone()/>
                 <TrackSettingsSection layer=l/>
             })}
@@ -1091,6 +1226,96 @@ fn LayerSection(layer: Layer) -> impl IntoView {
             </label>
             <button class="wide" on:click=move |_| ctx.edit_layer(|l| l.surface = trackwright_core::shape::default_surface(&l.shape))>"Reset Surface to Shape Bounds"</button>
             <p class="hint">"Edit Shape (E): drag points, click an edge to add a point, drag inside to move the shape, Delete removes the selected point. Surface (S): drag corners or drag inside to move it."</p>
+        </section>
+    }
+}
+
+/// Shape keyframes and Adjust Track keys for the selected layer.
+#[component]
+fn KeysSection(layer: Layer) -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let n_shape = layer.shape_keys.len();
+    let n_adjust = layer.adjust_keys.len();
+    let linked = layer.link.is_some();
+    let here = move || ctx.frame.get();
+    let shape_key_here = {
+        let keys: Vec<usize> = layer.shape_keys.keys().copied().collect();
+        move || keys.contains(&here())
+    };
+    let adjust_key_here = {
+        let keys: Vec<usize> = layer.adjust_keys.keys().copied().collect();
+        move || keys.contains(&here())
+    };
+    let shape_key_here2 = shape_key_here.clone();
+    let adjust_key_here2 = adjust_key_here.clone();
+    view! {
+        <section>
+            <h3>"Keyframes"</h3>
+            <p class="muted">{if n_shape == 0 { "Shape: fixed to the plane".to_string() } else { format!("Shape: animated, {n_shape} key(s)") }}</p>
+            <div class="row">
+                <button title="Add a shape key here; later edits on other frames add keys automatically" on:click=move |_| {
+                    let f = ctx.frame.get_untracked();
+                    ctx.edit_layer(move |l| { l.add_shape_key(f); });
+                    ctx.tool.set(Tool::EditShape);
+                    ctx.say("Shape key added. Edit the shape on other frames to animate it (E)", false);
+                }>"◆ Shape Key"</button>
+                <button disabled=move || !shape_key_here() on:click=move |_| { let f = ctx.frame.get_untracked(); ctx.edit_layer(move |l| { l.remove_shape_key(f); }); }>"Delete"</button>
+                <button disabled=n_shape == 0 title="Stop animating the shape (keeps the shape on this frame)" on:click=move |_| { let f = ctx.frame.get_untracked(); ctx.edit_layer(move |l| l.clear_shape_keys(f)); }>"Clear"</button>
+            </div>
+            <p class="muted">{if n_adjust == 0 { "Adjust Track: no corrections".to_string() } else { format!("Adjust Track: {n_adjust} key(s)") }}</p>
+            <div class="row">
+                <button disabled=linked title="Lock the corners on this frame (add a key with the current correction)" on:click=move |_| {
+                    let f = ctx.frame.get_untracked();
+                    ctx.edit_layer(move |l| { l.add_adjust_key(f); });
+                    ctx.tool.set(Tool::Adjust);
+                }>"◆ Lock Here"</button>
+                <button disabled=move || !adjust_key_here() on:click=move |_| { let f = ctx.frame.get_untracked(); ctx.edit_layer(move |l| { l.adjust_keys.remove(&f); }); }>"Delete"</button>
+                <button disabled=n_adjust == 0 on:click=move |_| ctx.edit_layer(|l| l.adjust_keys.clear())>"Clear"</button>
+            </div>
+            <p class="hint">{move || if adjust_key_here2() || shape_key_here2() { "There is a key on this frame." } else { "" }}
+                " Adjust (A): drag corners onto the right spot on a bad frame. Use ◆ Lock Here on good frames either side so the fix only covers the bad stretch."</p>
+        </section>
+    }
+}
+
+/// Pick layers whose areas this layer should ignore.
+#[component]
+fn ExclusionsSection(layer: Layer) -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let id = layer.id;
+    let others: Vec<(u32, String, String, bool)> = ctx.project.with_untracked(|p| {
+        p.layers
+            .iter()
+            .filter(|o| o.id != id)
+            .map(|o| {
+                (
+                    o.id,
+                    o.name.clone(),
+                    o.color.clone(),
+                    layer.exclusions.contains(&o.id),
+                )
+            })
+            .collect()
+    });
+    let empty = others.is_empty();
+    view! {
+        <section>
+            <h3>"Exclusions"</h3>
+            {if empty {
+                view! { <p class="hint">"Draw another layer over anything that moves in front of this surface (a hand, a person, a reflection), then tick it here so the tracker ignores that area. Track or keyframe that layer so it follows the occluder."</p> }.into_any()
+            } else {
+                view! {
+                    <p class="hint">"Ignore the areas covered by:"</p>
+                    {others.into_iter().map(|(oid, name, color, on)| view! {
+                        <label class="toggle">
+                            <input type="checkbox" prop:checked=on on:change=move |_| ctx.edit_layer(move |l| {
+                                if let Some(pos) = l.exclusions.iter().position(|&e| e == oid) { l.exclusions.remove(pos); } else { l.exclusions.push(oid); }
+                            }) />
+                            <span class="swatch" style=format!("background:{color}")></span>{name}
+                        </label>
+                    }).collect_view()}
+                }.into_any()
+            }}
         </section>
     }
 }
@@ -1196,6 +1421,26 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                 <input type="checkbox" prop:checked=s.refine_against_reference on:change=move |_| ctx.edit_layer(|l| l.settings.refine_against_reference = !l.settings.refine_against_reference) />
                 "Anti-drift (re-solve against reference)"
             </label>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=s.illumination on:change=move |_| ctx.edit_layer(|l| l.settings.illumination = !l.settings.illumination) />
+                "Lighting compensation (fades, flicker)"
+            </label>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=s.retry_hard_frames on:change=move |_| ctx.edit_layer(|l| l.settings.retry_hard_frames = !l.settings.retry_hard_frames) />
+                "Retry hard frames (motion blur)"
+            </label>
+            <label class="field">"Speed"
+                <select on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    let lvl: Option<usize> = v.parse().ok();
+                    ctx.edit_layer(move |l| l.settings.detail_level = lvl);
+                }>
+                    <option value="auto" selected=s.detail_level.is_none()>"Auto (fast first pass on 2.5K+)"</option>
+                    <option value="0" selected=s.detail_level == Some(0)>"Full resolution"</option>
+                    <option value="1" selected=s.detail_level == Some(1)>"Fast: half-res first pass"</option>
+                    <option value="2" selected=s.detail_level == Some(2)>"Fastest: quarter-res first pass"</option>
+                </select>
+            </label>
         </section>
     }
 }
@@ -1240,7 +1485,7 @@ fn Viewport() -> impl IntoView {
                     ctx.draft.update(|d| d.push(ip));
                 }
             }
-            Tool::EditShape | Tool::Surface => {
+            Tool::EditShape | Tool::Surface | Tool::Adjust => {
                 if ctx.tracking.get_untracked() {
                     return;
                 }
@@ -1273,9 +1518,7 @@ fn Viewport() -> impl IntoView {
                                 let at = seg + 1;
                                 ctx.project.update(|p| {
                                     if let Some(l) = p.layer_mut(id) {
-                                        let mut ns = sh.clone();
-                                        ns.points.insert(at, q);
-                                        l.set_shape_at(fr, ns);
+                                        l.insert_shape_point(fr, seg, q);
                                     }
                                 });
                                 ctx.sel_point.set(Some(at));
@@ -1296,14 +1539,23 @@ fn Viewport() -> impl IntoView {
                     let corners = ctx
                         .project
                         .with_untracked(|p| p.layer(id).and_then(|l| l.surface_at(fr)));
+                    let adjust = tool == Tool::Adjust;
                     corners.and_then(|c| {
                         if let Some(i) = c
                             .iter()
                             .position(|&q| dist2(v.to_screen(q), s) < hit_r2 * 1.4)
                         {
-                            Some(Drag::SurfaceCorner(i))
+                            Some(if adjust {
+                                Drag::AdjustCorner(i)
+                            } else {
+                                Drag::SurfaceCorner(i)
+                            })
                         } else if point_in_polygon(&c, ip) {
-                            Some(Drag::MoveSurface { start: ip, orig: c })
+                            Some(if adjust {
+                                Drag::MoveAdjust { start: ip, orig: c }
+                            } else {
+                                Drag::MoveSurface { start: ip, orig: c }
+                            })
                         } else {
                             None
                         }
@@ -1366,6 +1618,19 @@ fn Viewport() -> impl IntoView {
                     }
                 }
             }),
+            Drag::AdjustCorner(i) => ctx.project.update(|p| {
+                if let Some(l) = p.layer_mut(id) {
+                    l.set_adjust_corner(fr, i, ip);
+                }
+            }),
+            Drag::MoveAdjust { start, orig } => ctx.project.update(|p| {
+                if let Some(l) = p.layer_mut(id) {
+                    let d = [ip[0] - start[0], ip[1] - start[1]];
+                    for (i, c) in orig.iter().enumerate() {
+                        l.set_adjust_corner(fr, i, [c[0] + d[0], c[1] + d[1]]);
+                    }
+                }
+            }),
         }
     };
 
@@ -1378,6 +1643,8 @@ fn Viewport() -> impl IntoView {
                 | Drag::SurfaceCorner(_)
                 | Drag::MoveShape { .. }
                 | Drag::MoveSurface { .. }
+                | Drag::AdjustCorner(_)
+                | Drag::MoveAdjust { .. }
         ) {
             // Push the edited layer as one undo step.
             ctx.edit_layer(|_| {});
@@ -1423,7 +1690,7 @@ fn Viewport() -> impl IntoView {
             </div>
             <canvas node_ref=ctx.viewport class="view"
                 class:draw=move || ctx.tool.get() == Tool::Draw
-                class:edit=move || matches!(ctx.tool.get(), Tool::EditShape | Tool::Surface)
+                class:edit=move || matches!(ctx.tool.get(), Tool::EditShape | Tool::Surface | Tool::Adjust)
                 on:mousedown=on_down on:mousemove=on_move on:mouseup=on_up
                 on:mouseleave=move |e| { ctx.hover.set(None); on_up(e) }
                 on:wheel=on_wheel on:dblclick=on_dbl
@@ -1541,6 +1808,9 @@ fn RightPanel() -> impl IntoView {
                     <dt>"Enter / dbl-click"</dt><dd>"Close shape"</dd>
                     <dt>"Delete"</dt><dd>"Remove selected shape point"</dd>
                     <dt>"Right-click"</dt><dd>"Undo last point while drawing"</dd>
+                    <dt>"A"</dt><dd>"Adjust Track: drag corners to fix a frame"</dd>
+                    <dt>"I / O / X"</dt><dd>"Set In / Out, clear"</dd>
+                    <dt>"N"</dt><dd>"Next problem frame"</dd>
                     <dt>"Esc"</dt><dd>"Stop tracking / cancel"</dd>
                     <dt>"Wheel / middle-drag"</dt><dd>"Zoom / pan"</dd>
                 </dl>
@@ -1588,6 +1858,14 @@ fn Bottom() -> impl IntoView {
                 <button class="track" title="Track one frame forward (Shift+→)" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(1, Some(1))>"|▶"</button>
                 <button class="track" title="Track forward" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(1, None)>"Track ▶▶"</button>
                 <button title="Last frame (End)" on:click=move |_| ctx.frame.set(ctx.frame_count_untracked().saturating_sub(1))>"⏭"</button>
+                <span class="sep"></span>
+                <button class="inout" class:set=move || ctx.in_point.get().is_some() title="Set In point (I)" on:click=move |_| ctx.set_in_out(true)>"In"</button>
+                <button class="inout" class:set=move || ctx.out_point.get().is_some() title="Set Out point (O)" on:click=move |_| ctx.set_in_out(false)>"Out"</button>
+                <button class="small" title="Clear In/Out (X)" disabled=move || ctx.in_point.get().is_none() && ctx.out_point.get().is_none() on:click=move |_| { ctx.in_point.set(None); ctx.out_point.set(None); }>"✕"</button>
+                <button class="track" title="Re-track In→Out and blend it into the existing track" disabled=move || ctx.tracking.get() || ctx.in_point.get().is_none() || ctx.out_point.get().is_none() on:click=move |_| ctx.retrack_section()>"Re-track In→Out"</button>
+                <button class="warn" title="Jump to the next frame flagged on the quality graph (N)" disabled=move || ctx.problem_count() == 0 on:click=move |_| ctx.next_problem()>
+                    {move || { let n = ctx.problem_count(); if n == 0 { "✓ No problems".to_string() } else { format!("⚠ Next problem ({n})") } }}
+                </button>
                 <span class="sep"></span>
                 <button title="Previous frame (←)" on:click=move |_| ctx.step_frame(-1)>"‹"</button>
                 <button title="Play / pause (Space)" on:click=move |_| ctx.toggle_play()>{move || if ctx.playing.get() { "❚❚" } else { "▶" }}</button>

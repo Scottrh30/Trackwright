@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use trackwright_core::geometry::{apply, homography_from_corners, Point};
-use trackwright_core::Project;
+use trackwright_core::{exclusion_polys, Problem, Project};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
@@ -51,6 +51,8 @@ pub enum Tool {
     Draw,
     EditShape,
     Surface,
+    /// Adjust Track: per-frame corner corrections.
+    Adjust,
 }
 
 pub struct Overlays {
@@ -213,6 +215,33 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
         }
     }
 
+    // Areas the selected layer ignores: red hatching.
+    if let Some(sel) = scene.selected.and_then(|id| scene.project.layer(id)) {
+        for poly in exclusion_polys(&scene.project.layers, sel, scene.frame) {
+            path(&ctx, &poly, true);
+            ctx.save();
+            ctx.clip();
+            ctx.set_global_alpha(0.16);
+            ctx.set_fill_style_str("#ff4d4d");
+            ctx.fill_rect(0.0, 0.0, w, h);
+            ctx.set_global_alpha(0.55);
+            ctx.set_stroke_style_str("#ff4d4d");
+            ctx.set_line_width(1.0 * px);
+            let step = 10.0 * px;
+            let mut x = -h;
+            while x < w {
+                path(&ctx, &[[x, 0.0], [x + h, h]], false);
+                ctx.stroke();
+                x += step;
+            }
+            ctx.restore();
+            path(&ctx, &poly, true);
+            ctx.set_stroke_style_str("#ff4d4d");
+            ctx.set_line_width(1.5 * px);
+            ctx.stroke();
+        }
+    }
+
     for layer in scene.project.layers.iter().filter(|l| l.visible) {
         let selected = scene.selected == Some(layer.id);
         let Some(shape) = layer.shape_at(scene.frame) else {
@@ -261,12 +290,29 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
             }
         }
 
-        let show_surface = scene.overlays.surface && (selected || scene.tool == Tool::Surface);
+        let adjusting = scene.tool == Tool::Adjust && selected;
+        let show_surface =
+            adjusting || (scene.overlays.surface && (selected || scene.tool == Tool::Surface));
+        let adjust_key_here = layer.adjust_keys.contains_key(&scene.frame);
         if let Some(corners) = layer.surface_at(scene.frame) {
             if scene.overlays.grid && selected {
                 draw_grid(&ctx, &corners, px);
             }
             if show_surface {
+                if adjusting {
+                    // Ghost of the raw tracked corners, to see how much is corrected.
+                    if let Some(raw) = layer.tracked_surface_at(scene.frame) {
+                        path(&ctx, &raw, true);
+                        ctx.set_stroke_style_str("#ff7a45");
+                        ctx.set_line_width(1.0 * px);
+                        let _ = ctx.set_line_dash(&js_sys::Array::of2(
+                            &(4.0 * px).into(),
+                            &(3.0 * px).into(),
+                        ));
+                        ctx.stroke();
+                        let _ = ctx.set_line_dash(&js_sys::Array::new());
+                    }
+                }
                 path(&ctx, &corners, true);
                 ctx.set_stroke_style_str("#3fd0ff");
                 ctx.set_line_width(1.6 * px);
@@ -282,7 +328,12 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
                 ctx.set_font(&format!("{}px system-ui, sans-serif", 11.0 * px));
                 ctx.set_text_align("center");
                 for (i, c) in corners.iter().enumerate() {
-                    handle(&ctx, *c, 6.0 * px, "#3fd0ff", "#0d0e11");
+                    let fill = if adjusting && adjust_key_here {
+                        "#ff7a45"
+                    } else {
+                        "#3fd0ff"
+                    };
+                    handle(&ctx, *c, 6.0 * px, fill, "#0d0e11");
                     ctx.set_fill_style_str("#0d0e11");
                     let _ = ctx.fill_text(labels[i], c[0], c[1] + 4.0 * px);
                 }
@@ -448,11 +499,21 @@ fn draw_grid(ctx: &CanvasRenderingContext2d, corners: &[Point; 4], px: f64) {
     ctx.set_global_alpha(1.0);
 }
 
+fn diamond(ctx: &CanvasRenderingContext2d, x: f64, y: f64, r: f64, fill: &str) {
+    path(ctx, &[[x, y - r], [x + r, y], [x, y + r], [x - r, y]], true);
+    ctx.set_fill_style_str(fill);
+    ctx.fill();
+}
+
+/// Timeline: layer lanes, keyframes, In/Out range, the selected layer's quality graph,
+/// frame ticks and the playhead.
 pub fn draw_timeline(
     canvas: &HtmlCanvasElement,
     project: &Project,
     frame: usize,
     selected: Option<u32>,
+    in_pt: Option<usize>,
+    out_pt: Option<usize>,
 ) {
     let Some(ctx) = ctx_of(canvas) else { return };
     let (cw, ch, dpr) = fit_canvas(canvas);
@@ -465,18 +526,23 @@ pub fn draw_timeline(
     }
     let fw = cw / n as f64;
     let x_of = |f: usize| (f as f64 + 0.5) * fw;
+    let x0_of = |f: usize| (f as f64 * fw).floor();
+    let tick_h = 14.0;
 
+    // Lanes.
     let lane_h = 6.0;
+    let mut lanes_bottom = 4.0;
     for (li, layer) in project.layers.iter().enumerate() {
         let sel = selected == Some(layer.id);
         let y = 4.0 + li as f64 * (lane_h + 2.0);
-        if y + lane_h > ch - 14.0 {
+        if y + lane_h > 34.0 {
             break;
         }
+        lanes_bottom = y + lane_h;
         ctx.set_global_alpha(if sel { 1.0 } else { 0.45 });
         ctx.set_fill_style_str(&layer.color);
         for &f in layer.tracks.keys() {
-            ctx.fill_rect((f as f64 * fw).floor(), y, fw.ceil().max(1.0) + 1.0, lane_h);
+            ctx.fill_rect(x0_of(f), y, fw.ceil().max(1.0) + 1.0, lane_h);
         }
         ctx.set_global_alpha(1.0);
         if sel {
@@ -488,6 +554,92 @@ pub fn draw_timeline(
                 true,
             );
             ctx.fill();
+        }
+    }
+
+    // Quality graph for the selected layer: inlier bars, error line, problem marks.
+    let gy0 = lanes_bottom + 6.0;
+    let gy1 = ch - tick_h - 2.0;
+    if let Some(layer) = selected.and_then(|id| project.layer(id)) {
+        let gh = gy1 - gy0;
+        if gh > 12.0 {
+            ctx.set_fill_style_str("#181b21");
+            ctx.fill_rect(0.0, gy0, cw, gh);
+            let max_inl = layer
+                .tracks
+                .values()
+                .map(|t| t.inliers)
+                .max()
+                .unwrap_or(1)
+                .max(1) as f64;
+            ctx.set_fill_style_str("rgba(125,255,106,0.28)");
+            for (&f, t) in &layer.tracks {
+                let bh = gh * t.inliers as f64 / max_inl;
+                ctx.fill_rect(x0_of(f), gy1 - bh, fw.ceil().max(1.0), bh);
+            }
+            // Error line: full graph height = 2 px of error. Dashed guide at 1 px.
+            let y_err = |e: f64| gy1 - gh * (e / 2.0).min(1.0);
+            ctx.set_stroke_style_str("rgba(255,255,255,0.18)");
+            ctx.set_line_width(1.0);
+            let _ = ctx.set_line_dash(&js_sys::Array::of2(&3.0.into(), &3.0.into()));
+            path(&ctx, &[[0.0, y_err(1.0)], [cw, y_err(1.0)]], false);
+            ctx.stroke();
+            let _ = ctx.set_line_dash(&js_sys::Array::new());
+            ctx.set_stroke_style_str("#ffd24a");
+            ctx.set_line_width(1.3);
+            let mut prev: Option<(usize, Point)> = None;
+            ctx.begin_path();
+            for (&f, t) in &layer.tracks {
+                let p = [x_of(f), y_err(t.rms_error)];
+                match prev {
+                    Some((pf, _)) if pf + 1 == f => ctx.line_to(p[0], p[1]),
+                    _ => ctx.move_to(p[0], p[1]),
+                }
+                prev = Some((f, p));
+            }
+            ctx.stroke();
+            for &f in layer.tracks.keys() {
+                if let Some(pr) = layer.problem_at(f) {
+                    ctx.set_fill_style_str(match pr {
+                        Problem::HighError => "#ff4d4d",
+                        Problem::FewPoints => "#ff9a3c",
+                        Problem::Retried => "#b28bff",
+                    });
+                    ctx.fill_rect(x0_of(f), gy0, fw.ceil().max(1.5), 4.0);
+                }
+            }
+            ctx.set_fill_style_str("#7a8090");
+            ctx.set_font("9px system-ui, sans-serif");
+            ctx.set_text_align("left");
+            let _ = ctx.fill_text("error (line) / points (bars)", 4.0, gy0 + 13.0);
+        }
+        // Keyframes: shape keys (white) and Adjust Track keys (orange) on the lane.
+        if let Some(li) = project.layers.iter().position(|l| l.id == layer.id) {
+            let y = 4.0 + li as f64 * (lane_h + 2.0) + lane_h / 2.0;
+            if y < 34.0 {
+                for &f in layer.shape_keys.keys() {
+                    diamond(&ctx, x_of(f), y, 5.5, "#ffffff");
+                }
+                for &f in layer.adjust_keys.keys() {
+                    diamond(&ctx, x_of(f), y, 5.0, "#ff7a45");
+                }
+            }
+        }
+    }
+
+    // In/Out: dim everything outside the range.
+    if in_pt.is_some() || out_pt.is_some() {
+        let a = in_pt.unwrap_or(0);
+        let b = out_pt.unwrap_or(n - 1);
+        ctx.set_fill_style_str("rgba(0,0,0,0.45)");
+        ctx.fill_rect(0.0, 0.0, x0_of(a), ch);
+        ctx.fill_rect(x0_of(b + 1), 0.0, cw - x0_of(b + 1), ch);
+        ctx.set_fill_style_str("#46d17a");
+        for (f, left) in [(in_pt, true), (out_pt, false)] {
+            if let Some(f) = f {
+                let x = if left { x0_of(f) } else { x0_of(f + 1) - 2.0 };
+                ctx.fill_rect(x, 0.0, 2.0, ch - tick_h);
+            }
         }
     }
 

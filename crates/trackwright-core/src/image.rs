@@ -69,28 +69,30 @@ impl GrayImage {
     pub fn downsample(&self) -> GrayImage {
         const K: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
         let (w, h) = (self.width, self.height);
-        let mut tmp = GrayImage::new(w, h);
-        for y in 0..h {
-            for x in 0..w {
-                let mut s = 0.0;
-                for (k, wk) in K.iter().enumerate() {
-                    s += wk * self.get_clamped(x as isize + k as isize - 2, y as isize);
-                }
-                tmp.data[y * w + x] = s;
-            }
-        }
         let (nw, nh) = ((w + 1) / 2, (h + 1) / 2);
-        let mut out = GrayImage::new(nw, nh);
-        for y in 0..nh {
-            for x in 0..nw {
-                let (sx, sy) = (2 * x as isize, 2 * y as isize);
+        // Horizontal pass, keeping only every second column.
+        let mut tmp = GrayImage::new(nw, h);
+        crate::par::rows(&mut tmp.data, nw, |y, row| {
+            for (x, out) in row.iter_mut().enumerate() {
+                let sx = 2 * x as isize;
                 let mut s = 0.0;
                 for (k, wk) in K.iter().enumerate() {
-                    s += wk * tmp.get_clamped(sx, sy + k as isize - 2);
+                    s += wk * self.get_clamped(sx + k as isize - 2, y as isize);
                 }
-                out.data[y * nw + x] = s;
+                *out = s;
             }
-        }
+        });
+        let mut out = GrayImage::new(nw, nh);
+        crate::par::rows(&mut out.data, nw, |y, row| {
+            let sy = 2 * y as isize;
+            for (x, o) in row.iter_mut().enumerate() {
+                let mut s = 0.0;
+                for (k, wk) in K.iter().enumerate() {
+                    s += wk * tmp.get_clamped(x as isize, sy + k as isize - 2);
+                }
+                *o = s;
+            }
+        });
         out
     }
 
@@ -99,20 +101,28 @@ impl GrayImage {
         let (w, h) = (self.width, self.height);
         let mut gx = GrayImage::new(w, h);
         let mut gy = GrayImage::new(w, h);
-        for y in 0..h as isize {
-            for x in 0..w as isize {
+        crate::par::rows(&mut gx.data, w, |y, row| {
+            let y = y as isize;
+            for (x, o) in row.iter_mut().enumerate() {
+                let x = x as isize;
                 let p = |dx: isize, dy: isize| self.get_clamped(x + dx, y + dy);
-                let dx = 3.0 * (p(1, -1) - p(-1, -1))
+                *o = (3.0 * (p(1, -1) - p(-1, -1))
                     + 10.0 * (p(1, 0) - p(-1, 0))
-                    + 3.0 * (p(1, 1) - p(-1, 1));
-                let dy = 3.0 * (p(-1, 1) - p(-1, -1))
-                    + 10.0 * (p(0, 1) - p(0, -1))
-                    + 3.0 * (p(1, 1) - p(1, -1));
-                let i = y as usize * w + x as usize;
-                gx.data[i] = dx / 32.0;
-                gy.data[i] = dy / 32.0;
+                    + 3.0 * (p(1, 1) - p(-1, 1)))
+                    / 32.0;
             }
-        }
+        });
+        crate::par::rows(&mut gy.data, w, |y, row| {
+            let y = y as isize;
+            for (x, o) in row.iter_mut().enumerate() {
+                let x = x as isize;
+                let p = |dx: isize, dy: isize| self.get_clamped(x + dx, y + dy);
+                *o = (3.0 * (p(-1, 1) - p(-1, -1))
+                    + 10.0 * (p(0, 1) - p(0, -1))
+                    + 3.0 * (p(1, 1) - p(1, -1)))
+                    / 32.0;
+            }
+        });
         (gx, gy)
     }
 }

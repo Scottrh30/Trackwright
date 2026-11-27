@@ -1,6 +1,8 @@
 //! Project document: footage, layers, shapes, surfaces and per-frame track data.
 
-use crate::geometry::{apply, invert, mul, normalize, Mat3, MotionModel, Point, IDENTITY};
+use crate::geometry::{
+    apply, homography_from_corners, invert, mul, normalize, Mat3, MotionModel, Point, IDENTITY,
+};
 use crate::shape::{default_surface, Shape};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -30,6 +32,7 @@ impl Footage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct TrackSettings {
     pub model: MotionModel,
     pub max_features: usize,
@@ -46,6 +49,13 @@ pub struct TrackSettings {
     pub refine_against_reference: bool,
     /// Largest correction (pixels) the reference refinement may apply.
     pub max_refine_correction: f64,
+    /// Compensate brightness/contrast changes (fades, flicker, moving light).
+    pub illumination: bool,
+    /// When a frame fails, retry it with a wider search (helps with motion blur).
+    pub retry_hard_frames: bool,
+    /// Resolution for the fast frame-to-frame pass: 0 = full, 1 = half, 2 = quarter.
+    /// `None` picks automatically (half for footage 2.5K and wider).
+    pub detail_level: Option<usize>,
 }
 
 impl Default for TrackSettings {
@@ -62,6 +72,9 @@ impl Default for TrackSettings {
             min_inliers: 10,
             refine_against_reference: true,
             max_refine_correction: 12.0,
+            illumination: true,
+            retry_hard_frames: true,
+            detail_level: None,
         }
     }
 }
@@ -78,6 +91,9 @@ pub struct FrameTrack {
     /// True for the reference frame or frames the user fixed by hand.
     #[serde(default)]
     pub keyframe: bool,
+    /// Solved only on a second, wider attempt (often motion blur).
+    #[serde(default)]
+    pub retried: bool,
 }
 
 impl FrameTrack {
@@ -88,8 +104,17 @@ impl FrameTrack {
             rms_error: 0.0,
             points: vec![],
             keyframe: true,
+            retried: false,
         }
     }
+}
+
+/// Why a tracked frame looks unreliable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Problem {
+    HighError,
+    FewPoints,
+    Retried,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -111,6 +136,17 @@ pub struct Layer {
     /// Image or clip pinned to the surface for previewing the track.
     #[serde(default)]
     pub insert: Option<Insert>,
+    /// Layers whose shapes this layer's tracker ignores (occluders, reflections...).
+    #[serde(default)]
+    pub exclusions: Vec<u32>,
+    /// Animated shape: keyframes of the shape in reference-frame coordinates.
+    /// Empty = the shape is fixed to the plane (`shape`).
+    #[serde(default)]
+    pub shape_keys: BTreeMap<usize, Shape>,
+    /// Adjust Track: per-frame corner offsets (frame pixels, TL TR BR BL) added to the
+    /// tracked surface, interpolated between keys and held outside them.
+    #[serde(default)]
+    pub adjust_keys: BTreeMap<usize, [Point; 4]>,
 }
 
 /// Media corner-pinned onto a layer's surface (Mocha-style "insert").
@@ -167,6 +203,9 @@ impl Layer {
             tracks,
             link: None,
             insert: None,
+            exclusions: vec![],
+            shape_keys: BTreeMap::new(),
+            adjust_keys: BTreeMap::new(),
         }
     }
 
@@ -178,12 +217,94 @@ impl Layer {
         self.tracks.get(&frame).map(|t| t.h_from_ref)
     }
 
-    pub fn shape_at(&self, frame: usize) -> Option<Shape> {
-        self.h_at(frame).map(|h| self.shape.transformed(&h))
+    /// Shape in reference coordinates at `frame` (interpolates shape keyframes).
+    pub fn shape_ref_at(&self, frame: usize) -> Shape {
+        if self.shape_keys.is_empty() {
+            return self.shape.clone();
+        }
+        let before = self.shape_keys.range(..=frame).next_back();
+        let after = self.shape_keys.range(frame..).next();
+        match (before, after) {
+            (Some((&fa, a)), Some((&fb, b))) if fa != fb && a.points.len() == b.points.len() => {
+                let t = (frame - fa) as f64 / (fb - fa) as f64;
+                let mut s = a.clone();
+                for (p, q) in s.points.iter_mut().zip(&b.points) {
+                    *p = [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
+                }
+                s
+            }
+            (Some((_, a)), _) => a.clone(),
+            (None, Some((_, b))) => b.clone(),
+            _ => self.shape.clone(),
+        }
     }
 
-    pub fn surface_at(&self, frame: usize) -> Option<[Point; 4]> {
+    pub fn shape_at(&self, frame: usize) -> Option<Shape> {
+        self.h_at(frame)
+            .map(|h| self.shape_ref_at(frame).transformed(&h))
+    }
+
+    /// Shape at `frame`, or (if that frame isn't tracked) where it sits at the nearest
+    /// tracked frame. Untracked exclusion layers simply hold still this way.
+    pub fn shape_at_or_nearest(&self, frame: usize) -> Option<Shape> {
+        if let Some(s) = self.shape_at(frame) {
+            return Some(s);
+        }
+        let before = self.tracks.range(..frame).next_back().map(|(f, _)| *f);
+        let after = self.tracks.range(frame..).next().map(|(f, _)| *f);
+        let nearest = match (before, after) {
+            (Some(a), Some(b)) => Some(if frame - a <= b - frame { a } else { b }),
+            (a, b) => a.or(b),
+        }?;
+        let h = self.h_at(nearest)?;
+        Some(self.shape_ref_at(frame).transformed(&h))
+    }
+
+    /// Corner offsets from Adjust Track keys at `frame` (zero when there are none).
+    pub fn adjust_at(&self, frame: usize) -> [Point; 4] {
+        let before = self.adjust_keys.range(..=frame).next_back();
+        let after = self.adjust_keys.range(frame..).next();
+        match (before, after) {
+            (Some((&fa, a)), Some((&fb, b))) if fa != fb => {
+                let t = (frame - fa) as f64 / (fb - fa) as f64;
+                std::array::from_fn(|i| {
+                    [
+                        a[i][0] + (b[i][0] - a[i][0]) * t,
+                        a[i][1] + (b[i][1] - a[i][1]) * t,
+                    ]
+                })
+            }
+            (Some((_, a)), _) => *a,
+            (None, Some((_, b))) => *b,
+            _ => [[0.0; 2]; 4],
+        }
+    }
+
+    /// Surface corners from tracking alone (no Adjust Track).
+    pub fn tracked_surface_at(&self, frame: usize) -> Option<[Point; 4]> {
         self.h_at(frame).map(|h| self.surface.map(|p| apply(&h, p)))
+    }
+
+    /// Final surface corners at `frame`, including Adjust Track corrections.
+    pub fn surface_at(&self, frame: usize) -> Option<[Point; 4]> {
+        let c = self.tracked_surface_at(frame)?;
+        if self.adjust_keys.is_empty() {
+            return Some(c);
+        }
+        let o = self.adjust_at(frame);
+        Some(std::array::from_fn(|i| {
+            [c[i][0] + o[i][0], c[i][1] + o[i][1]]
+        }))
+    }
+
+    /// Reference-to-frame transform including Adjust Track corrections.
+    pub fn final_h_at(&self, frame: usize) -> Option<Mat3> {
+        let h = self.h_at(frame)?;
+        if self.adjust_keys.is_empty() {
+            return Some(h);
+        }
+        let corners = self.surface_at(frame)?;
+        Some(homography_from_corners(&self.surface, &corners).unwrap_or(h))
     }
 
     /// Move one surface corner at `frame`, keeping the reference surface consistent.
@@ -192,18 +313,143 @@ impl Layer {
             return false;
         };
         let Some(hi) = invert(&h) else { return false };
-        self.surface[corner % 4] = apply(&hi, pos);
+        let o = self.adjust_at(frame)[corner % 4];
+        self.surface[corner % 4] = apply(&hi, [pos[0] - o[0], pos[1] - o[1]]);
         true
     }
 
-    /// Replace the shape as drawn at `frame`, re-basing it into the reference frame.
+    /// Adjust Track: put one corner at `pos` on this frame by setting an adjust key.
+    pub fn set_adjust_corner(&mut self, frame: usize, corner: usize, pos: Point) -> bool {
+        let Some(t) = self.tracked_surface_at(frame) else {
+            return false;
+        };
+        let mut off = self.adjust_at(frame);
+        off[corner % 4] = [pos[0] - t[corner % 4][0], pos[1] - t[corner % 4][1]];
+        self.adjust_keys.insert(frame, off);
+        true
+    }
+
+    /// Adjust Track: lock the current corners here (a key with the current offsets).
+    pub fn add_adjust_key(&mut self, frame: usize) -> bool {
+        if !self.tracks.contains_key(&frame) {
+            return false;
+        }
+        let off = self.adjust_at(frame);
+        self.adjust_keys.insert(frame, off);
+        true
+    }
+
+    /// Replace the shape as drawn at `frame`. With shape keyframes this sets a key.
     pub fn set_shape_at(&mut self, frame: usize, shape_at_frame: Shape) -> bool {
         let Some(h) = self.h_at(frame) else {
             return false;
         };
         let Some(hi) = invert(&h) else { return false };
-        self.shape = shape_at_frame.transformed(&hi);
+        let shape = shape_at_frame.transformed(&hi);
+        if self.shape_keys.is_empty() {
+            self.shape = shape;
+        } else {
+            self.shape_keys.insert(frame, shape);
+        }
         true
+    }
+
+    /// Start (or extend) shape animation with a key holding the current shape.
+    pub fn add_shape_key(&mut self, frame: usize) -> bool {
+        if !self.tracks.contains_key(&frame) {
+            return false;
+        }
+        let s = self.shape_ref_at(frame);
+        self.shape_keys.insert(frame, s);
+        true
+    }
+
+    pub fn remove_shape_key(&mut self, frame: usize) -> bool {
+        let Some(removed) = self.shape_keys.remove(&frame) else {
+            return false;
+        };
+        if self.shape_keys.is_empty() {
+            self.shape = removed;
+        }
+        true
+    }
+
+    /// Stop animating; keep the shape as it is at `frame`.
+    pub fn clear_shape_keys(&mut self, frame: usize) {
+        self.shape = self.shape_ref_at(frame);
+        self.shape_keys.clear();
+    }
+
+    /// Insert a control point after `segment`, placed at `pos` (frame coordinates) on
+    /// this frame and at the matching spot along the segment on every shape key.
+    pub fn insert_shape_point(&mut self, frame: usize, segment: usize, pos: Point) -> bool {
+        let Some(hi) = self.h_at(frame).and_then(|h| invert(&h)) else {
+            return false;
+        };
+        let q = apply(&hi, pos);
+        let cur = self.shape_ref_at(frame);
+        let n = cur.points.len();
+        if n < 2 {
+            return false;
+        }
+        let (a, b) = (cur.points[segment % n], cur.points[(segment + 1) % n]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let at = segment % n + 1;
+        let lerp_into = |s: &mut Shape| {
+            let m = s.points.len();
+            if m == n {
+                let (a, b) = (s.points[segment % m], s.points[(segment + 1) % m]);
+                s.points
+                    .insert(at, [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+            }
+        };
+        lerp_into(&mut self.shape);
+        for k in self.shape_keys.values_mut() {
+            lerp_into(k);
+        }
+        if let Some(k) = self.shape_keys.get_mut(&frame) {
+            k.points[at] = q;
+        } else if self.shape_keys.is_empty() {
+            self.shape.points[at] = q;
+        }
+        true
+    }
+
+    /// Remove control point `index` from the shape and all its keys (min 3 points).
+    pub fn remove_shape_point(&mut self, index: usize) -> bool {
+        if self.shape.points.len() <= 3 || index >= self.shape.points.len() {
+            return false;
+        }
+        self.shape.points.remove(index);
+        for k in self.shape_keys.values_mut() {
+            if index < k.points.len() {
+                k.points.remove(index);
+            }
+        }
+        true
+    }
+
+    /// Frames that look unreliable, for the quality graph and "next problem" button.
+    pub fn problem_at(&self, frame: usize) -> Option<Problem> {
+        let t = self.tracks.get(&frame)?;
+        if t.keyframe || frame == self.ref_frame {
+            return None;
+        }
+        if t.rms_error > 1.0 {
+            Some(Problem::HighError)
+        } else if (t.inliers as usize) < (self.settings.min_inliers * 2).max(16) {
+            Some(Problem::FewPoints)
+        } else if t.retried {
+            Some(Problem::Retried)
+        } else {
+            None
+        }
     }
 
     /// Make `frame` the new reference: all homographies are re-expressed relative to it.
@@ -213,6 +459,9 @@ impl Layer {
         };
         let Some(hi) = invert(&h) else { return false };
         self.shape = self.shape.transformed(&h);
+        for k in self.shape_keys.values_mut() {
+            *k = k.transformed(&h);
+        }
         self.surface = self.surface.map(|p| apply(&h, p));
         for t in self.tracks.values_mut() {
             t.h_from_ref = mul(&t.h_from_ref, &hi);
@@ -361,18 +610,31 @@ impl Project {
     }
 }
 
+/// Outlines (frame coordinates) of `layer`'s exclusion layers at `frame`.
+pub fn exclusion_polys(layers: &[Layer], layer: &Layer, frame: usize) -> Vec<Vec<Point>> {
+    layer
+        .exclusions
+        .iter()
+        .filter(|&&id| id != layer.id)
+        .filter_map(|id| layers.iter().find(|l| l.id == *id))
+        .filter_map(|l| l.shape_at_or_nearest(frame))
+        .map(|s| s.flatten(8))
+        .collect()
+}
+
 /// Track data for a layer whose reference frame is `child_ref`, moving with `parent`.
 fn linked_tracks(parent: &Layer, child_ref: usize) -> BTreeMap<usize, FrameTrack> {
     let mut m = BTreeMap::new();
-    let Some(hr) = parent.h_at(child_ref).and_then(|h| invert(&h)) else {
+    let Some(hr) = parent.final_h_at(child_ref).and_then(|h| invert(&h)) else {
         m.insert(child_ref, FrameTrack::reference());
         return m;
     };
     for (&f, t) in &parent.tracks {
+        let hp = parent.final_h_at(f).unwrap_or(t.h_from_ref);
         let h = if f == child_ref {
             IDENTITY
         } else {
-            normalize(&mul(&t.h_from_ref, &hr))
+            normalize(&mul(&hp, &hr))
         };
         m.insert(
             f,
@@ -382,6 +644,7 @@ fn linked_tracks(parent: &Layer, child_ref: usize) -> BTreeMap<usize, FrameTrack
                 rms_error: t.rms_error,
                 points: vec![],
                 keyframe: f == child_ref,
+                retried: t.retried,
             },
         );
     }
@@ -430,6 +693,49 @@ mod tests {
         );
         // Cycles are refused.
         assert!(pr.link_creates_cycle(1, 2));
+    }
+
+    #[test]
+    fn shape_keys_interpolate_and_points_sync() {
+        let mut l = moving_parent();
+        assert!(l.add_shape_key(0));
+        let mut s9 = l.shape_at(9).unwrap();
+        s9.points[0][0] += 10.0; // widen at frame 9
+        assert!(l.set_shape_at(9, s9));
+        let x0 = |f: usize| l.shape_ref_at(f).points[0][0];
+        assert!((x0(0) - 0.0).abs() < 1e-9 && (x0(9) - 10.0).abs() < 1e-9);
+        assert!((x0(3) - 10.0 / 3.0).abs() < 1e-9);
+        // A point added on frame 9 shows up on every key.
+        let p = l.shape_at(9).unwrap();
+        let mid = [
+            (p.points[1][0] + p.points[2][0]) / 2.0,
+            (p.points[1][1] + p.points[2][1]) / 2.0,
+        ];
+        assert!(l.insert_shape_point(9, 1, mid));
+        assert!(l.shape_keys.values().all(|k| k.points.len() == 5) && l.shape.points.len() == 5);
+        assert!(l.remove_shape_point(2));
+        assert!(l.shape_keys.values().all(|k| k.points.len() == 4));
+    }
+
+    #[test]
+    fn adjust_track_offsets() {
+        let mut l = moving_parent();
+        let t5 = l.tracked_surface_at(5).unwrap();
+        assert!(l.add_adjust_key(2));
+        assert!(l.set_adjust_corner(8, 0, [t5[0][0], t5[0][1]]));
+        // Key at 2 has zero offset, key at 8 moves corner 0; frame 5 is halfway.
+        let off8 = l.adjust_at(8)[0];
+        let off5 = l.adjust_at(5)[0];
+        assert!((off5[0] - off8[0] / 2.0).abs() < 1e-9);
+        // Final transform reproduces the adjusted corners.
+        let h = l.final_h_at(8).unwrap();
+        let c = l.surface_at(8).unwrap();
+        let m = apply(&h, l.surface[0]);
+        assert!((m[0] - c[0][0]).abs() < 1e-6 && (m[1] - c[0][1]).abs() < 1e-6);
+        // Moving the surface on an adjusted frame stays where it was put.
+        assert!(l.set_surface_corner(8, 1, [500.0, 7.0]));
+        let c = l.surface_at(8).unwrap();
+        assert!((c[1][0] - 500.0).abs() < 1e-6 && (c[1][1] - 7.0).abs() < 1e-6);
     }
 
     #[test]

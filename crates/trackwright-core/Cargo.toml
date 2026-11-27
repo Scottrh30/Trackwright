@@ -9,3 +9,9 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+rayon = { version = "1", optional = true }
+
+[features]
+default = []
+# Multi-threaded tracking (used by the desktop app).
+parallel = ["dep:rayon"]

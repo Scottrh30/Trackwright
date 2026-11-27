@@ -21,7 +21,7 @@ html, body { margin: 0; height: 100%; overflow: hidden; user-select: none; }
 .app {
   display: grid;
   grid-template-columns: 270px 1fr 300px;
-  grid-template-rows: 46px minmax(0, 1fr) 96px;
+  grid-template-rows: 46px minmax(0, 1fr) 150px;
   grid-template-areas: "top top top" "left view right" "bottom bottom bottom";
   height: 100vh;
 }
@@ -153,3 +153,7 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 .group { flex-wrap: nowrap; }
 .topbar .spacer { flex: 1; }
 .view-toolbar { position: absolute; top: 8px; left: 8px; z-index: 2; display: flex; gap: 12px; align-items: center; padding: 5px 10px; background: rgba(21, 23, 28, 0.82); border: 1px solid var(--line); border-radius: 8px; backdrop-filter: blur(4px); }
+button.inout.set { border-color: #46d17a; color: #46d17a; }
+button.warn { color: #ffb020; }
+.panel .toggle { margin: 4px 0; }
+.panel .toggle .swatch { margin-left: 2px; }

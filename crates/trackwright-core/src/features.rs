@@ -15,6 +15,8 @@ pub struct FeatureParams {
     pub block_radius: usize,
     /// Keep features at least this far from the image edge.
     pub border: usize,
+    /// Keep features at least this far from exclusion outlines.
+    pub exclude_margin: f32,
 }
 
 impl Default for FeatureParams {
@@ -25,16 +27,19 @@ impl Default for FeatureParams {
             min_distance: 7.0,
             block_radius: 2,
             border: 10,
+            exclude_margin: 8.0,
         }
     }
 }
 
-/// Detect corners inside `mask` (image coordinates). `None` = whole image.
+/// Detect corners inside `mask` (image coordinates; `None` = whole image) that are
+/// not inside any of the `exclude` polygons.
 pub fn good_features(
     img: &GrayImage,
     gx: &GrayImage,
     gy: &GrayImage,
     mask: Option<&[Point]>,
+    exclude: &[Vec<Point>],
     params: &FeatureParams,
 ) -> Vec<Point> {
     let (w, h) = (img.width, img.height);
@@ -86,20 +91,18 @@ pub fn good_features(
 
     let (cw, ch) = (x1 - x0, y1 - y0);
     let mut resp = vec![0f32; cw * ch];
-    let mut max_resp = 0f32;
-    for y in 0..ch {
-        for x in 0..cw {
+    crate::par::rows(&mut resp, cw, |y, row| {
+        for (x, out) in row.iter_mut().enumerate() {
             let (cx, cy) = (x + r, y + r);
             let a = box_sum(&ixx, cx, cy);
             let b = box_sum(&ixy, cx, cy);
             let c = box_sum(&iyy, cx, cy);
             let half_tr = 0.5 * (a + c);
             let disc = (0.25 * (a - c) * (a - c) + b * b).sqrt();
-            let e = (half_tr - disc) as f32;
-            resp[y * cw + x] = e;
-            max_resp = max_resp.max(e);
+            *out = (half_tr - disc) as f32;
         }
-    }
+    });
+    let max_resp = resp.iter().copied().fold(0f32, f32::max);
     if max_resp <= 1e-6 {
         return vec![];
     }
@@ -135,6 +138,13 @@ pub fn good_features(
                     continue;
                 }
             }
+            // Inside an occluder, or close enough that the tracking patch would overlap it.
+            if exclude
+                .iter()
+                .any(|e| point_in_polygon(e, p) || near_outline(e, p, params.exclude_margin as f64))
+            {
+                continue;
+            }
             cands.push((v, p));
         }
     }
@@ -168,4 +178,21 @@ pub fn good_features(
         }
     }
     out
+}
+
+/// Is `p` within `margin` of the outline of `poly`?
+fn near_outline(poly: &[Point], p: Point, margin: f64) -> bool {
+    let n = poly.len();
+    (0..n).any(|i| {
+        let (a, b) = (poly[i], poly[(i + 1) % n]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 {
+            (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (qx, qy) = (a[0] + t * dx - p[0], a[1] + t * dy - p[1]);
+        qx * qx + qy * qy < margin * margin
+    })
 }

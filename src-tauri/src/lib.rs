@@ -17,7 +17,8 @@ use tauri_plugin_dialog::DialogExt;
 use trackwright_core::export::{self, ExportFormat};
 use trackwright_core::project::Insert;
 use trackwright_core::{
-    track_layer, FrameSource, FrameTrack, GrayImage, Layer, Project, Pyramid, Shape, StopReason,
+    exclusion_polys, retrack_section, track_layer, FrameSource, FrameTrack, GrayImage, Layer,
+    Project, Pyramid, Shape, StopReason,
 };
 
 const MAX_UNDO: usize = 60;
@@ -29,9 +30,26 @@ const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 
 struct FrameCache {
     frames: Vec<String>,
-    cache: HashMap<usize, Arc<Pyramid>>,
+    /// index -> (levels requested, pyramid)
+    cache: HashMap<usize, (usize, Arc<Pyramid>)>,
     order: VecDeque<usize>,
     capacity: usize,
+    /// The frame the tracker will probably ask for next, being decoded in the background.
+    prefetch: Option<(
+        usize,
+        usize,
+        std::thread::JoinHandle<Result<Pyramid, String>>,
+    )>,
+    last: Option<usize>,
+}
+
+fn load_pyramid(path: &str, levels: usize) -> Result<Pyramid, String> {
+    let img = image::open(path)
+        .map_err(|e| format!("{path}: {e}"))?
+        .to_luma8();
+    let (w, h) = img.dimensions();
+    let gray = GrayImage::from_luma8(w as usize, h as usize, img.as_raw());
+    Ok(Pyramid::build(gray, levels))
 }
 
 impl FrameCache {
@@ -41,6 +59,8 @@ impl FrameCache {
             cache: HashMap::new(),
             order: VecDeque::new(),
             capacity: 8,
+            prefetch: None,
+            last: None,
         }
     }
 
@@ -48,6 +68,19 @@ impl FrameCache {
         self.frames = frames;
         self.cache.clear();
         self.order.clear();
+        self.prefetch = None;
+        self.last = None;
+    }
+
+    fn insert(&mut self, index: usize, levels: usize, pyr: Arc<Pyramid>) {
+        self.cache.insert(index, (levels, pyr));
+        self.order.retain(|&i| i != index);
+        self.order.push_back(index);
+        while self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.cache.remove(&old);
+            }
+        }
     }
 }
 
@@ -57,26 +90,58 @@ impl FrameSource for FrameCache {
     }
 
     fn pyramid(&mut self, index: usize, levels: usize) -> Result<Arc<Pyramid>, String> {
-        if let Some(p) = self.cache.get(&index) {
-            return Ok(p.clone());
-        }
-        let path = self
-            .frames
-            .get(index)
-            .ok_or_else(|| format!("frame {index} is out of range"))?;
-        let img = image::open(path)
-            .map_err(|e| format!("{path}: {e}"))?
-            .to_luma8();
-        let (w, h) = img.dimensions();
-        let gray = GrayImage::from_luma8(w as usize, h as usize, img.as_raw());
-        let pyr = Arc::new(Pyramid::build(gray, levels));
-        self.cache.insert(index, pyr.clone());
-        self.order.push_back(index);
-        while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.cache.remove(&old);
+        let hit = self
+            .cache
+            .get(&index)
+            .filter(|(l, _)| *l >= levels)
+            .map(|(_, p)| p.clone());
+        let pyr = match hit {
+            Some(p) => p,
+            None => {
+                let prefetched = match self.prefetch.take() {
+                    Some((i, l, handle)) if i == index && l >= levels => {
+                        handle.join().ok().and_then(|r| r.ok())
+                    }
+                    other => {
+                        self.prefetch = other;
+                        None
+                    }
+                };
+                let path = self
+                    .frames
+                    .get(index)
+                    .ok_or_else(|| format!("frame {index} is out of range"))?;
+                let p = Arc::new(match prefetched {
+                    Some(p) => p,
+                    None => load_pyramid(path, levels)?,
+                });
+                self.insert(index, levels, p.clone());
+                p
+            }
+        };
+        // Decode the next frame in the direction of travel while this one is tracked.
+        if let Some(last) = self.last {
+            if last != index {
+                let next = if index > last {
+                    index.checked_add(1)
+                } else {
+                    index.checked_sub(1)
+                };
+                if let Some(n) = next.filter(|&n| n < self.frames.len()) {
+                    let busy = self.prefetch.as_ref().is_some_and(|(i, _, _)| *i == n);
+                    let cached = self.cache.get(&n).is_some_and(|(l, _)| *l >= levels);
+                    if !busy && !cached {
+                        let path = self.frames[n].clone();
+                        self.prefetch = Some((
+                            n,
+                            levels,
+                            std::thread::spawn(move || load_pyramid(&path, levels)),
+                        ));
+                    }
+                }
             }
         }
+        self.last = Some(index);
         Ok(pyr)
     }
 }
@@ -829,9 +894,11 @@ struct TrackDoneEvent {
 }
 
 /// Start tracking in the background. `direction` is 1 or -1; `steps` limits the
-/// number of frames (1 = step a single frame, None = to the end of the clip).
-/// A whole tracking run is a single undo step.
+/// number of frames (1 = step a single frame); `until` stops at that frame (the
+/// In/Out point). With `blend`, the section from..until is re-tracked and blended
+/// into the existing track at `until`. A whole tracking run is a single undo step.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_tracking(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -839,7 +906,10 @@ fn start_tracking(
     from: usize,
     direction: i32,
     steps: Option<usize>,
+    until: Option<usize>,
+    blend: Option<bool>,
 ) -> CmdResult<()> {
+    let blend = blend.unwrap_or(false);
     if state.tracking.swap(true, Ordering::SeqCst) {
         return Err("Already tracking".into());
     }
@@ -850,16 +920,25 @@ fn start_tracking(
         if let Some(pid) = layer.link {
             let name = p.layer(pid).map(|l| l.name.clone()).unwrap_or_default();
             return Err(format!(
-                "This layer follows {name}. Unlink it (Layer panel) to track it on its own"
+                "This layer follows {name}. Set Motion source to Own track to track it"
             ));
         }
         let last = f.frames.len().saturating_sub(1);
-        let end = match (direction >= 0, steps) {
+        let mut end = match (direction >= 0, steps) {
             (true, Some(n)) => (from + n).min(last),
             (true, None) => last,
             (false, Some(n)) => from.saturating_sub(n),
             (false, None) => 0,
         };
+        if let Some(u) = until {
+            let u = u.min(last);
+            if (direction >= 0 && u > from && u < end) || (direction < 0 && u < from && u > end) {
+                end = u;
+            }
+        }
+        if blend && end == from {
+            return Err("Set In and Out points around the section to re-track".into());
+        }
         Ok((layer, end, p.clone()))
     })();
     let (mut layer, end, before) = match setup {
@@ -873,12 +952,16 @@ fn start_tracking(
     let cache = state.cache.clone();
     let cancel = state.cancel.clone();
     let tracking = state.tracking.clone();
+    // Occluder outlines come from a snapshot of the other layers.
+    let all_layers = before.layers.clone();
+    let me = layer.clone();
 
     std::thread::spawn(move || {
         let mut last_frame = None;
+        let exclude = move |f: usize| exclusion_polys(&all_layers, &me, f);
         let result = {
             let mut src = cache.lock().unwrap();
-            track_layer(&mut *src, &mut layer, from, end, &cancel, |frame, track| {
+            let emit = |frame: usize, track: &FrameTrack| {
                 last_frame = Some(frame);
                 let _ = app.emit(
                     "track-frame",
@@ -888,7 +971,12 @@ fn start_tracking(
                         track: track.clone(),
                     },
                 );
-            })
+            };
+            if blend {
+                retrack_section(&mut *src, &mut layer, from, end, &exclude, &cancel, emit)
+            } else {
+                track_layer(&mut *src, &mut layer, from, end, &exclude, &cancel, emit)
+            }
         };
         // Write results back whatever happened, so partial tracks are kept.
         if let Some(state) = app.try_state::<AppState>() {
@@ -908,7 +996,11 @@ fn start_tracking(
                 layer_id: id,
                 ok: true,
                 cancelled: false,
-                message: "Tracking finished".into(),
+                message: if blend {
+                    "Section re-tracked and blended into the existing track".into()
+                } else {
+                    "Tracking finished".into()
+                },
                 last_frame,
             },
             Ok(StopReason::Cancelled) => TrackDoneEvent {

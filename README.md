@@ -17,7 +17,17 @@ Built in Rust with Tauri 2 and a Leptos UI.
 * **Tracking:** forward and backward, whole clip or one frame at a time, cancellable, live progress.
   * Motion model per layer: translation, + scale/rotation, + shear, + perspective.
   * Engine: Shi-Tomasi features inside the shape, pyramidal Lucas-Kanade with a forward-backward check, RANSAC model fit, and **anti-drift**: every frame is re-solved against the reference frame warped by the current estimate, so error does not build up over long shots.
-* **Checks:** grid insert overlay warped onto the surface, inlier points, per-frame error.
+* **Checks:** grid insert overlay warped onto the surface, inlier points, and a **quality graph** on the timeline (error line, point-count bars, red/orange/purple marks on suspect frames) with **⚠ Next problem (N)**.
+
+### Tracking quality
+
+* **Exclusion layers:** tick other layers in *Exclusions* and the tracker ignores those areas (and a margin around them), in the current frame and in the reference. Track or keyframe the excluded layer so it follows the occluder.
+* **Shape keyframes:** *◆ Shape Key* animates the tracking region; edits on other frames add keys, and points added or removed apply to every key.
+* **Adjust Track (A):** drag corners on a bad frame to correct them. Corrections are keyed, interpolated between keys and held outside them; *◆ Lock Here* pins good frames. The raw track is shown as an orange ghost. Exports, inserts and linked layers use the corrected corners.
+* **In / Out (I, O, X):** tracking stops at the Out (forward) or In (backward) point. **Re-track In→Out** re-solves just that section and blends it into the existing track so it joins seamlessly at Out.
+* **Lighting:** per-patch brightness/contrast compensation handles fades, flicker and moving light.
+* **Motion blur / hard frames:** a failed frame is retried with a wider, more forgiving search (flagged purple on the graph).
+* **Speed:** multi-core tracking, cropped anti-drift solve, background decoding of the next frame, and an automatic half-resolution first pass on 2.5K+ footage (full-res refinement keeps the precision).
 * **Export** (Save to Desktop / Send to app / Save As…):
 
 | Format | Use |
@@ -49,6 +59,10 @@ Synthetic plates with a textured plane moving over a different textured backgrou
 | 24 frames, rotation + scale + perspective (unit test) | 0.09 px |
 | 48 frames, 27° rotation, 23 % scale, perspective (unit test) | 0.07 px |
 | 48-frame 960×540 plate tracked through the app UI and exported | 0.014 px |
+| Textured box sliding across the plane, with an exclusion layer (through the app UI) | 0.032 px (without exclusion the track follows the box) |
+| Brightness flicker ±45 % gain, ±40 bias (unit test) | 0.08 px (track is lost without compensation) |
+| Corrupted 9-frame section re-tracked with In→Out blend (unit test) | 0.08 px, later frames untouched |
+| 4K, 2 cores: full-res pass → auto half-res pass | 209 → 116 ms/frame |
 
 ## Using it
 

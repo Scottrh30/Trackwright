@@ -67,7 +67,7 @@ fn frames(layer: &Layer) -> Vec<(usize, [Point; 4], Mat3, u32, f64)> {
             (
                 f,
                 layer.surface_at(f).unwrap(),
-                t.h_from_ref,
+                layer.final_h_at(f).unwrap_or(t.h_from_ref),
                 t.inliers,
                 t.rms_error,
             )
