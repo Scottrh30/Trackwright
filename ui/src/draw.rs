@@ -53,6 +53,8 @@ pub enum Tool {
     Surface,
     /// Adjust Track: per-frame corner corrections.
     Adjust,
+    /// Lens calibration: click points along edges that should be straight.
+    LensLine,
 }
 
 pub struct Overlays {
@@ -61,6 +63,14 @@ pub struct Overlays {
     pub points: bool,
     pub shapes: bool,
     pub inserts: bool,
+    /// Camera solve: 2D point tracks (trails).
+    pub tracks: bool,
+    /// Camera solve: solved 3D points projected into the frame.
+    pub cloud: bool,
+    /// Camera solve: ground grid of the oriented scene.
+    pub ground: bool,
+    /// Lens: distortion grid.
+    pub lens_grid: bool,
 }
 
 pub struct Scene<'a> {
@@ -340,6 +350,8 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
             }
         }
     }
+
+    draw_camera_overlays(&ctx, scene, w, h, px);
 
     // Shape being drawn.
     if !scene.draft.is_empty() {
@@ -660,4 +672,161 @@ pub fn draw_timeline(
 
     ctx.set_fill_style_str("#ffb020");
     ctx.fill_rect(x_of(frame) - 1.0, 0.0, 2.0, ch);
+}
+
+/// Camera solve and lens overlays: point trails, solved points, ground grid, lens lines and grid.
+fn draw_camera_overlays(ctx: &CanvasRenderingContext2d, scene: &Scene, w: f64, h: f64, px: f64) {
+    let p = scene.project;
+    let f = scene.frame;
+    let cam = &p.camera;
+
+    // Lens lines (always shown while calibrating, otherwise with the lens grid).
+    if scene.tool == Tool::LensLine || scene.overlays.lens_grid {
+        for (_, line) in &p.lens_lines {
+            path(ctx, line, false);
+            ctx.set_stroke_style_str("#ffe14d");
+            ctx.set_line_width(1.5 * px);
+            ctx.stroke();
+            for q in line {
+                handle(ctx, *q, 3.5 * px, "#ffe14d", "#0d0e11");
+            }
+            // Where the line would be after undistorting: straight chord through the ends.
+            if !p.lens.is_identity() && line.len() >= 2 {
+                let und: Vec<Point> = line.iter().map(|q| p.lens.undistort(*q, w, h)).collect();
+                path(ctx, &und, false);
+                ctx.set_stroke_style_str("rgba(120,255,160,0.85)");
+                ctx.set_line_width(1.0 * px);
+                ctx.stroke();
+            }
+        }
+    }
+    if scene.overlays.lens_grid && !p.lens.is_identity() {
+        // A straight grid in the undistorted image, drawn bent as the lens sees it.
+        ctx.set_stroke_style_str("rgba(255,225,77,0.45)");
+        ctx.set_line_width(1.0 * px);
+        let n = 12;
+        for i in 0..=n {
+            let t = i as f64 / n as f64;
+            let v: Vec<Point> = (0..=40)
+                .map(|k| p.lens.distort([t * w, k as f64 / 40.0 * h], w, h))
+                .collect();
+            path(ctx, &v, false);
+            ctx.stroke();
+            let hz: Vec<Point> = (0..=40)
+                .map(|k| p.lens.distort([k as f64 / 40.0 * w, t * h], w, h))
+                .collect();
+            path(ctx, &hz, false);
+            ctx.stroke();
+        }
+    }
+
+    // Point-track trails (last few frames) for the camera solve.
+    if scene.overlays.tracks && !cam.tracks.is_empty() {
+        let solved: std::collections::HashMap<u32, f64> = cam
+            .solve
+            .as_ref()
+            .map(|s| s.points.iter().map(|q| (q.id, q.error)).collect())
+            .unwrap_or_default();
+        for t in &cam.tracks {
+            let Some(now) = t.points.get(&f) else {
+                continue;
+            };
+            let trail: Vec<Point> = t
+                .points
+                .range(f.saturating_sub(8)..=f)
+                .map(|(_, q)| *q)
+                .collect();
+            let color = match solved.get(&t.id) {
+                Some(e) if *e < 1.0 => "#5cff8a",
+                Some(e) if *e < 3.0 => "#ffd24a",
+                Some(_) => "#ff5f5f",
+                None => "#8fb3ff",
+            };
+            if trail.len() > 1 {
+                path(ctx, &trail, false);
+                ctx.set_stroke_style_str(color);
+                ctx.set_line_width(1.0 * px);
+                ctx.stroke();
+            }
+            ctx.set_fill_style_str(color);
+            ctx.fill_rect(now[0] - 1.5 * px, now[1] - 1.5 * px, 3.0 * px, 3.0 * px);
+        }
+    }
+
+    let Some(solve) = cam.solve.as_ref() else {
+        return;
+    };
+    if !solve.poses.contains_key(&f) {
+        return;
+    }
+    // Solved 3D points projected back: small crosses.
+    if scene.overlays.cloud {
+        ctx.set_stroke_style_str("rgba(255,80,220,0.9)");
+        ctx.set_line_width(1.0 * px);
+        for sp in &solve.points {
+            if let Some(q) = solve.project(f, sp.pos) {
+                if q[0] < 0.0 || q[1] < 0.0 || q[0] > w || q[1] > h {
+                    continue;
+                }
+                let r = 3.0 * px;
+                path(ctx, &[[q[0] - r, q[1]], [q[0] + r, q[1]]], false);
+                ctx.stroke();
+                path(ctx, &[[q[0], q[1] - r], [q[0], q[1] + r]], false);
+                ctx.stroke();
+            }
+        }
+    }
+    // Ground grid on the oriented scene's XZ plane (y = 0), with X red and Z blue axes.
+    // Only meaningful once the scene is oriented (Set Ground); before that y = 0 runs through the camera.
+    if scene.overlays.ground && solve.world != trackwright_core::sfm::World::default() {
+        let n = 10i32;
+        let step = 0.1;
+        let seg = |a: [f64; 3], b: [f64; 3]| -> Vec<Point> {
+            (0..=20)
+                .filter_map(|k| {
+                    let t = k as f64 / 20.0;
+                    solve.project_user(
+                        f,
+                        [
+                            a[0] + (b[0] - a[0]) * t,
+                            a[1] + (b[1] - a[1]) * t,
+                            a[2] + (b[2] - a[2]) * t,
+                        ],
+                    )
+                })
+                .collect()
+        };
+        for i in -n..=n {
+            let c = i as f64 * step;
+            let e = n as f64 * step;
+            ctx.set_stroke_style_str(if i == 0 {
+                "rgba(255,255,255,0.7)"
+            } else {
+                "rgba(140,200,255,0.35)"
+            });
+            ctx.set_line_width(1.0 * px);
+            for line in [
+                seg([c, 0.0, -e], [c, 0.0, e]),
+                seg([-e, 0.0, c], [e, 0.0, c]),
+            ] {
+                if line.len() > 1 {
+                    path(ctx, &line, false);
+                    ctx.stroke();
+                }
+            }
+        }
+        for (end, color) in [
+            ([0.3, 0.0, 0.0], "#ff4d4d"),
+            ([0.0, 0.3, 0.0], "#5cff8a"),
+            ([0.0, 0.0, 0.3], "#4d8dff"),
+        ] {
+            let line = seg([0.0, 0.0, 0.0], end);
+            if line.len() > 1 {
+                path(ctx, &line, false);
+                ctx.set_stroke_style_str(color);
+                ctx.set_line_width(2.5 * px);
+                ctx.stroke();
+            }
+        }
+    }
 }

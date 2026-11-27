@@ -23,13 +23,15 @@ pub enum ExportFormat {
     Blender,
     /// Shake 4.x four-point tracker file, imported by Silhouette (and Shake).
     SilhouetteShake,
+    /// Animated mask (roto shape per frame) for Reelforge.
+    ReelforgeMask,
     /// Generic Trackwright JSON.
     Json,
     Csv,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 10] = [
+    pub const ALL: [ExportFormat; 11] = [
         ExportFormat::Reelforge,
         ExportFormat::Forma3d,
         ExportFormat::Tidefire,
@@ -38,6 +40,7 @@ impl ExportFormat {
         ExportFormat::FusionCornerPin,
         ExportFormat::Blender,
         ExportFormat::SilhouetteShake,
+        ExportFormat::ReelforgeMask,
         ExportFormat::Json,
         ExportFormat::Csv,
     ];
@@ -52,6 +55,7 @@ impl ExportFormat {
             ExportFormat::FusionCornerPin => "Fusion / DaVinci Resolve CornerPositioner (.setting)",
             ExportFormat::Blender => "Blender plane-track script (.py)",
             ExportFormat::SilhouetteShake => "Silhouette / Shake 4-point tracker (.txt)",
+            ExportFormat::ReelforgeMask => "Reelforge animated mask (.rfmask.json)",
             ExportFormat::Json => "Trackwright JSON (.json)",
             ExportFormat::Csv => "CSV corners (.csv)",
         }
@@ -67,6 +71,7 @@ impl ExportFormat {
             ExportFormat::FusionCornerPin => "setting",
             ExportFormat::Blender => "py",
             ExportFormat::SilhouetteShake => "shake.txt",
+            ExportFormat::ReelforgeMask => "rfmask.json",
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
         }
@@ -134,6 +139,7 @@ pub fn export(format: ExportFormat, footage: &Footage, layer: &Layer) -> String 
         ExportFormat::FusionCornerPin => fusion(footage, layer),
         ExportFormat::Blender => blender(footage, layer),
         ExportFormat::SilhouetteShake => shake_trackers(footage, layer),
+        ExportFormat::ReelforgeMask => reelforge_mask(footage, layer),
         ExportFormat::Json => generic_json(footage, layer),
         ExportFormat::Csv => csv(footage, layer),
     }
@@ -494,4 +500,30 @@ fn shake_trackers(f: &Footage, l: &Layer) -> String {
         out += "\n";
     }
     out
+}
+
+/// Roto shape per frame: control points, the drawn outline (polygon) and the feather.
+fn reelforge_mask(f: &Footage, l: &Layer) -> String {
+    let frames: Vec<_> = l
+        .tracks
+        .keys()
+        .filter_map(|&i| {
+            let shape = l.shape_at(i)?;
+            Some(json!({
+                "frame": f.frame_number(i),
+                "time": if f.fps > 0.0 { r4(i as f64 / f.fps) } else { 0.0 },
+                "points": shape.points.iter().map(|p| r4p(*p)).collect::<Vec<_>>(),
+                "polygon": shape.flatten(10).iter().map(|p| r4p(*p)).collect::<Vec<_>>(),
+            }))
+        })
+        .collect();
+    serde_json::to_string_pretty(&json!({
+        "format": "trackwright.mask.v1",
+        "generator": concat!("Trackwright ", env!("CARGO_PKG_VERSION")),
+        "source": source_json(f),
+        "mask": { "name": l.name, "smooth": l.shape.smooth, "feather_px": l.feather },
+        "coordinate_space": "pixels, origin top-left, y down",
+        "frames": frames,
+    }))
+    .unwrap()
 }

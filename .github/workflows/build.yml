@@ -44,8 +44,22 @@ jobs:
         with:
           node-version: 22
 
-      - name: Build app and installers
-        run: npx --yes @tauri-apps/cli@^2 build
+      - name: Fetch FFmpeg to bundle in the installers
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force src-tauri/ffmpeg | Out-Null
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-x -Force
+          Get-ChildItem ffmpeg-x -Recurse -Include ffmpeg.exe, ffprobe.exe | Copy-Item -Destination src-tauri/ffmpeg -Force
+          $lic = Get-ChildItem ffmpeg-x -Recurse -Include LICENSE, LICENSE.txt | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName src-tauri/ffmpeg/FFmpeg-LICENSE.txt } else { "FFmpeg is licensed under the GPL v3. Build from https://www.gyan.dev/ffmpeg/builds/ ; source at https://ffmpeg.org" | Set-Content src-tauri/ffmpeg/FFmpeg-LICENSE.txt }
+          Get-ChildItem src-tauri/ffmpeg | Format-Table Name, Length
+          # Installer-only overlay: ffmpeg.exe / ffprobe.exe go next to trackwright.exe.
+          '{"bundle":{"resources":{"ffmpeg/ffmpeg.exe":"ffmpeg.exe","ffmpeg/ffprobe.exe":"ffprobe.exe","ffmpeg/FFmpeg-LICENSE.txt":"FFmpeg-LICENSE.txt"}}}' | Set-Content -Encoding ascii src-tauri/tauri.ffmpeg.json
+
+      - name: Build app and installers (with FFmpeg)
+        run: npx --yes @tauri-apps/cli@^2 build --config "${{ github.workspace }}/src-tauri/tauri.ffmpeg.json"
 
       - name: Package Trackwright-windows.zip (exe + FFmpeg helper)
         shell: pwsh
@@ -75,7 +89,7 @@ jobs:
           gh release delete latest -y --cleanup-tag || true
           gh release create latest --prerelease --target "$GITHUB_SHA" \
             --title "Latest build ($(git rev-parse --short HEAD))" \
-            --notes "Automatic build of main at $GITHUB_SHA. Trackwright-windows.zip holds trackwright.exe (runs without installing) and get-ffmpeg.bat; the setup .exe / .msi install it." \
+            --notes "Automatic build of main at $GITHUB_SHA. Trackwright-windows.zip holds trackwright.exe (runs without installing) and get-ffmpeg.bat; the setup .exe / .msi install it with FFmpeg included." \
             Trackwright-windows.zip target/release/trackwright.exe target/release/bundle/nsis/*.exe target/release/bundle/msi/*.msi
 
       - name: Attach to GitHub release

@@ -147,6 +147,9 @@ pub struct Layer {
     /// tracked surface, interpolated between keys and held outside them.
     #[serde(default)]
     pub adjust_keys: BTreeMap<usize, [Point; 4]>,
+    /// Soft edge for mattes and masks, in pixels.
+    #[serde(default)]
+    pub feather: f64,
 }
 
 /// Media corner-pinned onto a layer's surface (Mocha-style "insert").
@@ -206,6 +209,7 @@ impl Layer {
             exclusions: vec![],
             shape_keys: BTreeMap::new(),
             adjust_keys: BTreeMap::new(),
+            feather: 0.0,
         }
     }
 
@@ -502,6 +506,15 @@ pub struct Project {
     pub footage: Option<Footage>,
     pub layers: Vec<Layer>,
     pub next_layer_id: u32,
+    /// Auto point tracks and the camera solve.
+    #[serde(default)]
+    pub camera: crate::sfm::CameraData,
+    /// Lens distortion of the footage (Lens panel).
+    #[serde(default)]
+    pub lens: crate::lens::Lens,
+    /// Lines drawn along edges that should be straight, for lens calibration (frame, points).
+    #[serde(default)]
+    pub lens_lines: Vec<(usize, Vec<Point>)>,
 }
 
 impl Default for Project {
@@ -511,6 +524,9 @@ impl Default for Project {
             footage: None,
             layers: vec![],
             next_layer_id: 1,
+            camera: Default::default(),
+            lens: Default::default(),
+            lens_lines: vec![],
         }
     }
 }

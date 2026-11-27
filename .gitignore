@@ -4,3 +4,5 @@
 /src-tauri/target
 *.twproj.bak
 .DS_Store
+src-tauri/ffmpeg/
+src-tauri/tauri.ffmpeg.json

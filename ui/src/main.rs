@@ -13,7 +13,9 @@ use leptos::task::spawn_local;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
+use trackwright_core::camera_export::CameraFormat;
 use trackwright_core::geometry::{MotionModel, Point};
+use trackwright_core::sfm::{CameraSettings, FocalMode, SolveMode};
 use trackwright_core::shape::point_in_polygon;
 use trackwright_core::{ExportFormat, FrameTrack, Layer, Project, Shape};
 use wasm_bindgen::JsCast;
@@ -71,6 +73,26 @@ struct TrackFrameEvent {
     layer_id: u32,
     frame: usize,
     track: FrameTrack,
+}
+
+#[derive(Clone, Deserialize)]
+struct CameraProgressEvent {
+    stage: String,
+    #[allow(dead_code)]
+    fraction: f64,
+}
+
+#[derive(Clone, Deserialize)]
+struct CameraDoneEvent {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct LensResult {
+    view: AppView,
+    rms_before: f64,
+    rms_after: f64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -171,6 +193,21 @@ struct Ctx {
     make_video: RwSignal<bool>,
     rendering: RwSignal<bool>,
     render_progress: RwSignal<(usize, usize)>,
+    render_bg: RwSignal<Option<u32>>,
+    render_search: RwSignal<usize>,
+    render_grow: RwSignal<f64>,
+    render_match: RwSignal<bool>,
+    render_all_layers: RwSignal<bool>,
+    show_tracks: RwSignal<bool>,
+    show_cloud: RwSignal<bool>,
+    show_ground: RwSignal<bool>,
+    show_lens_grid: RwSignal<bool>,
+    camera_busy: RwSignal<bool>,
+    camera_progress: RwSignal<(String, f64)>,
+    camera_format: RwSignal<CameraFormat>,
+    orient_layer: RwSignal<Option<u32>>,
+    orient_width: RwSignal<f64>,
+    lens_k2: RwSignal<bool>,
     drag: StoredValue<Drag>,
     play_handle: StoredValue<Option<IntervalHandle>>,
     viewport: NodeRef<html::Canvas>,
@@ -234,6 +271,21 @@ impl Ctx {
             make_video: RwSignal::new(true),
             rendering: RwSignal::new(false),
             render_progress: RwSignal::new((0, 0)),
+            render_bg: RwSignal::new(None),
+            render_search: RwSignal::new(20),
+            render_grow: RwSignal::new(6.0),
+            render_match: RwSignal::new(true),
+            render_all_layers: RwSignal::new(false),
+            show_tracks: RwSignal::new(true),
+            show_cloud: RwSignal::new(true),
+            show_ground: RwSignal::new(true),
+            show_lens_grid: RwSignal::new(false),
+            camera_busy: RwSignal::new(false),
+            camera_progress: RwSignal::new((String::new(), 0.0)),
+            camera_format: RwSignal::new(CameraFormat::Forma3d),
+            orient_layer: RwSignal::new(None),
+            orient_width: RwSignal::new(0.0),
+            lens_k2: RwSignal::new(false),
             drag: StoredValue::new(Drag::None),
             play_handle: StoredValue::new(None),
             viewport: NodeRef::new(),
@@ -565,6 +617,24 @@ impl Ctx {
     }
 
     fn finish_draft(self) {
+        if self.tool.get_untracked() == Tool::LensLine {
+            let pts = self.draft.get_untracked();
+            if pts.len() < 3 {
+                self.say(
+                    "A lens line needs at least 3 points along a straight edge",
+                    true,
+                );
+                return;
+            }
+            self.draft.set(vec![]);
+            let fr = self.frame.get_untracked();
+            let mut lines = self.project.with_untracked(|p| p.lens_lines.clone());
+            lines.push((fr, pts));
+            let n = lines.len();
+            self.call("set_lens_lines", json!({ "lines": lines }), None);
+            self.say(format!("{n} lens line(s). Draw more along straight edges near the frame edges, then Calibrate"), false);
+            return;
+        }
         let pts = self.draft.get_untracked();
         if pts.len() < 3 {
             self.say("A shape needs at least 3 points", true);
@@ -797,6 +867,19 @@ fn App() -> impl IntoView {
         ctx.render_progress.set((p.done, p.total));
         ctx.say(format!("Rendering… {} / {}", p.done, p.total), false);
     });
+    tauri::listen::<CameraProgressEvent>("camera-progress", move |p| {
+        ctx.camera_progress.set((p.stage.clone(), p.fraction));
+        ctx.say(p.stage, false);
+    });
+    tauri::listen::<CameraDoneEvent>("camera-done", move |d| {
+        ctx.camera_busy.set(false);
+        ctx.say(d.message, !d.ok);
+        spawn_local(async move {
+            if let Ok(v) = tauri::call::<AppView>("get_view", json!({})).await {
+                ctx.apply_view(v);
+            }
+        });
+    });
     tauri::listen::<RenderDone>("render-done", move |d| {
         ctx.rendering.set(false);
         ctx.say(d.message, !d.ok);
@@ -862,6 +945,10 @@ fn App() -> impl IntoView {
             points: ctx.show_points.get(),
             shapes: ctx.show_shapes.get(),
             inserts: ctx.show_inserts.get(),
+            tracks: ctx.show_tracks.get(),
+            cloud: ctx.show_cloud.get(),
+            ground: ctx.show_ground.get(),
+            lens_grid: ctx.show_lens_grid.get(),
         };
         let (sel, sel_point, tool, hover, view) = (
             ctx.selected.get(),
@@ -1007,6 +1094,7 @@ fn App() -> impl IntoView {
             }
             "d" => ctx.tool.set(Tool::Draw),
             "a" => ctx.tool.set(Tool::Adjust),
+            "l" => ctx.tool.set(Tool::LensLine),
             "i" => ctx.set_in_out(true),
             "o" => ctx.set_in_out(false),
             "x" => {
@@ -1043,7 +1131,7 @@ fn TopBar() -> impl IntoView {
     let tool_btn = move |t: Tool, label: &'static str, key: &'static str| {
         view! {
             <button class="tool" class:active=move || ctx.tool.get() == t title=format!("{label} ({key})")
-                on:click=move |_| { ctx.tool.set(t); if t != Tool::Draw { ctx.draft.set(vec![]); ctx.hover.set(None); } }>
+                on:click=move |_| { ctx.tool.set(t); if !matches!(t, Tool::Draw | Tool::LensLine) { ctx.draft.set(vec![]); ctx.hover.set(None); } }>
                 {label}<kbd>{key}</kbd>
             </button>
         }
@@ -1095,6 +1183,7 @@ fn TopBar() -> impl IntoView {
                 {tool_btn(Tool::EditShape, "Edit", "E")}
                 {tool_btn(Tool::Surface, "Surface", "S")}
                 {tool_btn(Tool::Adjust, "Adjust", "A")}
+                {tool_btn(Tool::LensLine, "Lens", "L")}
             </div>
             <div class="spacer"></div>
             <button on:click=move |_| ctx.modal.set(Modal::About)>"About"</button>
@@ -1256,8 +1345,254 @@ fn LayerSection(layer: Layer) -> impl IntoView {
                 <input type="checkbox" prop:checked=l.shape.smooth on:change=move |_| ctx.edit_layer(|l| l.shape.smooth = !l.shape.smooth) />
                 "Smooth (spline) outline"
             </label>
+            <label class="field">"Mask feather (px)"
+                <input type="number" min="0" max="200" step="1" prop:value=format!("{:.0}", l.feather) on:change=move |ev| {
+                    if let Ok(v) = event_target_value(&ev).parse::<f64>() { ctx.edit_layer(move |l| l.feather = v.clamp(0.0, 200.0)); }
+                } />
+            </label>
             <button class="wide" on:click=move |_| ctx.edit_layer(|l| l.surface = trackwright_core::shape::default_surface(&l.shape))>"Reset Surface to Shape Bounds"</button>
             <p class="hint">"Edit Shape (E): drag points, click an edge to add a point, drag inside to move the shape, Delete removes the selected point. Surface (S): drag corners or drag inside to move it."</p>
+        </section>
+    }
+}
+
+/// Camera solve: auto point tracking, solve, orientation and export.
+#[component]
+fn CameraSection() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let settings = move || ctx.project.with(|p| p.camera.settings.clone());
+    let edit = move |f: Box<dyn FnOnce(&mut CameraSettings)>| {
+        let mut s = ctx.project.with_untracked(|p| p.camera.settings.clone());
+        f(&mut s);
+        ctx.call("set_camera_settings", json!({ "settings": s }), None);
+    };
+    let run = move |cmd: &'static str| {
+        if ctx.tracking.get_untracked() || ctx.camera_busy.get_untracked() {
+            return;
+        }
+        ctx.camera_busy.set(true);
+        ctx.camera_progress.set((String::new(), 0.0));
+        let (from, to) = (ctx.in_point.get_untracked(), ctx.out_point.get_untracked());
+        spawn_local(async move {
+            if let Err(e) = tauri::call::<()>(cmd, json!({ "from": from, "to": to })).await {
+                ctx.camera_busy.set(false);
+                ctx.say(e, true);
+            }
+        });
+    };
+    let export = move |destination: &'static str| {
+        let fmt = ctx.camera_format.get_untracked();
+        spawn_local(async move {
+            match tauri::call::<Option<String>>(
+                "export_camera",
+                json!({ "format": fmt, "destination": destination }),
+            )
+            .await
+            {
+                Ok(Some(p)) => ctx.say(format!("Camera exported to {p}"), false),
+                Ok(None) => {}
+                Err(e) => ctx.say(e, true),
+            }
+        });
+    };
+    let summary = move || {
+        ctx.project.with(|p| {
+            let n = p.camera.tracks.len();
+            match &p.camera.solve {
+                None if n == 0 => "No point tracks yet.".to_string(),
+                None => format!("{n} point tracks. Not solved yet."),
+                Some(s) => format!(
+                    "{}: {} frames · focal {:.1} mm · error {:.2} px · {} points{}{}",
+                    if s.tripod { "Tripod" } else { "Moving camera" },
+                    s.poses.len(),
+                    s.focal_mm(p.camera.settings.sensor_mm),
+                    s.rms_px,
+                    s.points.len(),
+                    if s.lens.is_identity() {
+                        String::new()
+                    } else {
+                        format!(" · k1 {:.4}", s.lens.k1)
+                    },
+                    if s.world != trackwright_core::sfm::World::default() {
+                        " · oriented"
+                    } else {
+                        ""
+                    }
+                ),
+            }
+        })
+    };
+    let toggle = move |sig: RwSignal<bool>, label: &'static str| {
+        view! { <label class="toggle"><input type="checkbox" prop:checked=move || sig.get() on:change=move |_| sig.update(|v| *v = !*v) />{label}</label> }
+    };
+    view! {
+        <section>
+            <h3>"Camera Solve"</h3>
+            <p class="hint">"Uses the In/Out range, or the whole clip. Tick moving objects and people under Ignore."</p>
+            <div class="row">
+                <label class="field">"Focal length"
+                    <select on:change=move |ev| {
+                        let auto = event_target_value(&ev) == "auto";
+                        edit(Box::new(move |s| s.focal = if auto { FocalMode::Auto } else { FocalMode::Known { mm: match s.focal { FocalMode::Known { mm } => mm, _ => 35.0 } } }));
+                    }>
+                        <option value="auto" selected=move || matches!(settings().focal, FocalMode::Auto)>"Solve it"</option>
+                        <option value="known" selected=move || matches!(settings().focal, FocalMode::Known { .. })>"I know it"</option>
+                    </select>
+                </label>
+                <Show when=move || matches!(settings().focal, FocalMode::Known { .. })>
+                    <label class="field">"mm"
+                        <input type="number" step="0.1" prop:value=move || match settings().focal { FocalMode::Known { mm } => format!("{mm}"), _ => String::new() }
+                            on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<f64>() { edit(Box::new(move |s| s.focal = FocalMode::Known { mm: v.clamp(1.0, 2000.0) })) } } />
+                    </label>
+                </Show>
+                <label class="field">"Sensor width mm"
+                    <input type="number" step="0.1" prop:value=move || format!("{}", settings().sensor_mm)
+                        on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<f64>() { edit(Box::new(move |s| s.sensor_mm = v.clamp(1.0, 100.0))) } } />
+                </label>
+            </div>
+            <div class="row">
+                <label class="field">"Camera"
+                    <select on:change=move |ev| {
+                        let m = match event_target_value(&ev).as_str() { "free" => SolveMode::Free, "tripod" => SolveMode::Tripod, _ => SolveMode::Auto };
+                        edit(Box::new(move |s| s.mode = m));
+                    }>
+                        <option value="auto" selected=move || settings().mode == SolveMode::Auto>"Detect"</option>
+                        <option value="free" selected=move || settings().mode == SolveMode::Free>"Moving"</option>
+                        <option value="tripod" selected=move || settings().mode == SolveMode::Tripod>"Tripod (pan/tilt)"</option>
+                    </select>
+                </label>
+                <label class="field">"Points"
+                    <input type="number" step="50" prop:value=move || settings().max_points.to_string()
+                        on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<usize>() { edit(Box::new(move |s| s.max_points = v.clamp(50, 3000))) } } />
+                </label>
+            </div>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=move || settings().solve_distortion on:change=move |_| edit(Box::new(|s| s.solve_distortion = !s.solve_distortion)) />
+                "Solve lens distortion"
+            </label>
+            {move || {
+                let layers: Vec<(u32, String)> = ctx.project.with(|p| p.layers.iter().map(|l| (l.id, l.name.clone())).collect());
+                (!layers.is_empty()).then(|| view! {
+                    <p class="hint">"Ignore:"</p>
+                    {layers.into_iter().map(|(id, name)| view! {
+                        <label class="toggle">
+                            <input type="checkbox" prop:checked=move || settings().exclude_layers.contains(&id) on:change=move |_| edit(Box::new(move |s| {
+                                if let Some(i) = s.exclude_layers.iter().position(|e| *e == id) { s.exclude_layers.remove(i); } else { s.exclude_layers.push(id); }
+                            })) />
+                            {name}
+                        </label>
+                    }).collect_view()}
+                })
+            }}
+            <Show when=move || !ctx.camera_busy.get() fallback=move || view! {
+                <div class="progress"><div class="bar" style=move || format!("width:{:.0}%", ctx.camera_progress.get().1 * 100.0)></div></div>
+                <button class="wide stop" on:click=move |_| ctx.stop_track()>"Stop"</button>
+            }>
+                <div class="export-grid">
+                    <button on:click=move |_| run("camera_track_points")>"1 · Track Points"</button>
+                    <button class="primary-ish" disabled=move || ctx.project.with(|p| p.camera.tracks.is_empty()) on:click=move |_| run("camera_solve")>"2 · Solve Camera"</button>
+                </div>
+            </Show>
+            <p class="muted">{summary}</p>
+            <Show when=move || ctx.project.with(|p| p.camera.solve.is_some())>
+                <div class="row">
+                    {toggle(ctx.show_tracks, "Tracks")}
+                    {toggle(ctx.show_cloud, "3D points")}
+                    {toggle(ctx.show_ground, "Ground")}
+                </div>
+                <h3 class="sub">"Orient scene"</h3>
+                <div class="row">
+                    <label class="field">"Ground layer"
+                        <select on:change=move |ev| ctx.orient_layer.set(event_target_value(&ev).parse().ok())>
+                            <option value="">"Choose…"</option>
+                            {move || ctx.project.with(|p| p.layers.iter().map(|l| {
+                                let id = l.id;
+                                view! { <option value=id.to_string() selected=move || ctx.orient_layer.get() == Some(id)>{l.name.clone()}</option> }
+                            }).collect_view())}
+                        </select>
+                    </label>
+                    <label class="field">"Real width"
+                        <input type="number" step="0.01" placeholder="m" prop:value=move || { let w = ctx.orient_width.get(); if w > 0.0 { format!("{w}") } else { String::new() } }
+                            on:change=move |ev| ctx.orient_width.set(event_target_value(&ev).parse().unwrap_or(0.0)) />
+                    </label>
+                </div>
+                <div class="row">
+                    <button on:click=move |_| {
+                        let Some(id) = ctx.orient_layer.get_untracked() else { ctx.say("Choose the layer that lies on the ground (floor, table, road...)", true); return; };
+                        let w = ctx.orient_width.get_untracked();
+                        ctx.call("camera_orient", json!({ "layerId": id, "frame": ctx.frame.get_untracked(), "width": if w > 0.0 { Some(w) } else { None } }), Some("Scene oriented: the layer's surface is now the ground"));
+                    }>"Set Ground"</button>
+                    <button on:click=move |_| ctx.call("camera_reset_orientation", json!({}), Some("Orientation reset"))>"Reset"</button>
+                </div>
+                <h3 class="sub">"Export camera"</h3>
+                <select on:change=move |ev| {
+                    if let Ok(f) = serde_json::from_value::<CameraFormat>(json!(event_target_value(&ev))) { ctx.camera_format.set(f); }
+                }>
+                    {CameraFormat::ALL.iter().map(|f| {
+                        let fmt = *f;
+                        view! { <option value=enum_id(fmt) selected=move || ctx.camera_format.get() == fmt>{fmt.label()}</option> }
+                    }).collect_view()}
+                </select>
+                <div class="export-grid" style="margin-top:6px">
+                    <button class="primary" on:click=move |_| export("desktop")>"Save to Desktop"</button>
+                    <button on:click=move |_| export("forma3d")>"Send to Forma3D"</button>
+                    <button on:click=move |_| export("tidefire")>"Send to Tidefire"</button>
+                    <button on:click=move |_| export("choose")>"Save As…"</button>
+                </div>
+            </Show>
+            <Show when=move || ctx.project.with(|p| !p.camera.tracks.is_empty())>
+                <button class="wide" on:click=move |_| ctx.call("clear_camera", json!({}), Some("Camera tracks cleared"))>"Clear Camera Tracks"</button>
+            </Show>
+        </section>
+    }
+}
+
+/// Lens distortion: values, line calibration, and an overlay grid.
+#[component]
+fn LensSection() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let lens = move || ctx.project.with(|p| p.lens);
+    let set = move |k1: f64, k2: f64| ctx.call("set_lens", json!({ "k1": k1, "k2": k2 }), None);
+    view! {
+        <section>
+            <h3>"Lens Distortion"</h3>
+            <div class="row">
+                <label class="field">"k1"
+                    <input type="number" step="0.001" prop:value=move || format!("{:.5}", lens().k1)
+                        on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<f64>() { set(v, lens().k2) } } />
+                </label>
+                <label class="field">"k2"
+                    <input type="number" step="0.001" prop:value=move || format!("{:.5}", lens().k2)
+                        on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<f64>() { set(lens().k1, v) } } />
+                </label>
+            </div>
+            <p class="muted">{move || format!("{} line(s) drawn", ctx.project.with(|p| p.lens_lines.len()))}</p>
+            <div class="row">
+                <button on:click=move |_| { ctx.tool.set(Tool::LensLine); ctx.say("Click points along an edge that should be straight (3+), Enter to finish. Long lines near the frame edges work best", false); }>"Draw Lines (L)"</button>
+                <button disabled=move || ctx.project.with(|p| p.lens_lines.is_empty()) on:click=move |_| ctx.call("set_lens_lines", json!({ "lines": [] }), Some("Lens lines cleared"))>"Clear"</button>
+            </div>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=move || ctx.lens_k2.get() on:change=move |_| ctx.lens_k2.update(|v| *v = !*v) />
+                "Also solve k2 (strong fisheye-like bending)"
+            </label>
+            <button class="wide" on:click=move |_| {
+                let k2 = ctx.lens_k2.get_untracked();
+                spawn_local(async move {
+                    match tauri::call::<LensResult>("calibrate_lens", json!({ "solveK2": k2 })).await {
+                        Ok(r) => {
+                            ctx.apply_view(r.view);
+                            ctx.show_lens_grid.set(true);
+                            ctx.say(format!("Lens calibrated: lines were {:.2} px off straight, now {:.2} px", r.rms_before, r.rms_after), false);
+                        }
+                        Err(e) => ctx.say(e, true),
+                    }
+                });
+            }>"Calibrate from Lines"</button>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=move || ctx.show_lens_grid.get() on:change=move |_| ctx.show_lens_grid.update(|v| *v = !*v) />
+                "Show lens grid"
+            </label>
+            <p class="hint">"Render › Undistort footage writes straightened frames. The camera solve uses these values (or solves them)."</p>
         </section>
     }
 }
@@ -1267,12 +1602,19 @@ fn LayerSection(layer: Layer) -> impl IntoView {
 fn RenderSection() -> impl IntoView {
     let ctx = expect_context::<Ctx>();
     let start = move |destination: &'static str| {
-        let Some(id) = ctx.selected.get_untracked() else {
-            ctx.say("Select a tracked layer to render", true);
+        let mode = ctx.render_mode.get_untracked();
+        let id = ctx.selected.get_untracked();
+        if id.is_none() && mode != "undistort" && !ctx.render_all_layers.get_untracked() {
+            ctx.say("Select a layer to render", true);
             return;
-        };
+        }
         let request = json!({
             "id": id,
+            "bg_layer": ctx.render_bg.get_untracked(),
+            "search": ctx.render_search.get_untracked(),
+            "grow": ctx.render_grow.get_untracked(),
+            "match_light": ctx.render_match.get_untracked(),
+            "all_layers": ctx.render_all_layers.get_untracked(),
             "mode": ctx.render_mode.get_untracked(),
             "smooth_frames": ctx.smooth_frames.get_untracked(),
             "zoom": ctx.zoom_pct.get_untracked(),
@@ -1303,8 +1645,48 @@ fn RenderSection() -> impl IntoView {
                     {mode_opt("insert", "Insert composited into the footage")}
                     {mode_opt("stabilize_smooth", "Stabilize: smooth the motion")}
                     {mode_opt("stabilize_lock", "Stabilize: lock to the surface")}
+                    {mode_opt("remove", "Remove object (fill from other frames)")}
+                    {mode_opt("clean_plate", "Clean plate (single image)")}
+                    {mode_opt("matte", "Matte (black & white mask)")}
+                    {mode_opt("cutout", "Cut-out (footage with alpha)")}
+                    {mode_opt("undistort", "Undistort footage (lens)")}
                 </select>
             </label>
+            <Show when=move || matches!(ctx.render_mode.get().as_str(), "remove" | "clean_plate")>
+                <label class="field">"Background layer (tracks the surface behind the object)"
+                    <select on:change=move |ev| ctx.render_bg.set(event_target_value(&ev).parse().ok())>
+                        <option value="" selected=move || ctx.render_bg.get().is_none()>"Choose…"</option>
+                        {move || ctx.project.with(|p| p.layers.iter().map(|l| {
+                            let id = l.id;
+                            view! { <option value=id.to_string() selected=move || ctx.render_bg.get() == Some(id)>{l.name.clone()}</option> }
+                        }).collect_view())}
+                    </select>
+                </label>
+                <div class="row">
+                    <label class="field">"Search ± frames"
+                        <input type="number" min="1" max="120" prop:value=move || ctx.render_search.get().to_string()
+                            on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<usize>() { ctx.render_search.set(v.clamp(1, 120)) } } />
+                    </label>
+                    <label class="field">"Grow mask (px)"
+                        <input type="number" min="0" max="200" prop:value=move || format!("{:.0}", ctx.render_grow.get())
+                            on:change=move |ev| { if let Ok(v) = event_target_value(&ev).parse::<f64>() { ctx.render_grow.set(v.clamp(0.0, 200.0)) } } />
+                    </label>
+                </div>
+                <Show when=move || ctx.render_mode.get() == "remove">
+                    <label class="toggle">
+                        <input type="checkbox" prop:checked=move || ctx.render_match.get() on:change=move |_| ctx.render_match.update(|v| *v = !*v) />
+                        "Match lighting"
+                    </label>
+                </Show>
+                <p class="hint">"The selected layer is the object to remove (track it, link it, or keyframe its shape). Areas never seen in other frames are filled smoothly."</p>
+            </Show>
+            <Show when=move || matches!(ctx.render_mode.get().as_str(), "matte" | "cutout")>
+                <label class="toggle">
+                    <input type="checkbox" prop:checked=move || ctx.render_all_layers.get() on:change=move |_| ctx.render_all_layers.update(|v| *v = !*v) />
+                    "All visible layers"
+                </label>
+                <p class="hint">"Edge softness comes from each layer's Mask feather."</p>
+            </Show>
             <Show when=move || ctx.render_mode.get().starts_with("stabilize")>
                 <div class="row">
                     <Show when=move || ctx.render_mode.get() == "stabilize_smooth">
@@ -1326,9 +1708,16 @@ fn RenderSection() -> impl IntoView {
             <Show when=move || ctx.render_mode.get() == "insert">
                 <p class="hint">"Areas covered by this layer's exclusions stay in front of the insert."</p>
             </Show>
-            <p class="hint">{move || match (ctx.in_point.get(), ctx.out_point.get()) {
-                (None, None) => "Renders the layer's whole tracked range as a PNG sequence.".to_string(),
-                _ => "Renders the In/Out range (within the tracked frames) as a PNG sequence.".to_string(),
+            <p class="hint">{move || {
+                let ranged = ctx.in_point.get().is_some() || ctx.out_point.get().is_some();
+                match ctx.render_mode.get().as_str() {
+                    "clean_plate" => "Writes one PNG: the background with the object taken out, built from every tracked frame.".to_string(),
+                    "undistort" => format!("Writes the {} with the lens bending removed, as a PNG sequence.", if ranged { "In/Out range" } else { "whole clip" }),
+                    "matte" => "Writes white-on-black PNG masks (a luma matte for Reelforge; Export Track › Reelforge mask gives the editable shape).".to_string(),
+                    "cutout" => "Writes PNGs that are transparent outside the shape.".to_string(),
+                    _ if ranged => "Renders the In/Out range (within the tracked frames) as a PNG sequence.".to_string(),
+                    _ => "Renders the layer's whole tracked range as a PNG sequence.".to_string(),
+                }
             }}</p>
             <Show when=move || !ctx.rendering.get() fallback=move || view! {
                 <div class="progress"><div class="bar" style=move || {
@@ -1593,6 +1982,7 @@ fn Viewport() -> impl IntoView {
         let fr = ctx.frame.get_untracked();
         let hit_r2 = 9.0f64.powi(2);
         match tool {
+            Tool::LensLine => ctx.draft.update(|d| d.push(ip)),
             Tool::Draw => {
                 let d = ctx.draft.get_untracked();
                 if d.len() >= 3 && dist2(v.to_screen(d[0]), s) < hit_r2 * 1.5 {
@@ -1690,7 +2080,7 @@ fn Viewport() -> impl IntoView {
         let s = mouse_pos(&e);
         let v = ctx.view.get_untracked();
         let ip = v.to_image(s);
-        if ctx.tool.get_untracked() == Tool::Draw {
+        if matches!(ctx.tool.get_untracked(), Tool::Draw | Tool::LensLine) {
             ctx.hover.set(Some(ip));
         }
         let fr = ctx.frame.get_untracked();
@@ -1781,7 +2171,9 @@ fn Viewport() -> impl IntoView {
     };
 
     let on_dbl = move |_e: web_sys::MouseEvent| {
-        if ctx.tool.get_untracked() == Tool::Draw && ctx.draft.with_untracked(|d| d.len() >= 3) {
+        if matches!(ctx.tool.get_untracked(), Tool::Draw | Tool::LensLine)
+            && ctx.draft.with_untracked(|d| d.len() >= 3)
+        {
             ctx.draft.update(|d| {
                 d.pop(); // the double-click's second point
             });
@@ -1802,10 +2194,16 @@ fn Viewport() -> impl IntoView {
                 {toggle(ctx.show_inserts, "Insert")}
                 {toggle(ctx.show_grid, "Grid")}
                 {toggle(ctx.show_points, "Points")}
+                {move || ctx.project.with(|p| !p.camera.tracks.is_empty()).then(|| view! {
+                    {toggle(ctx.show_tracks, "Cam tracks")}
+                    {toggle(ctx.show_cloud, "3D pts")}
+                    {toggle(ctx.show_ground, "Ground")}
+                })}
+                {toggle(ctx.show_lens_grid, "Lens")}
                 <button class="small" on:click=move |_| ctx.fit_view() title="Fit (F)">"Fit"</button>
             </div>
             <canvas node_ref=ctx.viewport class="view"
-                class:draw=move || ctx.tool.get() == Tool::Draw
+                class:draw=move || matches!(ctx.tool.get(), Tool::Draw | Tool::LensLine)
                 class:edit=move || matches!(ctx.tool.get(), Tool::EditShape | Tool::Surface | Tool::Adjust)
                 on:mousedown=on_down on:mousemove=on_move on:mouseup=on_up
                 on:mouseleave=move |e| { ctx.hover.set(None); on_up(e) }
@@ -1900,6 +2298,8 @@ fn RightPanel() -> impl IntoView {
             </section>
 
             <RenderSection/>
+            <CameraSection/>
+            <LensSection/>
 
             <section>
                 <h3>"App Folders"</h3>

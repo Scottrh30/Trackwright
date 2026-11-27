@@ -8,6 +8,9 @@ get-ffmpeg.bat       Double-click once to download FFmpeg next to trackwright.ex
 
 Keep trackwright.exe, ffmpeg.exe and ffprobe.exe in the same folder.
 
+The setup installer (Trackwright_x.y.z_x64-setup.exe / .msi on the
+release page) already includes FFmpeg, so there is nothing to download.
+
 If Windows SmartScreen warns about an unknown publisher, choose
 "More info" > "Run anyway" (the app is not code-signed yet).
 

@@ -2,15 +2,21 @@
 //!
 //! © Scott Hambach. All rights reserved.
 
+pub mod camera_export;
+pub mod epipolar;
 pub mod export;
 pub mod features;
 pub mod geometry;
 pub mod image;
 pub mod klt;
+pub mod lens;
+pub mod linalg;
 mod par;
 pub mod planar;
+pub mod points;
 pub mod project;
 pub mod render;
+pub mod sfm;
 pub mod shape;
 
 pub use export::ExportFormat;

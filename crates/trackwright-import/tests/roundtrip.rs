@@ -103,3 +103,23 @@ fn rejects_other_files() {
     .is_err());
     assert!(CornerPinTrack::from_json("not json").is_err());
 }
+
+#[test]
+fn reads_masks() {
+    let (footage, mut l) = layer();
+    l.feather = 3.0;
+    let m = trackwright_import::MaskTrack::from_json(&export(
+        ExportFormat::ReelforgeMask,
+        &footage,
+        &l,
+    ))
+    .unwrap();
+    assert_eq!(m.frames.len(), 10);
+    assert_eq!(m.feather_px, 3.0);
+    let poly = m.polygon_at(1005.0);
+    let expect = l.shape_at(4).unwrap().flatten(10);
+    assert!((poly[0][0] - expect[0][0]).abs() < 1e-3);
+    let a = m.rasterize(1001.0, 640, 360);
+    assert_eq!(a[100 * 640 + 300], 255);
+    assert_eq!(a[5 * 640 + 5], 0);
+}

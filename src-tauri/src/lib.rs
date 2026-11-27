@@ -14,9 +14,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use trackwright_core::camera_export::{self, CameraFormat};
 use trackwright_core::export::{self, ExportFormat};
+use trackwright_core::lens::Lens;
+use trackwright_core::linalg;
+use trackwright_core::points::{auto_track, AutoTrackSettings};
 use trackwright_core::project::Insert;
 use trackwright_core::render;
+use trackwright_core::sfm::{self, SolveOptions};
 use trackwright_core::{
     exclusion_polys, retrack_section, track_layer, FrameSource, FrameTrack, GrayImage, Layer,
     Project, Pyramid, Shape, StopReason,
@@ -1125,8 +1130,10 @@ async fn export_layer(
 
 #[derive(Deserialize)]
 struct RenderRequest {
-    id: u32,
-    /// "insert", "stabilize_lock" or "stabilize_smooth"
+    /// Layer the render is about (not needed for "undistort").
+    id: Option<u32>,
+    /// "insert", "stabilize_lock", "stabilize_smooth", "remove", "clean_plate",
+    /// "matte", "cutout" or "undistort"
     mode: String,
     smooth_frames: Option<usize>,
     /// Percent, 100 = no zoom.
@@ -1138,6 +1145,13 @@ struct RenderRequest {
     make_video: bool,
     /// Put the layer's exclusion areas (occluders) back over the insert.
     holdout: Option<bool>,
+    /// Remove / clean plate: the layer tracking the surface behind the object.
+    bg_layer: Option<u32>,
+    search: Option<usize>,
+    grow: Option<f64>,
+    match_light: Option<bool>,
+    /// Matte / cutout: combine every visible layer instead of just the selected one.
+    all_layers: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1172,6 +1186,13 @@ fn save_png(img: render::Rgba, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
+fn save_gray(w: usize, h: usize, data: Vec<u8>, path: &Path) -> Result<(), String> {
+    image::GrayImage::from_raw(w as u32, h as u32, data)
+        .ok_or("bad image buffer")?
+        .save(path)
+        .map_err(|e| format!("Could not write {}: {e}", path.display()))
+}
+
 fn unique_dir(base: PathBuf) -> PathBuf {
     if !base.exists() {
         return base;
@@ -1182,7 +1203,65 @@ fn unique_dir(base: PathBuf) -> PathBuf {
         .unwrap()
 }
 
-/// Render the selected layer as a PNG sequence (and optionally an MP4) in the background.
+/// Small LRU of decoded frames for renders that read several frames per output frame.
+struct RgbaCache {
+    frames: Vec<String>,
+    map: HashMap<usize, Arc<render::Rgba>>,
+    order: VecDeque<usize>,
+    cap: usize,
+}
+
+impl RgbaCache {
+    fn get(&mut self, i: usize) -> Option<Arc<render::Rgba>> {
+        if let Some(v) = self.map.get(&i) {
+            return Some(v.clone());
+        }
+        let img = Arc::new(load_rgba(self.frames.get(i)?).ok()?);
+        self.map.insert(i, img.clone());
+        self.order.push_back(i);
+        while self.order.len() > self.cap {
+            if let Some(o) = self.order.pop_front() {
+                self.map.remove(&o);
+            }
+        }
+        Some(img)
+    }
+}
+
+/// Pick the output folder (Desktop or a dialog). `None` when the user cancels.
+fn render_parent(app: &AppHandle, destination: &str) -> CmdResult<Option<PathBuf>> {
+    Ok(match destination {
+        "desktop" => Some(
+            dirs::desktop_dir()
+                .or_else(dirs::home_dir)
+                .ok_or("Could not find your Desktop folder")?,
+        ),
+        _ => app
+            .dialog()
+            .file()
+            .set_title("Choose where to render")
+            .blocking_pick_folder()
+            .and_then(|p| p.into_path().ok()),
+    })
+}
+
+fn footage_stem(footage: &trackwright_core::Footage) -> String {
+    Path::new(&footage.source)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "footage".into())
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Render as a PNG sequence (and optionally an MP4), or a single clean plate, in the background.
 #[tauri::command]
 async fn render_layer(
     app: AppHandle,
@@ -1193,139 +1272,297 @@ async fn render_layer(
     if state.rendering.load(Ordering::SeqCst) {
         return Err("A render is already running".into());
     }
-    let (footage, layer, all_layers) = {
-        let p = state.project.lock().unwrap();
-        let f = p.footage.clone().ok_or("Open footage first")?;
-        let l = p.layer(request.id).ok_or("Layer not found")?.clone();
-        (f, l, p.layers.clone())
+    let project = state.project.lock().unwrap().clone();
+    let footage = project.footage.clone().ok_or("Open footage first")?;
+    let mode = request.mode.clone();
+    let layer = match request.id {
+        Some(id) => Some(project.layer(id).ok_or("Layer not found")?.clone()),
+        None => None,
     };
-    let holdout = request.holdout.unwrap_or(true);
-    let insert_mode = request.mode == "insert";
-    if insert_mode && layer.insert.is_none() {
-        return Err("Pick an insert image or clip for this layer first (Insert Preview)".into());
-    }
-    let (t0, t1) = layer.tracked_range().ok_or("Track the layer first")?;
-    let from = request.from.unwrap_or(t0).max(t0);
-    let to = request
-        .to
-        .unwrap_or(t1)
-        .min(t1)
-        .min(footage.frames.len().saturating_sub(1));
-    if to < from || layer.tracks.len() < 2 {
-        return Err("Nothing tracked in that range".into());
-    }
-    let frames: Vec<usize> = (from..=to).collect();
-
-    let suffix = match request.mode.as_str() {
-        "insert" => "insert",
-        "stabilize_lock" => "locked",
-        _ => "stabilized",
-    };
-    let parent = match request.destination.as_str() {
-        "desktop" => dirs::desktop_dir()
-            .or_else(dirs::home_dir)
-            .ok_or("Could not find your Desktop folder")?,
-        _ => {
-            let picked = app
-                .dialog()
-                .file()
-                .set_title("Choose where to render")
-                .blocking_pick_folder();
-            match picked.and_then(|p| p.into_path().ok()) {
-                Some(p) => p,
-                None => return Ok(()),
+    let all_layers_req = request.all_layers.unwrap_or(false);
+    let need_layer =
+        |l: &Option<Layer>| l.clone().ok_or_else(|| "Select a layer first".to_string());
+    let last = footage.frames.len().saturating_sub(1);
+    let bg = match mode.as_str() {
+        "remove" | "clean_plate" => {
+            let id = request
+                .bg_layer
+                .ok_or("Choose the background layer (the surface behind the object)")?;
+            let b = project
+                .layer(id)
+                .ok_or("Background layer not found")?
+                .clone();
+            if b.tracks.len() < 2 {
+                return Err(format!("Track the background layer ({}) first", b.name));
             }
+            Some(b)
+        }
+        _ => None,
+    };
+
+    // Frames to render.
+    let (lo, hi) = match mode.as_str() {
+        "undistort" => (0, last),
+        "remove" | "clean_plate" => {
+            let b = bg.as_ref().unwrap();
+            b.tracked_range()
+                .ok_or("Track the background layer first")?
+        }
+        "matte" | "cutout" if request.all_layers.unwrap_or(false) => (0, last),
+        _ => {
+            let l = need_layer(&layer)?;
+            if mode == "insert" && l.insert.is_none() {
+                return Err(
+                    "Pick an insert image or clip for this layer first (Insert Preview)".into(),
+                );
+            }
+            if l.tracks.len() < 2 && !mode.starts_with("matte") && mode != "cutout" {
+                return Err("Track the layer first".into());
+            }
+            l.tracked_range().ok_or("Track the layer first")?
         }
     };
-    let stem = export::file_name(&footage, &layer, ExportFormat::Csv);
-    let stem = stem.trim_end_matches(".csv");
-    let out_dir = unique_dir(parent.join(format!("{stem}_{suffix}")));
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Could not create {}: {e}", out_dir.display()))?;
+    let from = request.from.unwrap_or(lo).max(lo);
+    let to = request.to.unwrap_or(hi).min(hi).min(last);
+    if to < from {
+        return Err("Nothing to render in that range".into());
+    }
+    let frames: Vec<usize> = (from..=to).collect();
+    if mode == "remove" || ((mode == "matte" || mode == "cutout") && !all_layers_req) {
+        need_layer(&layer)?;
+    }
+    if mode == "undistort" && project.lens.is_identity() {
+        return Err("Set the lens distortion first (Lens panel: Calibrate, or Solve Camera with lens distortion)".into());
+    }
 
-    let maps = if insert_mode {
-        vec![]
-    } else {
-        let mode = if request.mode == "stabilize_lock" {
-            render::StabilizeMode::Lock
-        } else {
-            render::StabilizeMode::Smooth {
-                radius: request.smooth_frames.unwrap_or(15).clamp(1, 200),
-            }
-        };
-        let zoom = request.zoom.unwrap_or(100.0) / 100.0;
-        render::stabilize_maps(
-            &layer,
-            &frames,
-            mode,
-            zoom,
-            footage.width as usize,
-            footage.height as usize,
-        )
+    let Some(parent) = render_parent(&app, &request.destination)? else {
+        return Ok(());
     };
+    let layer_name = match (&layer, mode.as_str()) {
+        (_, "undistort") => "lens".to_string(),
+        (_, "matte" | "cutout") if all_layers_req => "all_layers".to_string(),
+        (Some(l), _) => l.name.clone(),
+        (None, _) => "lens".to_string(),
+    };
+    let clean = |s: &str| {
+        s.chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    let suffix = match mode.as_str() {
+        "insert" => "insert",
+        "stabilize_lock" => "locked",
+        "stabilize_smooth" => "stabilized",
+        "remove" => "removed",
+        "clean_plate" => "cleanplate",
+        "matte" => "matte",
+        "cutout" => "cutout",
+        "undistort" => "undistorted",
+        other => return Err(format!("Unknown render mode {other}")),
+    };
+    let base = format!("{}_{}_{suffix}", footage_stem(&footage), clean(&layer_name));
+    let out_dir = unique_dir(parent.join(&base));
+    if mode != "clean_plate" {
+        std::fs::create_dir_all(&out_dir)
+            .map_err(|e| format!("Could not create {}: {e}", out_dir.display()))?;
+    }
+
+    let maps = match (&layer, mode.as_str()) {
+        (Some(l), "stabilize_lock" | "stabilize_smooth") => {
+            let sm = if mode == "stabilize_lock" {
+                render::StabilizeMode::Lock
+            } else {
+                render::StabilizeMode::Smooth {
+                    radius: request.smooth_frames.unwrap_or(15).clamp(1, 200),
+                }
+            };
+            render::stabilize_maps(
+                l,
+                &frames,
+                sm,
+                request.zoom.unwrap_or(100.0) / 100.0,
+                footage.width as usize,
+                footage.height as usize,
+            )
+        }
+        _ => vec![],
+    };
+    let holdout = request.holdout.unwrap_or(true);
+    let remove_params = render::RemoveParams {
+        search: request.search.unwrap_or(20).clamp(1, 120),
+        grow: request.grow.unwrap_or(6.0).clamp(0.0, 200.0),
+        match_light: request.match_light.unwrap_or(true),
+        feather: layer.as_ref().map_or(3.0, |l| l.feather.max(2.0)),
+    };
+    let all_layers = request.all_layers.unwrap_or(false);
+    let lens = project.lens;
 
     state.rendering.store(true, Ordering::SeqCst);
     state.render_cancel.store(false, Ordering::SeqCst);
     let rendering = state.rendering.clone();
     let cancel = state.render_cancel.clone();
-    let make_video = request.make_video;
+    let make_video = request.make_video && mode != "clean_plate";
     std::thread::spawn(move || {
         let total = frames.len();
+        let (w, h) = (footage.width as usize, footage.height as usize);
+        let mut cache = RgbaCache {
+            frames: footage.frames.clone(),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: remove_params.search * 2 + 3,
+        };
         let mut insert_cache: Option<(String, render::Rgba)> = None;
         let mut last_map = None;
-        let result = (|| -> Result<bool, String> {
+        // Outline of the selected layer (or all visible layers) at a frame.
+        let shape_polys = |f: usize| -> Vec<Vec<trackwright_core::Point>> {
+            if all_layers {
+                project
+                    .layers
+                    .iter()
+                    .filter(|l| l.visible)
+                    .filter_map(|l| l.shape_at(f))
+                    .map(|s| s.flatten(10))
+                    .collect()
+            } else {
+                layer
+                    .as_ref()
+                    .and_then(|l| l.shape_at(f))
+                    .map(|s| vec![s.flatten(10)])
+                    .unwrap_or_default()
+            }
+        };
+        let result = (|| -> Result<Option<PathBuf>, String> {
+            if mode == "clean_plate" {
+                let b = bg.as_ref().unwrap();
+                let obj = layer.clone();
+                let mask = |g: usize| {
+                    obj.as_ref()
+                        .and_then(|l| l.shape_at(g))
+                        .map(|s| s.flatten(10))
+                };
+                let mut load = |g: usize| cache.get(g);
+                let _ = app.emit("render-progress", RenderProgress { done: 0, total: 1 });
+                let plate =
+                    render::clean_plate(b, w, h, &frames, &mask, &mut load, remove_params.grow);
+                let path = unique_dir(parent.join(&base)).with_extension("png");
+                save_png(plate, &path)?;
+                let _ = app.emit("render-progress", RenderProgress { done: 1, total: 1 });
+                return Ok(Some(path));
+            }
             for (k, &f) in frames.iter().enumerate() {
                 if cancel.load(Ordering::SeqCst) {
-                    return Ok(false);
+                    return Ok(None);
                 }
-                let src = load_rgba(&footage.frames[f])?;
-                let out = if insert_mode {
-                    let original = if holdout && !layer.exclusions.is_empty() {
-                        Some(src.clone())
-                    } else {
-                        None
-                    };
-                    let mut frame = src;
-                    if let (Some(ins), Some(corners)) = (layer.insert.as_ref(), layer.surface_at(f))
-                    {
-                        if let Some(path) = ins.frame_for(f) {
-                            if insert_cache.as_ref().map(|(p, _)| p.as_str()) != Some(path) {
-                                insert_cache = Some((path.to_string(), load_rgba(path)?));
+                let out_path = out_dir.join(format!("frame_{:06}.png", footage.frame_number(f)));
+                match mode.as_str() {
+                    "insert" => {
+                        let l = layer.as_ref().unwrap();
+                        let src = load_rgba(&footage.frames[f])?;
+                        let original = if holdout && !l.exclusions.is_empty() {
+                            Some(src.clone())
+                        } else {
+                            None
+                        };
+                        let mut frame = src;
+                        if let (Some(ins), Some(corners)) = (l.insert.as_ref(), l.surface_at(f)) {
+                            if let Some(path) = ins.frame_for(f) {
+                                if insert_cache.as_ref().map(|(p, _)| p.as_str()) != Some(path) {
+                                    insert_cache = Some((path.to_string(), load_rgba(path)?));
+                                }
+                                render::composite_insert(
+                                    &mut frame,
+                                    &insert_cache.as_ref().unwrap().1,
+                                    &corners,
+                                    ins.opacity,
+                                );
                             }
-                            render::composite_insert(
-                                &mut frame,
-                                &insert_cache.as_ref().unwrap().1,
-                                &corners,
-                                ins.opacity,
-                            );
                         }
-                    }
-                    if let Some(orig) = original {
-                        for poly in exclusion_polys(&all_layers, &layer, f) {
-                            render::restore_inside(&mut frame, &orig, &poly);
+                        if let Some(orig) = original {
+                            for poly in exclusion_polys(&project.layers, l, f) {
+                                render::restore_inside(&mut frame, &orig, &poly);
+                            }
                         }
+                        save_png(frame, &out_path)?;
                     }
-                    frame
-                } else {
-                    // Untracked gaps hold the nearest previous transform.
-                    if let Some((_, m)) = maps.iter().find(|(g, _)| *g == f) {
-                        last_map = Some(*m);
+                    "stabilize_lock" | "stabilize_smooth" => {
+                        if let Some((_, m)) = maps.iter().find(|(g, _)| *g == f) {
+                            last_map = Some(*m);
+                        }
+                        let m = last_map
+                            .or_else(|| maps.first().map(|(_, m)| *m))
+                            .ok_or("No tracked frames to stabilize")?;
+                        let src = load_rgba(&footage.frames[f])?;
+                        save_png(
+                            render::warp(&src, &m, src.width, src.height, [0, 0, 0, 255]),
+                            &out_path,
+                        )?;
                     }
-                    let m = last_map
-                        .or_else(|| maps.first().map(|(_, m)| *m))
-                        .ok_or("No tracked frames to stabilize")?;
-                    render::warp(&src, &m, src.width, src.height, [0, 0, 0, 255])
-                };
-                save_png(
-                    out,
-                    &out_dir.join(format!("frame_{:06}.png", footage.frame_number(f))),
-                )?;
+                    "remove" => {
+                        let obj = layer.clone().unwrap();
+                        let b = bg.as_ref().unwrap();
+                        let mask = |g: usize| obj.shape_at(g).map(|s| s.flatten(10));
+                        let src = cache.get(f).ok_or("Could not read a frame")?;
+                        let mut load = |g: usize| cache.get(g);
+                        let out = render::remove_object(
+                            f,
+                            &src,
+                            b,
+                            footage.frames.len(),
+                            &mask,
+                            &mut load,
+                            &remove_params,
+                        );
+                        save_png(out, &out_path)?;
+                    }
+                    "matte" => {
+                        let feather = layer.as_ref().map_or(0.0, |l| l.feather);
+                        save_gray(
+                            w,
+                            h,
+                            render::matte(w, h, &shape_polys(f), feather),
+                            &out_path,
+                        )?;
+                    }
+                    "cutout" => {
+                        let feather = layer.as_ref().map_or(0.0, |l| l.feather);
+                        let a = render::matte(w, h, &shape_polys(f), feather);
+                        let mut src = load_rgba(&footage.frames[f])?;
+                        for (i, v) in a.iter().enumerate() {
+                            src.data[i * 4 + 3] = *v;
+                        }
+                        save_png(src, &out_path)?;
+                    }
+                    "undistort" => {
+                        let src = load_rgba(&footage.frames[f])?;
+                        let mut out = render::Rgba::new(w, h);
+                        let (wf, hf) = (w as f64, h as f64);
+                        for y in 0..h {
+                            for x in 0..w {
+                                let q = lens.distort([x as f64 + 0.5, y as f64 + 0.5], wf, hf);
+                                let s = src.sample(q[0], q[1]);
+                                let i = (y * w + x) * 4;
+                                for c in 0..3 {
+                                    out.data[i + c] = s[c].round().clamp(0.0, 255.0) as u8;
+                                }
+                                out.data[i + 3] = 255;
+                            }
+                        }
+                        save_png(out, &out_path)?;
+                    }
+                    _ => {}
+                }
                 let _ = app.emit("render-progress", RenderProgress { done: k + 1, total });
             }
-            Ok(true)
+            Ok(Some(out_dir.clone()))
         })();
         let done = match result {
-            Ok(false) => RenderDone {
+            Ok(None) => RenderDone {
                 ok: true,
                 message: format!("Render stopped. Frames so far are in {}", out_dir.display()),
                 path: Some(out_dir.to_string_lossy().to_string()),
@@ -1335,7 +1572,12 @@ async fn render_layer(
                 message: e,
                 path: None,
             },
-            Ok(true) if make_video => {
+            Ok(Some(path)) if mode == "clean_plate" => RenderDone {
+                ok: true,
+                message: format!("Clean plate saved to {}", path.display()),
+                path: Some(path.to_string_lossy().to_string()),
+            },
+            Ok(Some(_)) if make_video => {
                 let mp4 = out_dir.with_extension("mp4");
                 let first = footage.frame_number(frames[0]);
                 let fps = if footage.fps > 0.0 { footage.fps } else { 24.0 };
@@ -1374,12 +1616,12 @@ async fn render_layer(
                     },
                     Err(_) => RenderDone {
                         ok: false,
-                        message: format!("Frames rendered to {}. Install ffmpeg (winget install ffmpeg) to also get an MP4", out_dir.display()),
+                        message: format!("Frames rendered to {}. Run get-ffmpeg.bat (or install ffmpeg) to also get an MP4", out_dir.display()),
                         path: Some(out_dir.to_string_lossy().to_string()),
                     },
                 }
             }
-            Ok(true) => RenderDone {
+            Ok(Some(_)) => RenderDone {
                 ok: true,
                 message: format!("Rendered {total} frames to {}", out_dir.display()),
                 path: Some(out_dir.to_string_lossy().to_string()),
@@ -1389,6 +1631,442 @@ async fn render_layer(
         let _ = app.emit("render-done", done);
     });
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Camera solve and lens
+
+#[derive(Clone, Serialize)]
+struct CameraProgress {
+    stage: String,
+    fraction: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct CameraDone {
+    ok: bool,
+    message: String,
+}
+
+fn camera_range(
+    project: &Project,
+    from: Option<usize>,
+    to: Option<usize>,
+) -> CmdResult<(usize, usize)> {
+    let f = project.footage.as_ref().ok_or("Open footage first")?;
+    let last = f.frames.len().saturating_sub(1);
+    let a = from.unwrap_or(0).min(last);
+    let b = to.unwrap_or(last).min(last);
+    if b < a + 2 {
+        return Err("The range needs at least 3 frames".into());
+    }
+    Ok((a, b))
+}
+
+/// Outlines of the camera solve's ignored layers at a frame.
+fn camera_excludes(
+    layers: &[Layer],
+    ids: &[u32],
+    frame: usize,
+) -> Vec<Vec<trackwright_core::Point>> {
+    ids.iter()
+        .filter_map(|id| layers.iter().find(|l| l.id == *id))
+        .filter_map(|l| l.shape_at_or_nearest(frame))
+        .map(|s| s.flatten(8))
+        .collect()
+}
+
+/// Step 1 of a camera solve: track points over the whole frame (In/Out range).
+#[tauri::command]
+fn camera_track_points(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    from: Option<usize>,
+    to: Option<usize>,
+) -> CmdResult<()> {
+    if state.tracking.swap(true, Ordering::SeqCst) {
+        return Err("Already tracking".into());
+    }
+    let before = state.project.lock().unwrap().clone();
+    let (a, b) = match camera_range(&before, from, to) {
+        Ok(r) => r,
+        Err(e) => {
+            state.tracking.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    let width = before.footage.as_ref().map_or(1920, |f| f.width as usize);
+    let settings = AutoTrackSettings::for_width(
+        width,
+        before.camera.settings.max_points.clamp(50, 3000),
+        before.camera.settings.min_distance,
+    );
+    state.cancel.store(false, Ordering::SeqCst);
+    let (cache, cancel, tracking) = (
+        state.cache.clone(),
+        state.cancel.clone(),
+        state.tracking.clone(),
+    );
+    let layers = before.layers.clone();
+    let ids = before.camera.settings.exclude_layers.clone();
+    std::thread::spawn(move || {
+        let exclude = move |f: usize| camera_excludes(&layers, &ids, f);
+        let result = {
+            let mut src = cache.lock().unwrap();
+            auto_track(
+                &mut *src,
+                a,
+                b,
+                &settings,
+                &exclude,
+                &cancel,
+                |done, total| {
+                    let _ = app.emit(
+                        "camera-progress",
+                        CameraProgress {
+                            stage: format!("Tracking points {done} / {total}"),
+                            fraction: done as f64 / total as f64,
+                        },
+                    );
+                },
+            )
+        };
+        let done = match result {
+            Ok((tracks, reason)) => {
+                let n = tracks.len();
+                if let Some(state) = app.try_state::<AppState>() {
+                    let mut p = state.project.lock().unwrap();
+                    p.camera.tracks = tracks;
+                    p.camera.solve = None;
+                    if *p != before {
+                        push_undo(&state, before);
+                        mark_changed(&state);
+                    }
+                }
+                let msg = if reason == StopReason::Cancelled {
+                    format!("Stopped. Kept {n} point tracks")
+                } else {
+                    format!("Tracked {n} points. Next: Solve Camera")
+                };
+                CameraDone {
+                    ok: true,
+                    message: msg,
+                }
+            }
+            Err(e) => CameraDone {
+                ok: false,
+                message: e.to_string(),
+            },
+        };
+        tracking.store(false, Ordering::SeqCst);
+        let _ = app.emit("camera-done", done);
+    });
+    Ok(())
+}
+
+/// Step 2: solve camera, focal length (and lens distortion) from the point tracks.
+#[tauri::command]
+fn camera_solve(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    from: Option<usize>,
+    to: Option<usize>,
+) -> CmdResult<()> {
+    if state.tracking.swap(true, Ordering::SeqCst) {
+        return Err("Already busy".into());
+    }
+    let before = state.project.lock().unwrap().clone();
+    let setup = (|| -> CmdResult<(Vec<usize>, SolveOptions)> {
+        if before.camera.tracks.is_empty() {
+            return Err("Track points first (step 1)".into());
+        }
+        let f = before.footage.as_ref().ok_or("Open footage first")?;
+        let (a, b) = camera_range(&before, from, to)?;
+        let s = &before.camera.settings;
+        Ok((
+            (a..=b).collect(),
+            SolveOptions {
+                width: f.width as f64,
+                height: f.height as f64,
+                focal: s.focal,
+                sensor_mm: s.sensor_mm,
+                mode: s.mode,
+                solve_distortion: s.solve_distortion,
+                lens: before.lens,
+            },
+        ))
+    })();
+    let (frames, opts) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            state.tracking.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    state.cancel.store(false, Ordering::SeqCst);
+    let (cancel, tracking) = (state.cancel.clone(), state.tracking.clone());
+    std::thread::spawn(move || {
+        let tracks = before.camera.tracks.clone();
+        let result = sfm::solve_camera(&tracks, &frames, &opts, &cancel, |stage, fraction| {
+            let _ = app.emit(
+                "camera-progress",
+                CameraProgress {
+                    stage: stage.to_string(),
+                    fraction,
+                },
+            );
+        });
+        let done = match result {
+            Ok(solve) => {
+                let sensor = before.camera.settings.sensor_mm;
+                let msg = format!(
+                    "{} camera solved: {} frames, focal {:.1} mm, error {:.2} px, {} points{}",
+                    if solve.tripod { "Tripod" } else { "Moving" },
+                    solve.poses.len(),
+                    solve.focal_mm(sensor),
+                    solve.rms_px,
+                    solve.points.len(),
+                    if opts.solve_distortion {
+                        format!(", lens k1 {:.4}", solve.lens.k1)
+                    } else {
+                        String::new()
+                    }
+                );
+                if let Some(state) = app.try_state::<AppState>() {
+                    let mut p = state.project.lock().unwrap();
+                    if opts.solve_distortion {
+                        p.lens = solve.lens;
+                    }
+                    p.camera.solve = Some(solve);
+                    push_undo(&state, before);
+                    mark_changed(&state);
+                }
+                CameraDone {
+                    ok: true,
+                    message: msg,
+                }
+            }
+            Err(e) => CameraDone {
+                ok: false,
+                message: e.to_string(),
+            },
+        };
+        tracking.store(false, Ordering::SeqCst);
+        let _ = app.emit("camera-done", done);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn set_camera_settings(
+    state: State<'_, AppState>,
+    settings: sfm::CameraSettings,
+) -> CmdResult<AppView> {
+    mutate(&state, |p| {
+        p.camera.settings = settings;
+        Ok(())
+    })?;
+    Ok(view(&state))
+}
+
+#[tauri::command]
+fn clear_camera(state: State<'_, AppState>) -> CmdResult<AppView> {
+    mutate(&state, |p| {
+        p.camera.tracks.clear();
+        p.camera.solve = None;
+        Ok(())
+    })?;
+    Ok(view(&state))
+}
+
+/// Make a planar layer's surface the ground: origin at its centre, X along its top edge,
+/// and (optionally) scale the scene so the surface is `width` units wide.
+#[tauri::command]
+fn camera_orient(
+    state: State<'_, AppState>,
+    layer_id: u32,
+    frame: usize,
+    width: Option<f64>,
+) -> CmdResult<AppView> {
+    mutate(&state, |p| {
+        let solve = p.camera.solve.clone().ok_or("Solve the camera first")?;
+        let layer = p.layer(layer_id).ok_or("Layer not found")?.clone();
+        if !solve.poses.contains_key(&frame) {
+            return Err("The camera isn't solved on this frame".into());
+        }
+        let shape = layer
+            .shape_at(frame)
+            .ok_or("That layer isn't tracked on this frame")?;
+        let poly = shape.flatten(8);
+        // Solved points whose track lies inside the layer's shape on this frame.
+        let ids: HashMap<u32, usize> = p
+            .camera
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id, i))
+            .collect();
+        let mut pts = Vec::new();
+        for sp in solve.points.iter().filter(|sp| sp.error < 2.0) {
+            if let Some(&ti) = ids.get(&sp.id) {
+                if let Some(px) = p.camera.tracks[ti].points.get(&frame) {
+                    if trackwright_core::shape::point_in_polygon(&poly, *px) {
+                        pts.push(sp.pos);
+                    }
+                }
+            }
+        }
+        if pts.len() < 4 {
+            return Err(format!("Only {} solved points lie on {} at this frame; pick a larger textured surface or another frame", pts.len(), layer.name));
+        }
+        let first =
+            sfm::orient_to_plane(&solve, &pts, frame, None, None).ok_or("Could not fit a plane")?;
+        // Plane in solve coordinates: origin and normal from the first fit.
+        let origin = first.from_user([0.0, 0.0, 0.0]);
+        let normal = linalg::sub(first.from_user([0.0, 1.0, 0.0]), origin);
+        let corners = layer
+            .surface_at(frame)
+            .ok_or("That layer has no surface on this frame")?;
+        let hit = |c: trackwright_core::Point| sfm::ray_plane(&solve, frame, c, origin, normal);
+        let (Some(tl), Some(tr), Some(br), Some(bl)) = (
+            hit(corners[0]),
+            hit(corners[1]),
+            hit(corners[2]),
+            hit(corners[3]),
+        ) else {
+            return Err(
+                "The surface corners don't hit the fitted plane; adjust the surface".into(),
+            );
+        };
+        let hint = linalg::sub(tr, tl);
+        let measured = linalg::norm(hint);
+        let scale_ref = width.filter(|w| *w > 0.0).map(|w| (measured, w));
+        let mut world = sfm::orient_to_plane(&solve, &pts, frame, Some(hint), scale_ref)
+            .ok_or("Could not orient the scene")?;
+        if scale_ref.is_none() {
+            world.scale = 1.0 / measured.max(1e-9);
+        }
+        // Origin at the centre of the surface.
+        let centre = linalg::scale(linalg::add(linalg::add(tl, tr), linalg::add(br, bl)), 0.25);
+        let c_user = world.to_user(centre);
+        world.translation = linalg::sub(world.translation, c_user);
+        p.camera.solve.as_mut().unwrap().world = world;
+        Ok(())
+    })?;
+    Ok(view(&state))
+}
+
+#[tauri::command]
+fn camera_reset_orientation(state: State<'_, AppState>) -> CmdResult<AppView> {
+    mutate(&state, |p| {
+        let s = p.camera.solve.as_mut().ok_or("Solve the camera first")?;
+        s.world = sfm::World::default();
+        Ok(())
+    })?;
+    Ok(view(&state))
+}
+
+#[tauri::command]
+async fn export_camera(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    format: CameraFormat,
+    destination: String,
+) -> CmdResult<Option<String>> {
+    let (text, name) = {
+        let p = state.project.lock().unwrap();
+        let f = p.footage.as_ref().ok_or("Open footage first")?;
+        let s = p.camera.solve.as_ref().ok_or("Solve the camera first")?;
+        let name = format!("{}_camera", footage_stem(f));
+        (
+            camera_export::export_camera(format, f, s, p.camera.settings.sensor_mm, &name),
+            format!("{name}.{}", format.extension()),
+        )
+    };
+    let settings = state.settings.lock().unwrap().clone();
+    let dir = match destination.as_str() {
+        "desktop" => dirs::desktop_dir()
+            .or_else(dirs::home_dir)
+            .ok_or("Could not find your Desktop folder")?,
+        "forma3d" => PathBuf::from(settings.forma3d_dir),
+        "tidefire" => PathBuf::from(settings.tidefire_dir),
+        "reelforge" => PathBuf::from(settings.reelforge_dir),
+        _ => {
+            let picked = app
+                .dialog()
+                .file()
+                .set_title("Export camera")
+                .set_file_name(&name)
+                .blocking_save_file();
+            let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
+                return Ok(None);
+            };
+            std::fs::write(&path, text).map_err(|e| format!("Export failed: {e}"))?;
+            return Ok(Some(path.to_string_lossy().to_string()));
+        }
+    };
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+    let path = dir.join(name);
+    std::fs::write(&path, text).map_err(|e| format!("Export failed: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn set_lens(state: State<'_, AppState>, k1: f64, k2: f64) -> CmdResult<AppView> {
+    mutate(&state, |p| {
+        p.lens = Lens {
+            k1: k1.clamp(-1.0, 1.0),
+            k2: k2.clamp(-1.0, 1.0),
+        };
+        Ok(())
+    })?;
+    Ok(view(&state))
+}
+
+#[tauri::command]
+fn set_lens_lines(
+    state: State<'_, AppState>,
+    lines: Vec<(usize, Vec<[f64; 2]>)>,
+) -> CmdResult<AppView> {
+    mutate(&state, |p| {
+        p.lens_lines = lines;
+        Ok(())
+    })?;
+    Ok(view(&state))
+}
+
+#[derive(Serialize)]
+struct LensResult {
+    view: AppView,
+    rms_before: f64,
+    rms_after: f64,
+}
+
+/// Solve k1 (and k2) so the lines drawn along straight edges become straight.
+#[tauri::command]
+fn calibrate_lens(state: State<'_, AppState>, solve_k2: bool) -> CmdResult<LensResult> {
+    let fit = mutate(&state, |p| {
+        let f = p.footage.as_ref().ok_or("Open footage first")?;
+        let lines: Vec<Vec<[f64; 2]>> = p.lens_lines.iter().map(|(_, l)| l.clone()).collect();
+        if lines.iter().filter(|l| l.len() >= 3).count() < 2 {
+            return Err("Draw at least two lines (3+ points each) along edges that should be straight, ideally near the frame edges".into());
+        }
+        let fit = trackwright_core::lens::calibrate_from_lines(
+            &lines,
+            f.width as f64,
+            f.height as f64,
+            solve_k2,
+        )
+        .ok_or("Calibration failed")?;
+        p.lens = fit.lens;
+        Ok(fit)
+    })?;
+    Ok(LensResult {
+        view: view(&state),
+        rms_before: fit.rms_before,
+        rms_after: fit.rms_after,
+    })
 }
 
 #[tauri::command]
@@ -1528,6 +2206,16 @@ pub fn run() {
             export_layer,
             render_layer,
             stop_render,
+            camera_track_points,
+            camera_solve,
+            set_camera_settings,
+            clear_camera,
+            camera_orient,
+            camera_reset_orientation,
+            export_camera,
+            set_lens,
+            set_lens_lines,
+            calibrate_lens,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Trackwright");

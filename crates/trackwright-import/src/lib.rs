@@ -427,3 +427,147 @@ pub fn homography(src: &Corners, dst: &Corners) -> Option<Mat3> {
     h[8] = 1.0;
     h.iter().all(|v| v.is_finite()).then_some(h)
 }
+
+/// An animated roto mask exported from Trackwright (`.rfmask.json`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskTrack {
+    pub name: String,
+    pub width: f64,
+    pub height: f64,
+    pub fps: f64,
+    pub first_frame: i64,
+    pub feather_px: f64,
+    /// frame number -> outline polygon (pixels, y down)
+    pub frames: BTreeMap<i64, Vec<Point>>,
+}
+
+impl MaskTrack {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ImportError> {
+        let text =
+            std::fs::read_to_string(path.as_ref()).map_err(|e| ImportError::Io(e.to_string()))?;
+        Self::from_json(&text)
+    }
+
+    pub fn from_json(text: &str) -> Result<Self, ImportError> {
+        let v: Value = serde_json::from_str(text).map_err(|e| ImportError::Json(e.to_string()))?;
+        let bad = |what: &str| ImportError::Format(what.to_string());
+        if v.get("format").and_then(Value::as_str) != Some("trackwright.mask.v1") {
+            return Err(bad("not a Trackwright mask (trackwright.mask.v1)"));
+        }
+        let src = v.get("source").ok_or_else(|| bad("missing source"))?;
+        let m = v.get("mask").ok_or_else(|| bad("missing mask"))?;
+        let mut frames = BTreeMap::new();
+        for fr in v
+            .get("frames")
+            .and_then(Value::as_array)
+            .ok_or_else(|| bad("missing frames"))?
+        {
+            let n = fr
+                .get("frame")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| bad("frame without number"))?;
+            let poly: Vec<Point> = fr
+                .get("polygon")
+                .and_then(Value::as_array)
+                .ok_or_else(|| bad("frame without polygon"))?
+                .iter()
+                .filter_map(point)
+                .collect();
+            frames.insert(n, poly);
+        }
+        if frames.is_empty() {
+            return Err(bad("mask has no frames"));
+        }
+        Ok(Self {
+            name: m
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            width: src.get("width").and_then(num).unwrap_or(0.0),
+            height: src.get("height").and_then(num).unwrap_or(0.0),
+            fps: src.get("fps").and_then(num).unwrap_or(24.0),
+            first_frame: src.get("first_frame").and_then(Value::as_i64).unwrap_or(0),
+            feather_px: m.get("feather_px").and_then(num).unwrap_or(0.0),
+            frames,
+        })
+    }
+
+    pub fn frame_at_time(&self, seconds: f64) -> f64 {
+        self.first_frame as f64 + seconds * self.fps
+    }
+
+    /// Outline at a (possibly fractional) frame; interpolated when neighbouring frames
+    /// have the same number of points, held outside the masked range.
+    pub fn polygon_at(&self, frame: f64) -> Vec<Point> {
+        let below = self.frames.range(..=frame.floor() as i64).next_back();
+        let above = self.frames.range(frame.ceil() as i64..).next();
+        match (below, above) {
+            (Some((&a, pa)), Some((&b, pb))) if b > a && pa.len() == pb.len() => {
+                let t = (frame - a as f64) / (b - a) as f64;
+                pa.iter()
+                    .zip(pb)
+                    .map(|(p, q)| [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t])
+                    .collect()
+            }
+            (Some((_, p)), _) | (None, Some((_, p))) => p.clone(),
+            (None, None) => vec![],
+        }
+    }
+
+    /// 8-bit alpha (one byte per pixel, row-major) of the mask at `frame`.
+    pub fn rasterize(&self, frame: f64, width: usize, height: usize) -> Vec<u8> {
+        let poly = self.polygon_at(frame);
+        let mut out = vec![0u8; width * height];
+        if poly.len() < 3 {
+            return out;
+        }
+        let fw = self.feather_px.max(1.0);
+        for y in 0..height {
+            for x in 0..width {
+                let p = [x as f64 + 0.5, y as f64 + 0.5];
+                let inside = point_in_polygon(&poly, p);
+                let d = outline_distance(&poly, p);
+                let a = if d >= fw / 2.0 {
+                    inside as u8 as f64
+                } else {
+                    (0.5 + if inside { d } else { -d } / fw).clamp(0.0, 1.0)
+                };
+                out[y * width + x] = (a * 255.0).round() as u8;
+            }
+        }
+        out
+    }
+}
+
+fn point_in_polygon(poly: &[Point], p: Point) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a[1] > p[1]) != (b[1] > p[1])
+            && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+fn outline_distance(poly: &[Point], p: Point) -> f64 {
+    let n = poly.len();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 {
+                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ((a[0] + t * dx - p[0]).powi(2) + (a[1] + t * dy - p[1]).powi(2)).sqrt()
+        })
+        .fold(f64::INFINITY, f64::min)
+}

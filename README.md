@@ -72,6 +72,19 @@ Synthetic plates with a textured plane moving over a different textured backgrou
 | Corrupted 9-frame section re-tracked with In→Out blend (unit test) | 0.08 px, later frames untouched |
 | 4K, 2 cores: full-res pass → auto half-res pass | 209 → 116 ms/frame |
 
+## Camera tracking, lens, removal and mattes
+
+* **Camera Solve** (right panel): **1 · Track Points** finds and follows up to 500 corner features across the In/Out range (or whole clip), skipping layers ticked under *Ignore* (people, cars, anything moving on its own). **2 · Solve Camera** runs structure from motion: keyframes, two-view start (or a rotation-only chain for tripod shots), resection, triangulation and bundle adjustment that also refines focal length and, optionally, lens distortion. Detects moving vs tripod cameras automatically; focal length can be solved or entered.
+* **Orient scene:** pick a planar layer that lies on the ground (floor, table, road), optionally type its real width, and **Set Ground**. The surface becomes the XZ ground plane with the origin at its centre, X along its top edge and Y up, scaled to real units.
+* **Overlays:** camera point trails coloured by solve error, solved 3D points projected back as crosses, and the oriented ground grid with X/Y/Z axes.
+* **Camera export:** Forma3D (camera + point cloud), Tidefire, Blender (Python script), Nuke (.nk), Collada (.dae), point cloud (.obj) and .chan. Save to Desktop, send to Forma3D/Tidefire, or Save As.
+* **Lens distortion:** k1/k2 radial model. Set the values, let the camera solve find them, or press **L** and click along edges that should be straight, then **Calibrate from Lines**. *Show lens grid* draws the bending; Render › *Undistort footage* writes straightened frames.
+* **Remove object / clean plate:** choose the object layer and the background layer that tracks the surface behind it. Each frame's hole is filled with the background seen in nearby frames (±search), aligned through the background track, with optional lighting match; areas never revealed are filled smoothly. *Clean plate* writes one PNG of the background with the object taken out (median of up to 15 frames).
+* **Rotoscoping / mattes:** every layer's shape is a roto mask with a *Mask feather* setting. Render a black-and-white **Matte** or a **Cut-out** (footage with alpha) for one layer or all visible layers, or export **Reelforge mask (.rfmask.json)** for an editable, animated mask in Reelforge.
+* **FFmpeg bundled:** the setup .exe / .msi install `ffmpeg.exe` and `ffprobe.exe` next to Trackwright. The portable zip includes `get-ffmpeg.bat` to fetch them.
+
+Measured on a ray-traced 640×360 room with a moving camera and k1 = −0.06, tracked and solved from the images alone: focal length within 2.6 %, k1 −0.060, reprojection error 0.25 px, camera path error 0.3 % of its length.
+
 ## Using it
 
 1. **Open Footage** (or drag a file onto the window).
@@ -100,12 +113,13 @@ GitHub Actions (`.github/workflows/build.yml`) runs the tests and builds the Win
 
 ```
 crates/trackwright-core   tracking engine (no UI deps): image pyramids, features, KLT,
-                          motion models + RANSAC, planar tracker, project model, exporters
+                          motion models + RANSAC, planar tracker, point tracker, camera solve
+                          (epipolar, sfm, bundle adjustment), lens model, render, exporters
 src-tauri                 desktop backend: footage import, frame cache, background tracking, export
 ui                        Leptos front end: viewport, timeline, layers, export panel
 ```
 
 ## Roadmap
 
-* **Milestone 2: camera tracking.** Automatic point tracks → camera solve (structure from motion) with focal length/lens solve, ground plane and scene orientation. Export camera + point cloud to Forma3D and Tidefire, plus FBX/Alembic/Nuke.
-* Mocha-style extras: per-frame shape keyframes, exclusion layers (holes), linked/grouped layers, lens distortion, stabilise and remove (clean plate) modules, direct Reelforge plugin.
+* FBX / Alembic camera export.
+* Direct Reelforge importer for tracks and masks.
