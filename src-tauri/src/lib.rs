@@ -999,15 +999,26 @@ fn start_tracking(
             }
         }
         tracking.store(false, Ordering::SeqCst);
+        let (lo, hi) = (from.min(end), from.max(end));
+        let predicted = layer
+            .tracks
+            .range(lo..=hi)
+            .filter(|(_, t)| t.predicted)
+            .count();
+        let bridged = if predicted > 0 {
+            format!(". {predicted} covered frame(s) were predicted by the occlusion solver (cyan on the timeline)")
+        } else {
+            String::new()
+        };
         let done = match result {
             Ok(StopReason::Finished) => TrackDoneEvent {
                 layer_id: id,
                 ok: true,
                 cancelled: false,
                 message: if blend {
-                    "Section re-tracked and blended into the existing track".into()
+                    format!("Section re-tracked and blended into the existing track{bridged}")
                 } else {
-                    "Tracking finished".into()
+                    format!("Tracking finished{bridged}")
                 },
                 last_frame,
             },

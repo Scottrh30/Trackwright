@@ -567,6 +567,9 @@ impl Ctx {
                     trackwright_core::Problem::HighError => "high error",
                     trackwright_core::Problem::FewPoints => "few good points",
                     trackwright_core::Problem::Retried => "needed a second, wider search (blur?)",
+                    trackwright_core::Problem::Predicted => {
+                        "covered: predicted by the occlusion solver"
+                    }
                 };
                 self.say(
                     format!(
@@ -838,13 +841,23 @@ fn App() -> impl IntoView {
             }
         });
         ctx.frame.set(e.frame);
-        ctx.say(
-            format!(
-                "Tracking… frame {}  ({} points, {:.2}px error)",
-                e.frame, e.track.inliers, e.track.rms_error
-            ),
-            false,
-        );
+        if e.track.predicted {
+            ctx.say(
+                format!(
+                    "Covered at frame {}: predicting and looking for it again…",
+                    e.frame
+                ),
+                false,
+            );
+        } else {
+            ctx.say(
+                format!(
+                    "Tracking… frame {}  ({} points, {:.2}px error)",
+                    e.frame, e.track.inliers, e.track.rms_error
+                ),
+                false,
+            );
+        }
     });
     tauri::listen::<TrackDoneEvent>("track-done", move |e| {
         ctx.tracking.set(false);
@@ -1934,6 +1947,11 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                 <input type="checkbox" prop:checked=s.retry_hard_frames on:change=move |_| ctx.edit_layer(|l| l.settings.retry_hard_frames = !l.settings.retry_hard_frames) />
                 "Retry hard frames (motion blur)"
             </label>
+            <label class="toggle" title="When the surface is covered (a blink over a pupil, a hand passing in front), keep it moving with what's around it, find it again when it shows, and join the track up">
+                <input type="checkbox" prop:checked=s.bridge_occlusions on:change=move |_| ctx.edit_layer(|l| l.settings.bridge_occlusions = !l.settings.bridge_occlusions) />
+                "Occlusion solver (blinks, things passing in front)"
+            </label>
+            {s.bridge_occlusions.then(|| num("Bridge up to (frames)", s.max_bridge_frames.to_string(), "1", |l, v| l.settings.max_bridge_frames = v.clamp(1.0, 600.0) as usize))}
             <label class="field">"Speed"
                 <select on:change=move |ev| {
                     let v = event_target_value(&ev);

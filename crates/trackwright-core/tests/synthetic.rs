@@ -590,3 +590,243 @@ fn dump_new_formats() {
         .unwrap();
     }
 }
+
+/// Face motion for the blink tests: sway, drift down, slow turn.
+fn truth_face(k: usize) -> Mat3 {
+    let t = k as f64;
+    let ang = 0.004 * t;
+    let (c, sn) = (ang.cos(), ang.sin());
+    let (cx, cy) = (320.0, 240.0);
+    let tx = 30.0 * (t * 0.15).sin();
+    let ty = 2.5 * t;
+    [
+        c,
+        -sn,
+        cx - c * cx + sn * cy + tx,
+        sn,
+        c,
+        cy - sn * cx - c * cy + ty,
+        0.0,
+        0.0,
+        1.0,
+    ]
+}
+
+/// A "pupil" patch on a moving "face"; an "eyelid" (smooth skin) closes over it
+/// for `closed` frames (half-closed on the frames either side), then opens.
+fn blink_footage(
+    n: usize,
+    closed: std::ops::Range<usize>,
+    face_textured: bool,
+) -> (Vec<Arc<Pyramid>>, [f64; 4]) {
+    let face = if face_textured {
+        noise_texture(61, W, H)
+    } else {
+        GrayImage {
+            width: W,
+            height: H,
+            data: vec![128.0; W * H],
+        }
+    };
+    let pupil = noise_texture(62, W, H);
+    let lid = {
+        let mut l = noise_texture(63, W, H);
+        for v in &mut l.data {
+            *v = 150.0 + (*v - 128.0) * 0.08; // nearly flat skin
+        }
+        l
+    };
+    let rect = [280.0, 200.0, 370.0, 265.0];
+    let frames = (0..n)
+        .map(|k| {
+            let h = truth_face(k);
+            let hi = invert(&h).unwrap();
+            // How far the lid is down (0 open .. 1 closed).
+            let down = if closed.contains(&k) {
+                1.0
+            } else if k + 1 == closed.start || k == closed.end {
+                0.5
+            } else {
+                0.0
+            };
+            let mut img = GrayImage::new(W, H);
+            for y in 0..H {
+                for x in 0..W {
+                    let s = apply(&hi, [x as f64, y as f64]);
+                    let in_eye = s[0] >= rect[0] - 6.0
+                        && s[0] <= rect[2] + 6.0
+                        && s[1] >= rect[1] - 6.0
+                        && s[1] <= rect[3] + 6.0;
+                    let lid_edge = rect[1] - 6.0 + down * (rect[3] - rect[1] + 12.0);
+                    img.data[y * W + x] = if in_eye && s[1] <= lid_edge && down > 0.0 {
+                        lid.sample(s[0] as f32, s[1] as f32)
+                    } else if s[0] >= rect[0]
+                        && s[0] <= rect[2]
+                        && s[1] >= rect[1]
+                        && s[1] <= rect[3]
+                    {
+                        pupil.sample(s[0] as f32, s[1] as f32)
+                    } else {
+                        face.sample(s[0] as f32, s[1] as f32)
+                    };
+                }
+            }
+            Arc::new(Pyramid::build(img, 4))
+        })
+        .collect();
+    (frames, rect)
+}
+
+/// Worst corner error over `frames`, ignoring frames with no track.
+fn worst_over(layer: &Layer, frames: impl Iterator<Item = usize>) -> f64 {
+    frames
+        .map(|k| {
+            let Some(est) = layer.surface_at(k) else {
+                return f64::INFINITY;
+            };
+            layer
+                .surface
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let t = apply(&truth_face(k), *c);
+                    ((t[0] - est[i][0]).powi(2) + (t[1] - est[i][1]).powi(2)).sqrt()
+                })
+                .fold(0.0, f64::max)
+        })
+        .fold(0.0, f64::max)
+}
+
+/// A blink: the pupil is covered for 6 frames. The occlusion solver carries it
+/// with the face around it, finds it again when the eye opens, and joins up.
+#[test]
+fn occlusion_solver_tracks_through_a_blink() {
+    let n = 36;
+    let closed = 14..20;
+    let (frames, rect) = blink_footage(n, closed.clone(), true);
+    // TW_DUMP_BLINK=<dir> writes the footage as PGM for trying it in the app.
+    if let Ok(dir) = std::env::var("TW_DUMP_BLINK") {
+        std::fs::create_dir_all(&dir).unwrap();
+        for (k, f) in frames.iter().enumerate() {
+            let mut out = format!("P5\n{W} {H}\n255\n").into_bytes();
+            out.extend(
+                f.levels[0]
+                    .data
+                    .iter()
+                    .map(|v| v.round().clamp(0.0, 255.0) as u8),
+            );
+            std::fs::write(format!("{dir}/blink_{k:04}.pgm"), out).unwrap();
+        }
+    }
+    let mut src = Synthetic { frames };
+    let cancel = AtomicBool::new(false);
+
+    let mut off = plane_layer(rect);
+    off.settings.bridge_occlusions = false;
+    let without = track_layer(
+        &mut src,
+        &mut off,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    let off_err = worst_over(&off, closed.end + 2..n);
+    println!(
+        "blink without solver: {:?}, error after {off_err:.2}px",
+        without.as_ref().map_err(|e| e.to_string())
+    );
+
+    let mut on = plane_layer(rect);
+    let r = track_layer(
+        &mut src,
+        &mut on,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
+    let predicted: Vec<usize> = on
+        .tracks
+        .iter()
+        .filter(|(_, t)| t.predicted)
+        .map(|(f, _)| *f)
+        .collect();
+    let before = worst_over(&on, 0..closed.start - 1);
+    let during = worst_over(&on, closed.clone());
+    let after = worst_over(&on, closed.end + 2..n);
+    println!("blink with solver: predicted {predicted:?}; error before {before:.2}px, while covered {during:.2}px, after {after:.2}px");
+    assert!(
+        !predicted.is_empty(),
+        "the covered frames should be marked predicted"
+    );
+    assert!(
+        predicted
+            .iter()
+            .all(|f| *f + 2 >= closed.start && *f <= closed.end + 1),
+        "only covered frames are predicted: {predicted:?}"
+    );
+    assert!(before < 0.75 && after < 0.75, "seen frames stay accurate");
+    assert!(during < 3.0, "covered frames follow the face: {during}");
+}
+
+/// Nothing to follow around it (a flat face): the prediction carries on with
+/// the pupil's own recent motion, and the track still picks up after the blink.
+#[test]
+fn occlusion_solver_predicts_from_motion_alone() {
+    let n = 30;
+    let closed = 12..16;
+    let (frames, rect) = blink_footage(n, closed.clone(), false);
+    let mut src = Synthetic { frames };
+    let cancel = AtomicBool::new(false);
+    let mut on = plane_layer(rect);
+    on.settings.model = MotionModel::Similarity;
+    let r = track_layer(
+        &mut src,
+        &mut on,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
+    let during = worst_over(&on, closed.clone());
+    let after = worst_over(&on, closed.end + 2..n);
+    println!("motion-only blink: while covered {during:.2}px, after {after:.2}px");
+    assert!(after < 1.0, "picks up again after the blink: {after}");
+    assert!(during < 12.0, "prediction stays near: {during}");
+}
+
+/// Covered for longer than "Bridge up to": the guesses are dropped and the
+/// track stops with a clear message instead of wandering off.
+#[test]
+fn occlusion_solver_gives_up_after_the_limit() {
+    let n = 30;
+    let (frames, rect) = blink_footage(n, 10..30, true);
+    let mut src = Synthetic { frames };
+    let cancel = AtomicBool::new(false);
+    let mut l = plane_layer(rect);
+    l.settings.max_bridge_frames = 6;
+    let r = track_layer(
+        &mut src,
+        &mut l,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    println!("long cover: {:?}", r.as_ref().map_err(|e| e.to_string()));
+    assert!(
+        matches!(r, Err(TrackError::Occluded { frames: 6, .. })),
+        "{r:?}"
+    );
+    assert!(
+        l.tracks.values().all(|t| !t.predicted),
+        "guesses are removed"
+    );
+}

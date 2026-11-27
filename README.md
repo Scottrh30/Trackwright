@@ -17,7 +17,7 @@ Built in Rust with Tauri 2 and a Leptos UI.
 * **Tracking:** forward and backward, whole clip or one frame at a time, cancellable, live progress.
   * Motion model per layer: translation, + scale/rotation, + shear, + perspective.
   * Engine: Shi-Tomasi features inside the shape, pyramidal Lucas-Kanade with a forward-backward check, RANSAC model fit, and **anti-drift**: every frame is re-solved against the reference frame warped by the current estimate, so error does not build up over long shots.
-* **Checks:** grid insert overlay warped onto the surface, inlier points, and a **quality graph** on the timeline (error line, point-count bars, red/orange/purple marks on suspect frames) with **⚠ Next problem (N)**.
+* **Checks:** grid insert overlay warped onto the surface, inlier points, and a **quality graph** on the timeline (error line, point-count bars, red/orange/purple marks on suspect frames, cyan on predicted ones) with **⚠ Next problem (N)**.
 
 ### Tracking quality
 
@@ -27,6 +27,7 @@ Built in Rust with Tauri 2 and a Leptos UI.
 * **In / Out (I, O, X):** tracking stops at the Out (forward) or In (backward) point. **Re-track In→Out** re-solves just that section and blends it into the existing track so it joins seamlessly at Out.
 * **Lighting:** per-patch brightness/contrast compensation handles fades, flicker and moving light.
 * **Motion blur / hard frames:** a failed frame is retried with a wider, more forgiving search (flagged purple on the graph).
+* **Occlusion solver** (Track Settings, on by default): when the surface is covered (an eyelid over a pupil, a hand or car passing in front) the track carries on instead of stopping. It notices the cover either when tracking fails or when the surface stops looking like the reference (a closing eyelid that points would otherwise follow). Hidden frames are predicted from the area around the shape (a ring 2.5× its size: face, skin, background) when that still tracks, otherwise from the surface's own recent motion. Every hidden frame it tries to find the surface again by tracking straight from the last frame it was seen, accepting only a result that lands near the prediction and matches the reference's appearance; the predicted stretch is then corrected to join that frame seamlessly. Predicted frames are marked cyan on the timeline. *Bridge up to* (default 48 frames) limits the gap; past it the guesses are dropped and tracking stops with a message. On a synthetic blink (pupil covered for 6 frames on a moving face) the covered frames stay within 0.2 px.
 * **Speed:** multi-core tracking, cropped anti-drift solve, background decoding of the next frame, and an automatic half-resolution first pass on 2.5K+ footage (full-res refinement keeps the precision).
 * **Export** (Save to Desktop / Send to app / Save As…):
 

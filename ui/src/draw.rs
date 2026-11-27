@@ -616,6 +616,7 @@ pub fn draw_timeline(
                         Problem::HighError => "#ff4d4d",
                         Problem::FewPoints => "#ff9a3c",
                         Problem::Retried => "#b28bff",
+                        Problem::Predicted => "#4dd8ff",
                     });
                     ctx.fill_rect(x0_of(f), gy0, fw.ceil().max(1.5), 4.0);
                 }

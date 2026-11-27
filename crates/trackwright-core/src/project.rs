@@ -56,6 +56,11 @@ pub struct TrackSettings {
     /// Resolution for the fast frame-to-frame pass: 0 = full, 1 = half, 2 = quarter.
     /// `None` picks automatically (half for footage 2.5K and wider).
     pub detail_level: Option<usize>,
+    /// Occlusion solver: when the surface is covered (a blink, something passing in
+    /// front) keep it moving with what's around it, then find it again and join up.
+    pub bridge_occlusions: bool,
+    /// Longest stretch (frames) the occlusion solver may predict before giving up.
+    pub max_bridge_frames: usize,
 }
 
 impl Default for TrackSettings {
@@ -75,6 +80,8 @@ impl Default for TrackSettings {
             illumination: true,
             retry_hard_frames: true,
             detail_level: None,
+            bridge_occlusions: true,
+            max_bridge_frames: 48,
         }
     }
 }
@@ -94,6 +101,9 @@ pub struct FrameTrack {
     /// Solved only on a second, wider attempt (often motion blur).
     #[serde(default)]
     pub retried: bool,
+    /// Not seen: predicted by the occlusion solver while the surface was covered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub predicted: bool,
 }
 
 impl FrameTrack {
@@ -105,6 +115,7 @@ impl FrameTrack {
             points: vec![],
             keyframe: true,
             retried: false,
+            predicted: false,
         }
     }
 }
@@ -115,6 +126,7 @@ pub enum Problem {
     HighError,
     FewPoints,
     Retried,
+    Predicted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -445,7 +457,9 @@ impl Layer {
         if t.keyframe || frame == self.ref_frame {
             return None;
         }
-        if t.rms_error > 1.0 {
+        if t.predicted {
+            Some(Problem::Predicted)
+        } else if t.rms_error > 1.0 {
             Some(Problem::HighError)
         } else if (t.inliers as usize) < (self.settings.min_inliers * 2).max(16) {
             Some(Problem::FewPoints)
@@ -661,6 +675,7 @@ fn linked_tracks(parent: &Layer, child_ref: usize) -> BTreeMap<usize, FrameTrack
                 points: vec![],
                 keyframe: f == child_ref,
                 retried: t.retried,
+                predicted: t.predicted,
             },
         );
     }
