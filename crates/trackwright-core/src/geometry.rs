@@ -200,18 +200,22 @@ pub fn fit_model(model: MotionModel, src: &[Point], dst: &[Point]) -> Option<Mat
     if src.len() < model.min_samples() {
         return None;
     }
+    // Translation is the mean shift, in pixels. (Normalising the two point sets
+    // separately, as below, would let a difference in their spread leak in as scale.)
+    if model == MotionModel::Translation {
+        let n = src.len() as f64;
+        let tx = src.iter().zip(dst).map(|(a, b)| b[0] - a[0]).sum::<f64>() / n;
+        let ty = src.iter().zip(dst).map(|(a, b)| b[1] - a[1]).sum::<f64>() / n;
+        let h = [1.0, 0.0, tx, 0.0, 1.0, ty, 0.0, 0.0, 1.0];
+        return h.iter().all(|v| v.is_finite()).then_some(h);
+    }
     let (ts, _) = normalizer(src);
     let (td, td_inv) = normalizer(dst);
     let s: Vec<Point> = src.iter().map(|&p| apply(&ts, p)).collect();
     let d: Vec<Point> = dst.iter().map(|&p| apply(&td, p)).collect();
 
     let hn: Mat3 = match model {
-        MotionModel::Translation => {
-            let n = s.len() as f64;
-            let tx = s.iter().zip(&d).map(|(a, b)| b[0] - a[0]).sum::<f64>() / n;
-            let ty = s.iter().zip(&d).map(|(a, b)| b[1] - a[1]).sum::<f64>() / n;
-            [1.0, 0.0, tx, 0.0, 1.0, ty, 0.0, 0.0, 1.0]
-        }
+        MotionModel::Translation => unreachable!("handled above"),
         MotionModel::Similarity => {
             let mut ne = Normal::new(4);
             for (p, q) in s.iter().zip(&d) {
@@ -418,6 +422,21 @@ pub fn ransac(
 
 #[cfg(test)]
 mod tests {
+
+    /// Points that spread out (some pulled by a moving edge) must not make a
+    /// translation-only fit grow or shrink.
+    #[test]
+    fn translation_fit_never_scales() {
+        let src: Vec<Point> = vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]];
+        let dst: Vec<Point> = vec![[5.0, 3.0], [17.0, 3.0], [5.0, 15.0], [17.0, 15.0]];
+        let h = fit_model(MotionModel::Translation, &src, &dst).unwrap();
+        assert_eq!(
+            (h[0], h[1], h[3], h[4], h[6], h[7]),
+            (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        );
+        assert!((h[2] - 6.0).abs() < 1e-12 && (h[5] - 4.0).abs() < 1e-12);
+    }
+
     use super::*;
 
     fn close(a: &Mat3, b: &Mat3, tol: f64) -> bool {

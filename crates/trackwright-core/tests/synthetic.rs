@@ -630,6 +630,19 @@ fn blink_footage_moving(
     face_textured: bool,
     gaze: &dyn Fn(usize) -> [f64; 2],
 ) -> (Vec<Arc<Pyramid>>, [f64; 4]) {
+    blink_footage_with(n, closed, face_textured, gaze, &truth_face, &|_| 0)
+}
+
+/// As `blink_footage_moving`, with the face moving by `face_at(k)` (face -> frame)
+/// and frame k smeared up and down over `blur(k)` pixels (motion blur).
+fn blink_footage_with(
+    n: usize,
+    closed: std::ops::Range<usize>,
+    face_textured: bool,
+    gaze: &dyn Fn(usize) -> [f64; 2],
+    face_at: &dyn Fn(usize) -> Mat3,
+    blur: &dyn Fn(usize) -> usize,
+) -> (Vec<Arc<Pyramid>>, [f64; 4]) {
     let face = if face_textured {
         noise_texture(61, W, H)
     } else {
@@ -650,7 +663,7 @@ fn blink_footage_moving(
     let rect = [280.0, 200.0, 370.0, 265.0];
     let frames = (0..n)
         .map(|k| {
-            let h = truth_face(k);
+            let h = face_at(k);
             let hi = invert(&h).unwrap();
             // How far the lid is down (0 open .. 1 closed).
             let down = if closed.contains(&k) {
@@ -681,6 +694,17 @@ fn blink_footage_moving(
                     } else {
                         face.sample(s[0] as f32, s[1] as f32)
                     };
+                }
+            }
+            let b = blur(k);
+            if b > 1 {
+                let src = img.data.clone();
+                for y in 0..H {
+                    for x in 0..W {
+                        let (lo, hi) = (y.saturating_sub(b / 2), (y + b / 2).min(H - 1));
+                        let sum: f32 = (lo..=hi).map(|yy| src[yy * W + x]).sum();
+                        img.data[y * W + x] = sum / (hi - lo + 1) as f32;
+                    }
                 }
             }
             Arc::new(Pyramid::build(img, 4))
@@ -891,4 +915,69 @@ fn occlusion_solver_finds_a_target_that_moved_while_hidden() {
         .collect();
     println!("moved while hidden: predicted {predicted:?}, centre error before {before:.2}px, after {after:.2}px");
     assert!(after < 1.5, "follows the pupil to where it went: {after}");
+}
+
+/// The head jerks up and back while the eye is shut (as in real footage, where a
+/// blink often comes with a quick head move). Motion blur and the speed leave few
+/// clean points around the eye, but the ones that agree are enough: the guessed
+/// boxes must follow the face, not drift on at the speed it had before the blink.
+#[test]
+fn occlusion_solver_follows_a_fast_head_move_during_a_blink() {
+    let n = 30;
+    let closed = 11..20;
+    let jerk = |k: usize| -> f64 {
+        if (10..21).contains(&k) {
+            -16.0 * (k - 10).min(20 - k) as f64
+        } else {
+            0.0
+        }
+    };
+    let face_at = move |k: usize| {
+        let mut h = truth_face(k);
+        h[5] += jerk(k);
+        h
+    };
+    // Smeared over about the distance moved, as a camera with an open shutter would.
+    let blur = move |k: usize| (jerk(k) - jerk(k.saturating_sub(1))).abs() as usize;
+    let (frames, rect) =
+        blink_footage_with(n, closed.clone(), true, &|_| [0.0, 0.0], &face_at, &blur);
+    let mut src = Synthetic { frames };
+    let cancel = AtomicBool::new(false);
+    let mut l = plane_layer(rect);
+    let r = track_layer(
+        &mut src,
+        &mut l,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
+    let worst = |k: usize| {
+        let est = l.surface_at(k).unwrap();
+        l.surface
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let t = apply(&face_at(k), *c);
+                ((t[0] - est[i][0]).powi(2) + (t[1] - est[i][1]).powi(2)).sqrt()
+            })
+            .fold(0.0, f64::max)
+    };
+    let predicted: Vec<usize> = l
+        .tracks
+        .iter()
+        .filter(|(_, t)| t.predicted)
+        .map(|(f, _)| *f)
+        .collect();
+    let during = predicted.iter().map(|&k| worst(k)).fold(0.0, f64::max);
+    let after = (closed.end + 2..n).map(worst).fold(0.0, f64::max);
+    println!("head jerk: predicted {predicted:?}, worst corner error while hidden {during:.2}px, after {after:.2}px");
+    assert!(!predicted.is_empty(), "the shut eye is bridged");
+    assert!(
+        during < 8.0,
+        "guesses follow the head (peak move 80 px): {during}"
+    );
+    assert!(after < 1.5, "back on it after: {after}");
 }

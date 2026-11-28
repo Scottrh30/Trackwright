@@ -558,6 +558,7 @@ pub fn track_layer<S: FrameSource>(
                 exclude,
                 cancel,
                 &memory,
+                look.unwrap_or(0.0),
                 &mut on_frame,
             )? {
                 Bridged::Found { frame, velocity: v } => {
@@ -825,7 +826,9 @@ fn context_motion(
         s.ransac_threshold * 1.5,
         seed,
     )?;
-    (fit.inlier_count >= 10 && fit.inlier_count * 3 >= feats.len()).then_some(fit.model)
+    // Fast moves blur the surroundings and many points drop out or slip, but a clear
+    // group moving together is still the right motion (a head jerking up mid-blink).
+    (fit.inlier_count >= 12 && fit.inlier_count * 5 >= cr.src.len()).then_some(fit.model)
 }
 
 /// Search frame `b` for the shape's look in frame `a` (under `h_a`), shifted
@@ -1060,6 +1063,7 @@ fn bridge<S: FrameSource>(
     exclude: ExcludeFn,
     cancel: &AtomicBool,
     memory: &[(usize, Mat3)],
+    peak: f64,
     on_frame: &mut impl FnMut(usize, &FrameTrack),
 ) -> Result<Bridged, TrackError> {
     let s = layer.settings.clone();
@@ -1115,6 +1119,14 @@ fn bridge<S: FrameSource>(
             looks.push((f, h, source.pyramid(f, levels).map_err(TrackError::Source)?));
         }
     }
+    // How alike two clean views of it usually are (the two latest remembered frames),
+    // for telling "back" from "still covered".
+    let usual_level = match (looks.get(1), looks.get(2)) {
+        (Some((f1, h1, p1)), Some((f2, h2, p2))) => {
+            appearance_vs(layer, p2, h2, *f2, p1, h1, *f1, exclude).unwrap_or(peak)
+        }
+        _ => peak,
+    };
     let seed_base = layer.id as u64 * 7_000_003;
     let mut ctx_vel = IDENTITY;
     let mut prev = anchor;
@@ -1122,6 +1134,8 @@ fn bridge<S: FrameSource>(
     let mut damp_sum = 0.0;
     let mut k = 0usize;
     let mut last_shift: Option<Point> = None;
+    // The least it has looked like itself while hidden (at the best spot found).
+    let mut hidden_low = f64::INFINITY;
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Ok(Bridged::Cancelled);
@@ -1203,6 +1217,25 @@ fn bridge<S: FrameSource>(
                 .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
         };
         let needed = |d: Point| 0.40 + 0.3 * d[0].hypot(d[1]) / size.max(1.0);
+        // For a position found by the search alone (no point tracking to confirm it):
+        // back for real: about as like itself (the reference or a clean remembered frame)
+        // as two clean views usually are, or clearly more than the best spot was on an
+        // earlier hidden frame (it may look a little different now: an eye that turned).
+        // Never on the first hidden frame, and not on a lid that has stayed shut: a
+        // closing lid matches a closed one, and the frame just before the cover, well
+        // enough.
+        let usual = |h: &Mat3| {
+            looks
+                .iter()
+                .skip(1)
+                .filter_map(|(f, hf, p)| appearance_vs(layer, p, hf, *f, &g_pyr, h, g, exclude))
+                .chain(appearance(layer, ref_pyr, &g_pyr, h, g, exclude))
+                .fold(0.0, f64::max)
+        };
+        let like_usual = |h: &Mat3| {
+            let u = usual(h);
+            u >= (0.85 * usual_level).min(hidden_low + 0.12)
+        };
         // The best spot for any remembered look, by how far it clears what it needs.
         let searched = looks
             .iter()
@@ -1254,7 +1287,7 @@ fn bridge<S: FrameSource>(
         let found = found.or_else(|| {
             let (d, _) = searched?;
             let h = translate(&h_pred, d);
-            (steady(d) && like_anchor(&h)? >= 0.4).then(|| StepResult {
+            (steady(d) && like_anchor(&h)? >= 0.4 && like_usual(&h)).then(|| StepResult {
                 h_next: h,
                 step: IDENTITY,
                 inliers: 0,
@@ -1263,6 +1296,9 @@ fn bridge<S: FrameSource>(
             })
         });
         last_shift = searched.map(|(d, _)| d);
+        // How alike the best spot was on this frame, for judging later frames.
+        let best_spot = searched.map_or(h_pred, |(d, _)| translate(&h_pred, d));
+        hidden_low = hidden_low.min(usual(&best_spot));
         // Confirm on the next frame: still there and looking no worse (an eye opening or
         // open), not getting worse (an eye still closing).
         let found = found.filter(|r| {

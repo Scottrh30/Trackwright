@@ -106,6 +106,7 @@ fn main() {
     };
     let cancel = AtomicBool::new(false);
     let t0 = std::time::Instant::now();
+    let surf = layer.surface;
     let r = track_layer(
         &mut src,
         &mut layer,
@@ -114,7 +115,7 @@ fn main() {
         &no_exclusions,
         &cancel,
         |f, t| {
-            let c = layer_centre(t);
+            let c = layer_centre(t, &surf);
             eprintln!(
                 "{f:4} {} inl {:4} rms {:.2} centre ~({:.0},{:.0})",
                 if t.predicted { "PRED" } else { "seen" },
@@ -165,7 +166,11 @@ fn main() {
     }
 }
 
-fn layer_centre(t: &FrameTrack) -> Point {
-    // Where the reference origin area moved: good enough to watch progress.
-    apply(&t.h_from_ref, [0.0, 0.0])
+fn layer_centre(t: &FrameTrack, surf: &[Point; 4]) -> Point {
+    // Where the middle of the surface is in this frame.
+    let c = [
+        surf.iter().map(|p| p[0]).sum::<f64>() / 4.0,
+        surf.iter().map(|p| p[1]).sum::<f64>() / 4.0,
+    ];
+    apply(&t.h_from_ref, c)
 }
