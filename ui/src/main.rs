@@ -17,7 +17,7 @@ use trackwright_core::camera_export::CameraFormat;
 use trackwright_core::geometry::{MotionModel, Point};
 use trackwright_core::sfm::{CameraSettings, FocalMode, SolveMode};
 use trackwright_core::shape::point_in_polygon;
-use trackwright_core::{ExportFormat, FrameTrack, Layer, Project, Shape};
+use trackwright_core::{ExportFormat, FrameTrack, Layer, Project, Shape, TargetKind, Tuning};
 use wasm_bindgen::JsCast;
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,24 @@ struct AppSettings {
     default_format: ExportFormat,
     #[serde(default)]
     recent_projects: Vec<String>,
+    #[serde(default = "yes")]
+    learn_enabled: bool,
+    #[serde(default = "yes")]
+    use_learning: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// What has been learned for one kind of target (from the backend).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct KindStatus {
+    kind: TargetKind,
+    label: String,
+    examples: usize,
+    layers: usize,
+    tuning: Tuning,
 }
 
 impl Default for AppSettings {
@@ -41,6 +59,8 @@ impl Default for AppSettings {
             tidefire_dir: String::new(),
             default_format: ExportFormat::Reelforge,
             recent_projects: vec![],
+            learn_enabled: true,
+            use_learning: true,
         }
     }
 }
@@ -183,6 +203,9 @@ struct Ctx {
     viewer_res: RwSignal<ViewerRes>,
     proxy: RwSignal<ProxyInfo>,
     settings: RwSignal<AppSettings>,
+    learning: RwSignal<Vec<KindStatus>>,
+    /// A reset waiting for its second click ("all" or a kind's id).
+    learn_confirm: RwSignal<Option<String>>,
     export_format: RwSignal<ExportFormat>,
     modal: RwSignal<Modal>,
     in_point: RwSignal<Option<usize>>,
@@ -261,6 +284,8 @@ impl Ctx {
             viewer_res: RwSignal::new(ViewerRes::Auto),
             proxy: RwSignal::new(ProxyInfo::default()),
             settings: RwSignal::new(AppSettings::default()),
+            learning: RwSignal::new(vec![]),
+            learn_confirm: RwSignal::new(None),
             export_format: RwSignal::new(ExportFormat::Reelforge),
             modal: RwSignal::new(Modal::None),
             in_point: RwSignal::new(None),
@@ -916,6 +941,9 @@ fn App() -> impl IntoView {
             ctx.export_format.set(s.default_format);
             ctx.settings.set(s);
         }
+        if let Ok(l) = tauri::call::<Vec<KindStatus>>("learning_status", json!({})).await {
+            ctx.learning.set(l);
+        }
         if let Ok(Some(info)) =
             tauri::call::<Option<RecoveryInfo>>("recovery_info", json!({})).await
         {
@@ -1562,6 +1590,153 @@ fn CameraSection() -> impl IntoView {
 
 /// Lens distortion: values, line calibration, and an overlay grid.
 #[component]
+fn LearningSection() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let toggle = move |which: &'static str| {
+        let mut s = ctx.settings.get_untracked();
+        match which {
+            "learn" => s.learn_enabled = !s.learn_enabled,
+            _ => s.use_learning = !s.use_learning,
+        }
+        spawn_local(async move {
+            match tauri::call::<AppSettings>("set_settings", json!({ "settings": s })).await {
+                Ok(s) => ctx.settings.set(s),
+                Err(e) => ctx.say(e, true),
+            }
+        });
+    };
+    let learn_now = move |_| {
+        let Some(id) = ctx.selected.get_untracked() else {
+            ctx.say("Select a layer first", true);
+            return;
+        };
+        spawn_local(async move {
+            match tauri::call::<String>("learn_from_layer", json!({ "id": id })).await {
+                Ok(m) => ctx.say(m, false),
+                Err(e) => ctx.say(e, true),
+            }
+            if let Ok(l) = tauri::call::<Vec<KindStatus>>("learning_status", json!({})).await {
+                ctx.learning.set(l);
+            }
+        });
+    };
+    // Resetting needs a second click on the same button.
+    let reset = move |kind: Option<TargetKind>| {
+        let key = kind.map_or("all".to_string(), enum_id);
+        if ctx.learn_confirm.get_untracked().as_deref() != Some(key.as_str()) {
+            ctx.learn_confirm.set(Some(key));
+            ctx.say(
+                "Click again to forget it. This can't be undone (Back Up first if unsure)",
+                false,
+            );
+            return;
+        }
+        ctx.learn_confirm.set(None);
+        spawn_local(async move {
+            match tauri::call::<Vec<KindStatus>>("reset_learning", json!({ "kind": kind })).await {
+                Ok(l) => {
+                    ctx.learning.set(l);
+                    ctx.say(
+                        match kind {
+                            Some(k) => format!(
+                                "Forgot what was learned for {}; it starts again from the defaults",
+                                k.label()
+                            ),
+                            None => {
+                                "Forgot everything learned; tracking is back to the defaults".into()
+                            }
+                        },
+                        false,
+                    );
+                }
+                Err(e) => ctx.say(e, true),
+            }
+        });
+    };
+    let backup = move |_| {
+        spawn_local(async move {
+            match tauri::call::<Option<String>>("export_learning", json!({})).await {
+                Ok(Some(p)) => ctx.say(format!("Learning backed up to {p}"), false),
+                Ok(None) => {}
+                Err(e) => ctx.say(e, true),
+            }
+        });
+    };
+    let restore = move |_| {
+        spawn_local(async move {
+            match tauri::call::<Option<Vec<KindStatus>>>("import_learning", json!({})).await {
+                Ok(Some(l)) => {
+                    ctx.learning.set(l);
+                    ctx.say("Learning loaded (it replaced what was there)", false);
+                }
+                Ok(None) => {}
+                Err(e) => ctx.say(e, true),
+            }
+        });
+    };
+    let confirming = move |key: &str| ctx.learn_confirm.get().as_deref() == Some(key);
+    view! {
+        <section>
+            <h3>"Learning"</h3>
+            <p class="muted">"Trackwright learns from the frames you fix by hand (Adjust Track) when you save or export, and tracks better on that kind of target next time. To teach it that a stretch is right, add Adjust keys at its start and end."</p>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=move || ctx.settings.get().learn_enabled on:change=move |_| toggle("learn") />
+                "Learn from my manual tracking"
+            </label>
+            <label class="toggle">
+                <input type="checkbox" prop:checked=move || ctx.settings.get().use_learning on:change=move |_| toggle("use") />
+                "Use what it has learned when tracking"
+            </label>
+            <div class="row">
+                <button disabled=move || !ctx.settings.get().learn_enabled || ctx.selected.get().is_none() on:click=learn_now
+                    title="Learn from the selected layer's hand-fixed frames now">"Learn From Layer"</button>
+            </div>
+            {move || {
+                let l = ctx.learning.get();
+                if l.is_empty() {
+                    return view! { <p class="muted">"Nothing learned yet: tracking uses the built-in defaults."</p> }.into_any();
+                }
+                let d = Tuning::default();
+                view! {
+                    <div class="learned">
+                        {l.into_iter().map(|k| {
+                            let id = enum_id(k.kind);
+                            let kind = k.kind;
+                            let t = k.tuning;
+                            let changed = t != d;
+                            let detail = format!(
+                                "Covered when look < {:.0}% (default {:.0}%) or < {:.0}% of best ({:.0}%). Found again at {:.0}% ({:.0}%) or +{:.2} ({:.2})",
+                                t.sudden * 100.0, d.sudden * 100.0, t.gone * 100.0, d.gone * 100.0,
+                                t.reacquire_level * 100.0, d.reacquire_level * 100.0, t.reacquire_margin, d.reacquire_margin
+                            );
+                            view! {
+                                <div class="dir">
+                                    <div class="dir-head">
+                                        <strong>{k.label.clone()}</strong>
+                                        <button class="small" on:click=move |_| reset(Some(kind))>
+                                            {move || if confirming(&id) { "Sure? Click again" } else { "Reset" }}
+                                        </button>
+                                    </div>
+                                    <span class="muted">{format!("{} example(s) from {} layer(s){}", k.examples, k.layers, if changed { "" } else { ". Not enough yet to change anything" })}</span>
+                                    <code title=detail.clone()>{if changed { "Adjusted (hover for details)" } else { "Defaults" }}</code>
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
+                }.into_any()
+            }}
+            <div class="row">
+                <button on:click=backup>"Back Up…"</button>
+                <button on:click=restore title="Replace what has been learned with a backup">"Load…"</button>
+                <button class="danger" disabled=move || ctx.learning.get().is_empty() on:click=move |_| reset(None)>
+                    {move || if confirming("all") { "Sure? Click again" } else { "Reset All" }}
+                </button>
+            </div>
+        </section>
+    }
+}
+
+#[component]
 fn LensSection() -> impl IntoView {
     let ctx = expect_context::<Ctx>();
     let lens = move || ctx.project.with(|p| p.lens);
@@ -1926,6 +2101,20 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                         let id = enum_id(*m);
                         let sel = id == model;
                         view! { <option value=id.clone() selected=sel>{m.label()}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            <label class="field" title="What this layer tracks. Trackwright learns from your hand fixes separately for each kind">"Target"
+                <select on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    if let Ok(k) = serde_json::from_value::<TargetKind>(json!(v)) {
+                        ctx.edit_layer(move |l| l.settings.target = k);
+                    }
+                }>
+                    {TargetKind::ALL.iter().map(|k| {
+                        let id = enum_id(*k);
+                        let sel = *k == s.target;
+                        view! { <option value=id.clone() selected=sel>{k.label()}</option> }
                     }).collect_view()}
                 </select>
             </label>
@@ -2318,6 +2507,8 @@ fn RightPanel() -> impl IntoView {
             <RenderSection/>
             <CameraSection/>
             <LensSection/>
+
+            <LearningSection/>
 
             <section>
                 <h3>"App Folders"</h3>

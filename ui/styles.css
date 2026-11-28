@@ -160,3 +160,8 @@ button.warn { color: #ffb020; }
 .progress { height: 6px; background: #121419; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; margin: 6px 0; }
 .progress .bar { height: 100%; background: var(--accent); transition: width 0.15s; }
 .export-grid .primary:only-of-type { grid-column: auto; }
+
+button.danger { color: #ff8a80; }
+button.danger:hover:not(:disabled) { border-color: #ff8a80; }
+.learned { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+.learned .muted { font-size: 11px; }

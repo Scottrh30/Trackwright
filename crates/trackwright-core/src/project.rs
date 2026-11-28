@@ -61,6 +61,49 @@ pub struct TrackSettings {
     pub bridge_occlusions: bool,
     /// Longest stretch (frames) the occlusion solver may predict before giving up.
     pub max_bridge_frames: usize,
+    /// What is being tracked; what the app learns from manual fixes is kept per kind.
+    #[serde(default)]
+    pub target: TargetKind,
+    /// Judgement thresholds for this run (learned or default). Not saved: filled in
+    /// from what has been learned each time tracking starts.
+    #[serde(skip)]
+    pub tuning: crate::learning::Tuning,
+}
+
+/// The kind of thing a layer tracks. Each kind learns separately.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum TargetKind {
+    #[default]
+    General,
+    Eye,
+    Mouth,
+    Face,
+    Screen,
+    Object,
+}
+
+impl TargetKind {
+    pub const ALL: [TargetKind; 6] = [
+        TargetKind::General,
+        TargetKind::Eye,
+        TargetKind::Mouth,
+        TargetKind::Face,
+        TargetKind::Screen,
+        TargetKind::Object,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TargetKind::General => "General",
+            TargetKind::Eye => "Eye / pupil",
+            TargetKind::Mouth => "Mouth / lips",
+            TargetKind::Face => "Face / skin",
+            TargetKind::Screen => "Screen / sign / flat surface",
+            TargetKind::Object => "Object / vehicle",
+        }
+    }
 }
 
 impl Default for TrackSettings {
@@ -82,6 +125,8 @@ impl Default for TrackSettings {
             detail_level: None,
             bridge_occlusions: true,
             max_bridge_frames: 48,
+            target: TargetKind::General,
+            tuning: crate::learning::Tuning::default(),
         }
     }
 }
@@ -104,6 +149,9 @@ pub struct FrameTrack {
     /// Not seen: predicted by the occlusion solver while the surface was covered.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub predicted: bool,
+    /// The scores the solver judged this frame by, for learning from manual fixes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cues: Option<crate::learning::Cues>,
 }
 
 impl FrameTrack {
@@ -116,6 +164,7 @@ impl FrameTrack {
             keyframe: true,
             retried: false,
             predicted: false,
+            cues: None,
         }
     }
 }
@@ -697,6 +746,7 @@ fn linked_tracks(parent: &Layer, child_ref: usize) -> BTreeMap<usize, FrameTrack
                 keyframe: f == child_ref,
                 retried: t.retried,
                 predicted: t.predicted,
+                cues: None,
             },
         );
     }

@@ -981,3 +981,130 @@ fn occlusion_solver_follows_a_fast_head_move_during_a_blink() {
     );
     assert!(after < 1.5, "back on it after: {after}");
 }
+
+/// Learning from hand fixes: a target that changes look every few frames (like a
+/// mouth talking) makes the occlusion solver flag those frames as covered. After the
+/// user's corrected track is learned, the same kind of footage is tracked with fewer
+/// false alarms, and a real cover is still caught.
+#[test]
+fn learning_from_fixes_cuts_false_alarms() {
+    use trackwright_core::{LearningStore, TargetKind};
+    let n = 90usize;
+    let cover = 62..67;
+    let pos = |k: usize| -> [f64; 4] {
+        let x = 120.0 + 2.5 * k as f64;
+        [x, 200.0, x + 90.0, 270.0]
+    };
+    let make = |seed: u64, off: f64| -> Vec<Arc<Pyramid>> {
+        let face = noise_texture(seed, W, H);
+        let target = noise_texture(seed + 1, W, H);
+        let other = noise_texture(seed + 2, W, H);
+        let cover = cover.clone();
+        let frames = (0..n)
+            .map(|k| {
+                let r = pos(k);
+                let changed = k % 6 == 3;
+                let covered = cover.contains(&k);
+                let mut img = GrayImage::new(W, H);
+                for y in 0..H {
+                    for x in 0..W {
+                        let (fx, fy) = (x as f64, y as f64);
+                        let inside = fx >= r[0] && fx <= r[2] && fy >= r[1] && fy <= r[3];
+                        // Texture moves with the target (sampled in its own coordinates).
+                        let (u, v) = ((fx - r[0] + off) as f32, (fy - r[1] + off) as f32);
+                        img.data[y * W + x] = if inside && covered {
+                            150.0
+                        } else if inside && changed && fy < r[1] + 0.4 * (r[3] - r[1]) {
+                            other.sample(u, v)
+                        } else if inside {
+                            target.sample(u, v)
+                        } else {
+                            face.sample(fx as f32, fy as f32)
+                        };
+                    }
+                }
+                Arc::new(Pyramid::build(img, 4))
+            })
+            .collect();
+        frames
+    };
+    let run = |frames: Vec<Arc<Pyramid>>,
+               pos: &dyn Fn(usize) -> [f64; 4],
+               store: &LearningStore|
+     -> Layer {
+        let mut src = Synthetic { frames };
+        let cancel = AtomicBool::new(false);
+        let mut l = plane_layer(pos(0));
+        l.settings.model = MotionModel::Translation;
+        l.settings.target = TargetKind::Mouth;
+        l.settings.tuning = store.tuning_for(TargetKind::Mouth);
+        let r = track_layer(
+            &mut src,
+            &mut l,
+            0,
+            n - 1,
+            &no_exclusions,
+            &cancel,
+            |_, _| {},
+        );
+        assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
+        l
+    };
+    let false_alarms = |l: &Layer| {
+        l.tracks
+            .iter()
+            .filter(|(f, t)| t.predicted && !(cover.start - 1..cover.end + 1).contains(*f))
+            .count()
+    };
+    let caught = |l: &Layer| cover.clone().filter(|f| l.tracks[f].predicted).count();
+
+    // First shot: the defaults.
+    let mut store = LearningStore::default();
+    let frames = make(71, 100.0);
+    let mut first = run(frames, &pos, &store);
+    let before = false_alarms(&first);
+    // The user fixes every frame by hand (Adjust Track on each corner), then saves.
+    for k in 0..n {
+        let r = pos(k);
+        let truth = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]];
+        for (i, c) in truth.iter().enumerate() {
+            assert!(first.set_adjust_corner(k, i, *c));
+        }
+    }
+    let learned = store.learn("shot1", &first);
+    let t = store.tuning_for(TargetKind::Mouth);
+
+    // A new shot of the same kind of target.
+    let frames = make(71, 260.0);
+    let second = run(frames, &pos, &store);
+    let after = false_alarms(&second);
+    println!(
+        "learning: {learned} examples, tuning {t:?}; false alarms {before} -> {after}, cover caught {} -> {} of {}",
+        caught(&first),
+        caught(&second),
+        cover.len()
+    );
+    assert!(
+        before >= 4,
+        "the defaults do flag the look changes: {before}"
+    );
+    assert!(
+        after * 2 <= before,
+        "fewer false alarms after learning: {before} -> {after}"
+    );
+    assert!(
+        caught(&second) >= cover.len() - 1,
+        "a real cover is still caught"
+    );
+
+    // Switching learning use off (default tuning) brings the old behaviour back,
+    // and wiping the profile forgets it.
+    store.reset(Some(TargetKind::Mouth));
+    let frames = make(71, 260.0);
+    let wiped = run(frames, &pos, &store);
+    assert_eq!(store.tuning_for(TargetKind::Mouth), Default::default());
+    assert!(
+        false_alarms(&wiped) > after,
+        "back to the defaults after a reset"
+    );
+}

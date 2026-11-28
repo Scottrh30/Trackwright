@@ -24,7 +24,7 @@ use trackwright_core::render;
 use trackwright_core::sfm::{self, SolveOptions};
 use trackwright_core::{
     exclusion_polys, retrack_section, track_layer, FrameSource, FrameTrack, GrayImage, Layer,
-    Project, Pyramid, Shape, StopReason,
+    LearningStore, Project, Pyramid, Shape, StopReason, TargetKind, Tuning,
 };
 
 const MAX_UNDO: usize = 60;
@@ -163,6 +163,16 @@ pub struct AppSettings {
     pub tidefire_dir: String,
     pub default_format: ExportFormat,
     pub recent_projects: Vec<String>,
+    /// Learn from the frames the user fixes by hand (on save, export, or on request).
+    #[serde(default = "yes")]
+    pub learn_enabled: bool,
+    /// Track with what has been learned (off = always the built-in defaults).
+    #[serde(default = "yes")]
+    pub use_learning: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -183,6 +193,8 @@ impl Default for AppSettings {
             tidefire_dir: d("Tidefire"),
             default_format: ExportFormat::Reelforge,
             recent_projects: vec![],
+            learn_enabled: true,
+            use_learning: true,
         }
     }
 }
@@ -211,6 +223,8 @@ struct AppState {
     allow_close: AtomicBool,
     rendering: Arc<AtomicBool>,
     render_cancel: Arc<AtomicBool>,
+    /// What has been learned from the user's manual fixes, by target kind.
+    learning: Mutex<LearningStore>,
 }
 
 /// Everything the UI needs after a change.
@@ -640,6 +654,15 @@ async fn save_project(
     std::fs::rename(&tmp, &path).map_err(|e| format!("Could not save: {e}"))?;
     *state.project_path.lock().unwrap() = Some(path.clone());
     state.dirty.store(false, Ordering::SeqCst);
+    let ids: Vec<u32> = state
+        .project
+        .lock()
+        .unwrap()
+        .layers
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    auto_learn(&app, &state, &ids);
     delete_autosave(&app);
     add_recent(&app, &state, &path);
     Ok(Some(view(&state)))
@@ -956,6 +979,15 @@ fn start_tracking(
             return Err(e);
         }
     };
+    layer.settings.tuning = if state.settings.lock().unwrap().use_learning {
+        state
+            .learning
+            .lock()
+            .unwrap()
+            .tuning_for(layer.settings.target)
+    } else {
+        Tuning::default()
+    };
     state.cancel.store(false, Ordering::SeqCst);
     let cache = state.cache.clone();
     let cancel = state.cancel.clone();
@@ -1042,6 +1074,178 @@ fn start_tracking(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Learning from manual fixes
+
+fn learning_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("learning.json"))
+}
+
+fn load_learning(app: &AppHandle) -> LearningStore {
+    learning_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| LearningStore::from_json(&s).ok())
+        .unwrap_or_default()
+}
+
+fn store_learning(app: &AppHandle, store: &LearningStore) -> CmdResult<()> {
+    let p = learning_path(app).ok_or("No settings folder")?;
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, store.to_json()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+}
+
+/// Where a layer's examples came from, so learning from it again replaces them.
+fn learning_source(state: &AppState, p: &Project, id: u32) -> String {
+    let doc = state
+        .project_path
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| p.footage.as_ref().map(|f| format!("unsaved:{}", f.source)))
+        .unwrap_or_else(|| "unsaved".into());
+    format!("{doc}#layer{id}")
+}
+
+/// Learn from these layers' hand-fixed frames. Returns how many examples were found.
+fn learn_layers(app: &AppHandle, state: &AppState, ids: &[u32]) -> CmdResult<usize> {
+    let p = state.project.lock().unwrap().clone();
+    let mut store = state.learning.lock().unwrap();
+    let before = store.clone();
+    let mut n = 0;
+    for &id in ids {
+        if let Some(l) = p.layer(id) {
+            if l.link.is_none() && !l.adjust_keys.is_empty() {
+                n += store.learn(&learning_source(state, &p, id), l);
+            }
+        }
+    }
+    if *store != before {
+        store_learning(app, &store)?;
+    }
+    Ok(n)
+}
+
+/// Learning that happens by itself (on save and export), when it is switched on.
+fn auto_learn(app: &AppHandle, state: &AppState, ids: &[u32]) {
+    if state.settings.lock().unwrap().learn_enabled {
+        let _ = learn_layers(app, state, ids);
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct KindStatus {
+    kind: TargetKind,
+    label: String,
+    examples: usize,
+    layers: usize,
+    tuning: Tuning,
+}
+
+fn learning_status_of(store: &LearningStore) -> Vec<KindStatus> {
+    store
+        .profiles
+        .iter()
+        .map(|(k, p)| KindStatus {
+            kind: *k,
+            label: k.label().to_string(),
+            examples: p.example_count(),
+            layers: p.sources.len(),
+            tuning: p.tuning,
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn learning_status(state: State<'_, AppState>) -> Vec<KindStatus> {
+    learning_status_of(&state.learning.lock().unwrap())
+}
+
+#[tauri::command]
+fn learn_from_layer(app: AppHandle, state: State<'_, AppState>, id: u32) -> CmdResult<String> {
+    let (kind, keys) = {
+        let p = state.project.lock().unwrap();
+        let l = p.layer(id).ok_or("Layer not found")?;
+        (l.settings.target, l.adjust_keys.len())
+    };
+    if keys == 0 {
+        return Err(
+            "Nothing to learn from yet: fix the track by hand first (Adjust Track), \
+             or add Adjust keys at the start and end of a stretch you have checked"
+                .into(),
+        );
+    }
+    let n = learn_layers(&app, &state, &[id])?;
+    if n == 0 {
+        return Ok("No new examples in this layer (track it again so the tracker can note what it judged each frame by, then fix it)".into());
+    }
+    let store = state.learning.lock().unwrap();
+    let total = store.profiles.get(&kind).map_or(0, |p| p.example_count());
+    Ok(format!(
+        "Learned {n} example(s) from this layer. {} now has {total}",
+        kind.label()
+    ))
+}
+
+#[tauri::command]
+fn reset_learning(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: Option<TargetKind>,
+) -> CmdResult<Vec<KindStatus>> {
+    let mut store = state.learning.lock().unwrap();
+    store.reset(kind);
+    store_learning(&app, &store)?;
+    Ok(learning_status_of(&store))
+}
+
+#[tauri::command]
+async fn export_learning(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    let json = state.learning.lock().unwrap().to_json();
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Back up what Trackwright has learned")
+        .add_filter("Trackwright learning", &["twlearn"])
+        .set_file_name("trackwright-learning.twlearn")
+        .blocking_save_file();
+    let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
+        return Ok(None);
+    };
+    std::fs::write(&path, json).map_err(|e| format!("Could not save: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+/// Replaces everything learned with the file's contents.
+#[tauri::command]
+async fn import_learning(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<Option<Vec<KindStatus>>> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Load learning")
+        .add_filter("Trackwright learning", &["twlearn", "json"])
+        .blocking_pick_file();
+    let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("Could not read: {e}"))?;
+    let loaded = LearningStore::from_json(&text)?;
+    let mut store = state.learning.lock().unwrap();
+    *store = loaded;
+    store_learning(&app, &store)?;
+    Ok(Some(learning_status_of(&store)))
+}
+
 #[tauri::command]
 fn stop_tracking(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
@@ -1106,6 +1310,7 @@ async fn export_layer(
             export::file_name(f, l, format),
         )
     };
+    auto_learn(&app, &state, &[id]);
     let settings = state.settings.lock().unwrap().clone();
     let dir = match destination.as_str() {
         "desktop" => dirs::desktop_dir()
@@ -2158,6 +2363,7 @@ pub fn run() {
                 allow_close: AtomicBool::new(false),
                 rendering: Arc::new(AtomicBool::new(false)),
                 render_cancel: Arc::new(AtomicBool::new(false)),
+                learning: Mutex::new(load_learning(app.handle())),
             });
             let handle = app.handle().clone();
             std::thread::spawn(move || autosave_loop(handle));
@@ -2227,6 +2433,11 @@ pub fn run() {
             set_lens,
             set_lens_lines,
             calibrate_lens,
+            learning_status,
+            learn_from_layer,
+            reset_learning,
+            export_learning,
+            import_learning,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Trackwright");

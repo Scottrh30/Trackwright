@@ -6,6 +6,9 @@
 //!
 //! Settings: bridge=0|1, model=perspective|affine|similarity|translation,
 //! max_bridge=N, min_inliers=N, max_features=N.
+//! Learning: kind=eye|mouth|face|screen|object, use=STORE.json (track with what the
+//! store has learned for that kind), approve=STORE.json (afterwards, treat the run as
+//! checked by hand from START to END, learn from it, and save the store).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
@@ -80,6 +83,14 @@ fn main() {
     };
     let mut layer = Layer::new(1, start, shape);
     let out = a.get(5).filter(|s| !s.contains('=')).cloned();
+    let mut approve: Option<String> = None;
+    let load = |p: &str| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|t| LearningStore::from_json(&t).ok())
+            .unwrap_or_default()
+    };
+    let mut use_store: Option<String> = None;
     for kv in a.iter().skip(5).filter(|s| s.contains('=')) {
         let (k, v) = kv.split_once('=').unwrap();
         let s = &mut layer.settings;
@@ -96,6 +107,18 @@ fn main() {
                     _ => MotionModel::Perspective,
                 }
             }
+            "kind" => {
+                s.target = match v {
+                    "eye" => TargetKind::Eye,
+                    "mouth" => TargetKind::Mouth,
+                    "face" => TargetKind::Face,
+                    "screen" => TargetKind::Screen,
+                    "object" => TargetKind::Object,
+                    _ => TargetKind::General,
+                }
+            }
+            "use" => use_store = Some(v.to_string()),
+            "approve" => approve = Some(v.to_string()),
             _ => panic!("unknown setting {k}"),
         }
     }
@@ -104,6 +127,10 @@ fn main() {
         cache: HashMap::new(),
         order: VecDeque::new(),
     };
+    if let Some(p) = &use_store {
+        layer.settings.tuning = load(p).tuning_for(layer.settings.target);
+        println!("tuning: {:?}", layer.settings.tuning);
+    }
     let cancel = AtomicBool::new(false);
     let t0 = std::time::Instant::now();
     let surf = layer.surface;
@@ -142,6 +169,25 @@ fn main() {
         layer.tracks.len(),
         pred
     );
+    if let Some(p) = &approve {
+        let mut store = load(p);
+        let (lo, hi) = (start.min(end), start.max(end));
+        let hi = layer
+            .tracks
+            .range(lo..=hi)
+            .next_back()
+            .map_or(lo, |(f, _)| *f);
+        layer.add_adjust_key(lo);
+        layer.add_adjust_key(hi);
+        let n = store.learn(&format!("{}#{lo}-{hi}", a[1]), &layer);
+        std::fs::write(p, store.to_json()).unwrap();
+        println!(
+            "learned {n} examples; {:?} now {:?}",
+            layer.settings.target,
+            store.tuning_for(layer.settings.target)
+        );
+        layer.adjust_keys.clear();
+    }
     if let Some(path) = out {
         let refp = src.pyramid(layer.ref_frame, 4).unwrap();
         let rows: Vec<serde_json::Value> = layer

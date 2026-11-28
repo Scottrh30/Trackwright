@@ -7,6 +7,7 @@ use crate::geometry::{
 };
 use crate::image::{GrayImage, Pyramid};
 use crate::klt::{track_point, KltParams};
+use crate::learning::Cues;
 use crate::project::{FrameTrack, Layer, TrackSettings};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -434,8 +435,8 @@ pub fn track_layer<S: FrameSource>(
                        steady: Option<f64>,
                        sc: Option<f64>,
                        cons: Option<f64>| {
-        let gone = matches!((look, sc), (Some(peak), Some(sc)) if peak >= 0.3 && sc < 0.45 * peak);
-        let sudden = matches!((steady, cons), (Some(avg), Some(c)) if avg >= 0.5 && c < 0.7 * avg);
+        let gone = matches!((look, sc), (Some(peak), Some(sc)) if peak >= 0.3 && sc < s.tuning.gone * peak);
+        let sudden = matches!((steady, cons), (Some(avg), Some(c)) if avg >= 0.5 && c < s.tuning.sudden * avg);
         gone || sudden
     };
 
@@ -490,6 +491,7 @@ pub fn track_layer<S: FrameSource>(
             Err(e) => Err(e),
         };
         // Covered? The step failed, or it "worked" but no longer looks like the surface.
+        let mut cues = None;
         let lost = match &result {
             Err(TrackError::Lost { .. } | TrackError::NoFeatures(_)) => true,
             Ok(r) if s.bridge_occlusions => {
@@ -497,6 +499,18 @@ pub fn track_layer<S: FrameSource>(
                 let cons = appearance_vs(
                     layer, &prev_pyr, &h_cur, cur, &next_pyr, &r.h_next, next, exclude,
                 );
+                // What the calls below are based on, kept for learning from fixes.
+                cues = Some(Cues {
+                    sudden: match (steady, cons) {
+                        (Some(a), Some(c)) if a >= 0.5 => Some((c / a) as f32),
+                        _ => None,
+                    },
+                    gone: match (look, sc) {
+                        (Some(p), Some(v)) if p >= 0.3 => Some((v / p) as f32),
+                        _ => None,
+                    },
+                    ..Default::default()
+                });
                 if hidden_from(look, steady, sc, cons) {
                     true
                 } else {
@@ -545,7 +559,16 @@ pub fn track_layer<S: FrameSource>(
                     }
                 }
             }
-            match bridge(
+            // The solve this frame would have used, for telling a real cover from a
+            // false alarm when the user fixes the track later.
+            let trigger = cues.take().map(|mut c| {
+                c.rejected = result
+                    .as_ref()
+                    .ok()
+                    .map(|r| layer.surface.map(|p| apply(&r.h_next, p)));
+                c
+            });
+            let outcome = bridge(
                 source,
                 layer,
                 &normal,
@@ -560,7 +583,15 @@ pub fn track_layer<S: FrameSource>(
                 &memory,
                 look.unwrap_or(0.0),
                 &mut on_frame,
-            )? {
+            )?;
+            if matches!(outcome, Bridged::Found { .. } | Bridged::ToEnd) {
+                if let Some(t) = layer.tracks.get_mut(&next) {
+                    if t.cues.is_none() {
+                        t.cues = trigger;
+                    }
+                }
+            }
+            match outcome {
                 Bridged::Found { frame, velocity: v } => {
                     h_cur = layer.h_at(frame).unwrap_or(h_cur);
                     velocity = v;
@@ -595,6 +626,7 @@ pub fn track_layer<S: FrameSource>(
             keyframe: false,
             retried,
             predicted: false,
+            cues,
         };
         velocity = r.step;
         layer.tracks.insert(next, ft.clone());
@@ -1199,6 +1231,7 @@ fn bridge<S: FrameSource>(
             keyframe: false,
             retried: false,
             predicted: true,
+            cues: None,
         };
         layer.tracks.insert(g, ft.clone());
         on_frame(g, &ft);
@@ -1232,9 +1265,11 @@ fn bridge<S: FrameSource>(
                 .chain(appearance(layer, ref_pyr, &g_pyr, h, g, exclude))
                 .fold(0.0, f64::max)
         };
+        let low_before = hidden_low;
         let like_usual = |h: &Mat3| {
-            let u = usual(h);
-            u >= (0.85 * usual_level).min(hidden_low + 0.12)
+            usual(h)
+                >= (s.tuning.reacquire_level * usual_level)
+                    .min(low_before + s.tuning.reacquire_margin)
         };
         // The best spot for any remembered look, by how far it clears what it needs.
         let searched = looks
@@ -1349,6 +1384,21 @@ fn bridge<S: FrameSource>(
             }
         });
         if let Some(r) = found {
+            // Found by the search alone: keep what it was judged on, for learning.
+            let cues = (r.inliers == 0).then(|| {
+                let u = usual(&r.h_next);
+                Cues {
+                    reacquire: Some([
+                        (u / usual_level.max(1e-6)) as f32,
+                        if low_before.is_finite() {
+                            (u - low_before) as f32
+                        } else {
+                            -1.0
+                        },
+                    ]),
+                    ..Default::default()
+                }
+            });
             // Spread the miss at the found frame back over the predicted frames.
             let miss: [Point; 4] = {
                 let a = corners(&r.h_next, layer);
@@ -1381,6 +1431,7 @@ fn bridge<S: FrameSource>(
                 keyframe: false,
                 retried: false,
                 predicted: false,
+                cues,
             };
             layer.tracks.insert(g, ft.clone());
             on_frame(g, &ft);
