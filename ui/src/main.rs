@@ -181,6 +181,8 @@ enum Pending {
 enum Modal {
     None,
     About,
+    /// Getting started: the steps of a track, the tools and the shortcuts.
+    Help,
     Unsaved(Pending),
     Recovery(RecoveryInfo),
 }
@@ -207,6 +209,10 @@ struct Ctx {
     sel_point: RwSignal<Option<usize>>,
     /// Track Settings: the mesh size is being typed in (Custom…).
     mesh_custom: RwSignal<bool>,
+    /// Panel sections the user has folded away (ids), remembered between runs.
+    folded: RwSignal<Vec<String>>,
+    /// The File menu is open.
+    file_open: RwSignal<bool>,
     renaming: RwSignal<Option<u32>>,
     tool: RwSignal<Tool>,
     draft: RwSignal<Vec<Point>>,
@@ -261,6 +267,33 @@ struct Ctx {
     timeline: NodeRef<html::Canvas>,
 }
 
+const FOLD_KEY: &str = "trackwright.folded";
+
+/// Sections folded away until opened: the less-used and specialist ones.
+const FOLDED_AT_FIRST: [&str; 8] = [
+    "render", "camera", "lens", "learning", "ai", "folders", "shortcuts", "track-advanced",
+];
+
+fn load_folded() -> Vec<String> {
+    window()
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|st| st.get_item(FOLD_KEY).ok().flatten())
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_else(|| FOLDED_AT_FIRST.iter().map(|s| s.to_string()).collect())
+}
+
+/// A panel section heading that folds the section away when clicked.
+fn fold_head(ctx: Ctx, id: &'static str, title: &'static str) -> impl IntoView {
+    view! {
+        <h3 class="fold" title="Click to show or hide" on:click=move |_| ctx.toggle_fold(id)>
+            <span>{title}</span>
+            <span class="chev">{move || if ctx.is_folded(id) { "▸" } else { "▾" }}</span>
+        </h3>
+    }
+}
+
 fn dist2(a: Point, b: Point) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
 }
@@ -290,6 +323,8 @@ impl Ctx {
             selected: RwSignal::new(None),
             sel_point: RwSignal::new(None),
             mesh_custom: RwSignal::new(false),
+            folded: RwSignal::new(load_folded()),
+            file_open: RwSignal::new(false),
             renaming: RwSignal::new(None),
             tool: RwSignal::new(Tool::Pan),
             draft: RwSignal::new(vec![]),
@@ -341,6 +376,32 @@ impl Ctx {
             play_handle: StoredValue::new(None),
             viewport: NodeRef::new(),
             timeline: NodeRef::new(),
+        }
+    }
+
+    /// Is the panel section `id` folded away?
+    fn is_folded(self, id: &str) -> bool {
+        self.folded.with(|f| f.iter().any(|x| x == id))
+    }
+
+    /// Fold or unfold a panel section, and remember it.
+    fn toggle_fold(self, id: &str) {
+        self.folded.update(|f| match f.iter().position(|x| x == id) {
+            Some(i) => {
+                f.remove(i);
+            }
+            None => f.push(id.to_string()),
+        });
+        let v = self.folded.get_untracked();
+        if let Some(st) = window().local_storage().ok().flatten() {
+            let _ = st.set_item(FOLD_KEY, &serde_json::to_string(&v).unwrap_or_default());
+        }
+    }
+
+    /// Unfold a section (when a step points at it).
+    fn unfold(self, id: &str) {
+        if self.is_folded(id) {
+            self.toggle_fold(id);
         }
     }
 
@@ -1182,6 +1243,7 @@ fn App() -> impl IntoView {
             "s" => ctx.tool.set(Tool::Surface),
             "h" => ctx.tool.set(Tool::Pan),
             "f" => ctx.fit_view(),
+            "f1" | "?" => ctx.modal.set(Modal::Help),
             _ => {}
         }
     });
@@ -1204,11 +1266,12 @@ fn App() -> impl IntoView {
 #[component]
 fn TopBar() -> impl IntoView {
     let ctx = expect_context::<Ctx>();
-    let tool_btn = move |t: Tool, label: &'static str, key: &'static str| {
+    let tool_btn = move |t: Tool| {
+        let (icon, label, key, tip) = tool_info(t);
         view! {
-            <button class="tool" class:active=move || ctx.tool.get() == t title=format!("{label} ({key})")
+            <button class="tool" class:active=move || ctx.tool.get() == t title=format!("{label} ({key}): {tip}")
                 on:click=move |_| { ctx.tool.set(t); if !matches!(t, Tool::Draw | Tool::LensLine) { ctx.draft.set(vec![]); ctx.hover.set(None); } }>
-                {label}<kbd>{key}</kbd>
+                <span class="ico">{icon}</span>{label}<kbd>{key}</kbd>
             </button>
         }
     };
@@ -1220,50 +1283,96 @@ fn TopBar() -> impl IntoView {
             .unwrap_or_else(|| "Untitled".into());
         format!("{name}{}", if ctx.dirty.get() { " •" } else { "" })
     };
+    // Close the menu, then do `f`.
+    let item = move |f: Box<dyn Fn()>| {
+        move |_| {
+            ctx.file_open.set(false);
+            f();
+        }
+    };
 
     view! {
         <header class="topbar">
             <div class="brand"><span class="logo">"◆"</span>"Trackwright"<span class="doc" title=move || ctx.path.get().unwrap_or_default()>{title}</span></div>
             <div class="group">
-                <button title="New project (Ctrl+N)" on:click=move |_| ctx.guard(Pending::New)>"New"</button>
-                <button on:click=move |_| ctx.open_footage("file")>"Open Footage…"</button>
-                <button on:click=move |_| ctx.open_footage("folder")>"Sequence…"</button>
-                <button title="Open project (Ctrl+O)" on:click=move |_| ctx.guard(Pending::OpenProject(None))>"Open Project…"</button>
                 <div class="menu-wrap">
-                    <button disabled=move || ctx.recent.get().is_empty() on:click=move |_| ctx.recent_open.update(|v| *v = !*v)>"Recent ▾"</button>
-                    <Show when=move || ctx.recent_open.get()>
-                        <div class="menu-backdrop" on:click=move |_| ctx.recent_open.set(false)></div>
-                        <ul class="menu">
-                            {move || ctx.recent.get().into_iter().map(|p| {
-                                let name = file_name(&p);
-                                let full = p.clone();
-                                view! {
-                                    <li title=full.clone() on:click=move |_| { ctx.recent_open.set(false); ctx.guard(Pending::OpenProject(Some(full.clone()))); }>
-                                        <span>{name}</span><small>{p.clone()}</small>
-                                    </li>
-                                }
-                            }).collect_view()}
+                    <button class:open=move || ctx.file_open.get() on:click=move |_| ctx.file_open.update(|v| *v = !*v)>"File ▾"</button>
+                    <Show when=move || ctx.file_open.get()>
+                        <div class="menu-backdrop" on:click=move |_| ctx.file_open.set(false)></div>
+                        <ul class="menu file-menu">
+                            <li on:click=item(Box::new(move || ctx.guard(Pending::New)))><span>"New project"</span><kbd>"Ctrl+N"</kbd></li>
+                            <li on:click=item(Box::new(move || ctx.guard(Pending::OpenProject(None))))><span>"Open project…"</span><kbd>"Ctrl+O"</kbd></li>
+                            <li class="sepline"></li>
+                            <li class="two-line" on:click=item(Box::new(move || ctx.open_footage("file")))><span>"Open video or image…"</span><small>"MP4, MOV, PNG, EXR…"</small></li>
+                            <li class="two-line" on:click=item(Box::new(move || ctx.open_footage("folder")))><span>"Open image sequence…"</span><small>"Pick the folder that holds the frames"</small></li>
+                            <li class="sepline"></li>
+                            <li on:click=item(Box::new(move || ctx.save(false)))><span>"Save"</span><kbd>"Ctrl+S"</kbd></li>
+                            <li on:click=item(Box::new(move || ctx.save(true)))><span>"Save as…"</span><kbd>"Ctrl+Shift+S"</kbd></li>
+                            {move || {
+                                let recent = ctx.recent.get();
+                                (!recent.is_empty()).then(|| view! {
+                                    <li class="sepline"></li>
+                                    <li class="label">"Recent projects"</li>
+                                    {recent.into_iter().take(8).map(|p| {
+                                        let name = file_name(&p);
+                                        let full = p.clone();
+                                        view! {
+                                            <li class="recent" title=full.clone() on:click=move |_| { ctx.file_open.set(false); ctx.guard(Pending::OpenProject(Some(full.clone()))); }>
+                                                <span>{name}</span><small>{p.clone()}</small>
+                                            </li>
+                                        }
+                                    }).collect_view()}
+                                })
+                            }}
                         </ul>
                     </Show>
                 </div>
                 <button title="Save (Ctrl+S)" on:click=move |_| ctx.save(false)>"Save"</button>
-                <button title="Save As (Ctrl+Shift+S)" on:click=move |_| ctx.save(true)>"Save As…"</button>
             </div>
             <div class="group">
                 <button title="Undo (Ctrl+Z)" disabled=move || !ctx.can_undo.get() || ctx.tracking.get() on:click=move |_| ctx.undo()>"↶ Undo"</button>
                 <button title="Redo (Ctrl+Shift+Z / Ctrl+Y)" disabled=move || !ctx.can_redo.get() || ctx.tracking.get() on:click=move |_| ctx.redo()>"↷ Redo"</button>
             </div>
             <div class="group tools">
-                {tool_btn(Tool::Pan, "Pan", "H")}
-                {tool_btn(Tool::Draw, "Draw", "D")}
-                {tool_btn(Tool::EditShape, "Edit", "E")}
-                {tool_btn(Tool::Surface, "Surface", "S")}
-                {tool_btn(Tool::Adjust, "Adjust", "A")}
-                {tool_btn(Tool::LensLine, "Lens", "L")}
+                {tool_btn(Tool::Pan)}
+                {tool_btn(Tool::Draw)}
+                {tool_btn(Tool::EditShape)}
+                {tool_btn(Tool::Surface)}
+                {tool_btn(Tool::Adjust)}
+                {tool_btn(Tool::LensLine)}
             </div>
             <div class="spacer"></div>
+            <button class="help" title="How to use Trackwright (F1)" on:click=move |_| ctx.modal.set(Modal::Help)>"? Help"</button>
             <button on:click=move |_| ctx.modal.set(Modal::About)>"About"</button>
         </header>
+    }
+}
+
+/// Icon, name, shortcut and one-line description of a tool.
+fn tool_info(t: Tool) -> (&'static str, &'static str, &'static str, &'static str) {
+    match t {
+        Tool::Pan => ("✋", "Pan", "H", "move around the picture; the mouse wheel zooms"),
+        Tool::Draw => ("✎", "Draw", "D", "draw a new shape around something to track"),
+        Tool::EditShape => ("◇", "Edit", "E", "reshape or move the selected layer's shape"),
+        Tool::Surface => ("⌗", "Surface", "S", "place the four corner-pin corners (and shape a mesh)"),
+        Tool::Adjust => ("✥", "Fix", "A", "fix a bad frame by dragging the corners into place"),
+        Tool::LensLine => ("⌒", "Lens", "L", "mark lines that should be straight, to measure lens distortion"),
+    }
+}
+
+/// What to do with the current tool, shown under the picture.
+fn tool_hint(t: Tool, has_layer: bool, mesh: bool) -> &'static str {
+    match t {
+        Tool::Pan => "Drag to move around · mouse wheel to zoom · F to fit the picture",
+        Tool::Draw => "Click around a flat area (a screen, sign, wall, face) · click the first point or press Enter to finish · right-click removes the last point",
+        Tool::EditShape if !has_layer => "Select a layer on the left to edit its shape",
+        Tool::EditShape => "Drag a point to move it · click an edge to add a point · Delete removes the selected point · drag inside to move the whole shape",
+        Tool::Surface if !has_layer => "Select a layer on the left to place its corners",
+        Tool::Surface if mesh => "Drag the numbered corners onto the surface's real corners · drag inside to move all four · on the reference frame, drag inner grid points to shape the mesh",
+        Tool::Surface => "Drag the numbered corners onto the surface's real corners (where an insert's corners should go) · drag inside to move all four",
+        Tool::Adjust if !has_layer => "Select a tracked layer on the left to fix it",
+        Tool::Adjust => "On a frame where the track slipped, drag the corners back into place · use ◆ Lock Here on good frames either side so the fix stays local",
+        Tool::LensLine => "Click points along an edge that should be straight (a door frame, a horizon) · Enter finishes the line · mark a few lines, then Solve in Lens Distortion",
     }
 }
 
@@ -1391,8 +1500,8 @@ fn LayerSection(layer: Layer) -> impl IntoView {
     let link = l.link;
     let linked = link.is_some();
     view! {
-        <section>
-            <h3>"Layer"</h3>
+        <section class:folded=move || ctx.is_folded("layer")>
+            {fold_head(ctx, "layer", "Layer")}
             <label class="field">"Name"
                 <input type="text" prop:value=name on:change=move |ev| { let v = event_target_value(&ev); ctx.edit_layer(move |l| l.name = v); } />
             </label>
@@ -1427,7 +1536,6 @@ fn LayerSection(layer: Layer) -> impl IntoView {
                 } />
             </label>
             <button class="wide" on:click=move |_| ctx.edit_layer(|l| l.surface = trackwright_core::shape::default_surface(&l.shape))>"Reset Surface to Shape Bounds"</button>
-            <p class="hint">"Edit Shape (E): drag points, click an edge to add a point, drag inside to move the shape, Delete removes the selected point. Surface (S): drag corners or drag inside to move it."</p>
         </section>
     }
 }
@@ -1502,8 +1610,8 @@ fn CameraSection() -> impl IntoView {
         view! { <label class="toggle"><input type="checkbox" prop:checked=move || sig.get() on:change=move |_| sig.update(|v| *v = !*v) />{label}</label> }
     };
     view! {
-        <section>
-            <h3>"Camera Solve"</h3>
+        <section class:folded=move || ctx.is_folded("camera") class:disabled=move || ctx.project.with(|p| p.footage.is_none())>
+            {fold_head(ctx, "camera", "Camera Solve")}
             <p class="hint">"Uses the In/Out range, or the whole clip. Tick moving objects and people under Ignore."</p>
             <div class="row">
                 <label class="field">"Focal length"
@@ -1666,8 +1774,8 @@ fn AiSection() -> impl IntoView {
         });
     };
     view! {
-        <section>
-            <h3>"AI Tracker"</h3>
+        <section class:folded=move || ctx.is_folded("ai")>
+            {fold_head(ctx, "ai", "AI Tracker")}
             <p class="muted">"An AI point tracker (AllTracker) that follows a covered surface through blinks, hands and fast moves. Optional: a one-time download, then turn on AI assist per layer. Slower than normal tracking while something is covered."</p>
             <p class:err=move || { let a = ctx.ai.get(); !a.ready && !a.downloading && a.downloaded }>{move || ctx.ai.get().message}</p>
             <div class="row">
@@ -1777,8 +1885,8 @@ fn LearningSection() -> impl IntoView {
     };
     let confirming = move |key: &str| ctx.learn_confirm.get().as_deref() == Some(key);
     view! {
-        <section>
-            <h3>"Learning"</h3>
+        <section class:folded=move || ctx.is_folded("learning")>
+            {fold_head(ctx, "learning", "Learning")}
             <p class="muted">"Trackwright learns from the frames you fix by hand (Adjust Track) when you save or export, and tracks better on that kind of target next time. To teach it that a stretch is right, add Adjust keys at its start and end."</p>
             <label class="toggle">
                 <input type="checkbox" prop:checked=move || ctx.settings.get().learn_enabled on:change=move |_| toggle("learn") />
@@ -1843,8 +1951,8 @@ fn LensSection() -> impl IntoView {
     let lens = move || ctx.project.with(|p| p.lens);
     let set = move |k1: f64, k2: f64| ctx.call("set_lens", json!({ "k1": k1, "k2": k2 }), None);
     view! {
-        <section>
-            <h3>"Lens Distortion"</h3>
+        <section class:folded=move || ctx.is_folded("lens")>
+            {fold_head(ctx, "lens", "Lens Distortion")}
             <div class="row">
                 <label class="field">"k1"
                     <input type="number" step="0.001" prop:value=move || format!("{:.5}", lens().k1)
@@ -1927,8 +2035,8 @@ fn RenderSection() -> impl IntoView {
         view! { <option value=id selected=move || ctx.render_mode.get() == id>{label}</option> }
     };
     view! {
-        <section>
-            <h3>"Render"</h3>
+        <section class:folded=move || ctx.is_folded("render") class:disabled=move || ctx.project.with(|p| p.footage.is_none())>
+            {fold_head(ctx, "render", "Render")}
             <label class="field">"Output"
                 <select on:change=move |ev| ctx.render_mode.set(event_target_value(&ev))>
                     {mode_opt("insert", "Insert composited into the footage")}
@@ -2043,8 +2151,8 @@ fn KeysSection(layer: Layer) -> impl IntoView {
     let shape_key_here2 = shape_key_here.clone();
     let adjust_key_here2 = adjust_key_here.clone();
     view! {
-        <section>
-            <h3>"Keyframes"</h3>
+        <section class:folded=move || ctx.is_folded("keys")>
+            {fold_head(ctx, "keys", "Keyframes")}
             <p class="muted">{if n_shape == 0 { "Shape: fixed to the plane".to_string() } else { format!("Shape: animated, {n_shape} key(s)") }}</p>
             <div class="row">
                 <button title="Add a shape key here; later edits on other frames add keys automatically" on:click=move |_| {
@@ -2067,7 +2175,7 @@ fn KeysSection(layer: Layer) -> impl IntoView {
                 <button disabled=n_adjust == 0 on:click=move |_| ctx.edit_layer(|l| l.adjust_keys.clear())>"Clear"</button>
             </div>
             <p class="hint">{move || if adjust_key_here2() || shape_key_here2() { "There is a key on this frame." } else { "" }}
-                " Adjust (A): drag corners onto the right spot on a bad frame. Use ◆ Lock Here on good frames either side so the fix only covers the bad stretch."</p>
+                " Fix (A): drag corners onto the right spot on a bad frame. ◆ Lock Here on good frames either side keeps the fix local."</p>
         </section>
     }
 }
@@ -2093,8 +2201,8 @@ fn ExclusionsSection(layer: Layer) -> impl IntoView {
     });
     let empty = others.is_empty();
     view! {
-        <section>
-            <h3>"Exclusions"</h3>
+        <section class:folded=move || ctx.is_folded("exclusions")>
+            {fold_head(ctx, "exclusions", "Exclusions")}
             {if empty {
                 view! { <p class="hint">"Draw another layer over anything that moves in front of this surface (a hand, a person, a reflection), then tick it here so the tracker ignores that area. Track or keyframe that layer so it follows the occluder."</p> }.into_any()
             } else {
@@ -2166,7 +2274,7 @@ fn InsertSection(layer: Layer) -> impl IntoView {
             .into_any()
         }
     };
-    view! { <section><h3>"Insert Preview"</h3>{body}</section> }
+    view! { <section class:folded=move || ctx.is_folded("insert")>{fold_head(ctx, "insert", "Insert Preview")}{body}</section> }
 }
 
 /// Mesh grids offered in Track Settings (cells across, down).
@@ -2295,8 +2403,8 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
         }
     };
     view! {
-        <section class:disabled=layer.link.is_some()>
-            <h3>"Track Settings"</h3>
+        <section class:disabled=layer.link.is_some() class:folded=move || ctx.is_folded("track")>
+            {fold_head(ctx, "track", "Track Settings")}
             <label class="field">"Motion"
                 <select on:change=move |ev| {
                     let v = event_target_value(&ev);
@@ -2360,6 +2468,11 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                     "Find the pupil"
                 </label>
             })}
+            <button class="adv-toggle" on:click=move |_| ctx.toggle_fold("track-advanced")>
+                {move || if ctx.is_folded("track-advanced") { "▸ Advanced settings" } else { "▾ Advanced settings" }}
+            </button>
+            <div class="adv" class:hidden=move || ctx.is_folded("track-advanced")>
+            <p class="hint">"The defaults suit most shots. Change these only if a track struggles."</p>
             {num("Max points", s.max_features.to_string(), "10", |l, v| l.settings.max_features = v.clamp(20.0, 3000.0) as usize)}
             {num("Min point spacing (px)", s.min_distance.to_string(), "1", |l, v| l.settings.min_distance = v.clamp(2.0, 50.0) as f32)}
             {num("Search window radius (px)", s.search_radius.to_string(), "1", |l, v| l.settings.search_radius = v.clamp(3.0, 31.0) as i32)}
@@ -2395,6 +2508,21 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                     <option value="2" selected=s.detail_level == Some(2)>"Fastest: quarter-res first pass"</option>
                 </select>
             </label>
+            <button class="wide" title="Put the advanced settings back to their defaults (keeps Motion, Target, Rotation and Mesh)" on:click=move |_| ctx.edit_layer(|l| {
+                let keep = l.settings.clone();
+                let mut d = trackwright_core::project::TrackSettings::default();
+                d.model = keep.model;
+                d.target = keep.target;
+                d.rotation = keep.rotation;
+                d.find_pupil = keep.find_pupil;
+                d.ai_assist = keep.ai_assist;
+                d.mesh_cells = keep.mesh_cells;
+                d.mesh_rows = keep.mesh_rows;
+                d.mesh_stiffness = keep.mesh_stiffness;
+                d.mesh_falloff = keep.mesh_falloff;
+                l.settings = d;
+            })>"Reset advanced to defaults"</button>
+            </div>
         </section>
     }
 }
@@ -2666,7 +2794,7 @@ fn Viewport() -> impl IntoView {
     };
     view! {
         <main class="viewport">
-            <div class="view-toolbar">
+            <div class="view-toolbar" class:hidden=move || ctx.project.with(|p| p.footage.is_none())>
                 {toggle(ctx.show_shapes, "Shapes")}
                 {toggle(ctx.show_surface, "Surface")}
                 {toggle(ctx.show_inserts, "Insert")}
@@ -2687,7 +2815,117 @@ fn Viewport() -> impl IntoView {
                 on:mouseleave=move |e| { ctx.hover.set(None); on_up(e) }
                 on:wheel=on_wheel on:dblclick=on_dbl
                 on:contextmenu=|e| e.prevent_default()></canvas>
+            <Show when=move || ctx.project.with(|p| p.footage.is_some()) fallback=move || view! { <Welcome/> }>
+                <Steps/>
+                <div class="tool-hint">{move || {
+                    let t = ctx.tool.get();
+                    let layer = ctx.selected.get().and_then(|id| ctx.project.with(|p| p.layer(id).map(|l| l.mesh_dims().is_some())));
+                    let (icon, label, ..) = tool_info(t);
+                    view! { <strong>{format!("{icon} {label}")}</strong>" "{tool_hint(t, layer.is_some(), layer == Some(true))} }
+                }}</div>
+            </Show>
         </main>
+    }
+}
+
+/// No footage yet: what to do first.
+#[component]
+fn Welcome() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    view! {
+        <div class="welcome">
+            <h2>"Start a track"</h2>
+            <p class="muted">"Open a clip, draw a shape around what you want to follow, then press Track."</p>
+            <div class="welcome-actions">
+                <button class="primary big" on:click=move |_| ctx.open_footage("file")>"Open video or image…"</button>
+                <button class="big" on:click=move |_| ctx.open_footage("folder")>"Open image sequence…"</button>
+                <button class="big" on:click=move |_| ctx.guard(Pending::OpenProject(None))>"Open project…"</button>
+            </div>
+            <p class="muted small">"Or drag a video, image or folder of frames onto this window."</p>
+            {move || {
+                let recent = ctx.recent.get();
+                (!recent.is_empty()).then(|| view! {
+                    <h3>"Recent projects"</h3>
+                    <ul class="welcome-recent">
+                        {recent.into_iter().take(5).map(|p| {
+                            let full = p.clone();
+                            view! {
+                                <li title=p.clone() on:click=move |_| ctx.guard(Pending::OpenProject(Some(full.clone())))>
+                                    <span>{file_name(&p)}</span><small>{p.clone()}</small>
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                })
+            }}
+            <button class="link" on:click=move |_| ctx.modal.set(Modal::Help)>"How does tracking work? (F1)"</button>
+        </div>
+    }
+}
+
+/// The steps of a track along the top of the picture: what's done, and what to do
+/// next. Each step is a button that does it (or points at where to do it).
+#[component]
+fn Steps() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    // (layers, selected layer tracked?, problems)
+    let state = move || {
+        let sel = ctx.selected.get();
+        ctx.project.with(|p| {
+            let tracked = sel
+                .and_then(|id| p.layer(id))
+                .is_some_and(|l| l.tracks.len() > 1 || l.link.is_some());
+            (p.layers.len(), sel.is_some(), tracked)
+        })
+    };
+    let current = move || {
+        let (layers, _, tracked) = state();
+        if layers == 0 {
+            2
+        } else if !tracked {
+            3
+        } else if ctx.problem_count() > 0 {
+            4
+        } else {
+            5
+        }
+    };
+    let next = move || {
+        let (_, selected, _) = state();
+        match current() {
+            2 => "Next: draw a shape around a flat area you want to follow (✎ Draw, D)".to_string(),
+            3 if !selected => "Next: pick a layer on the left, then press Track ▶▶".to_string(),
+            3 => "Next: press Track ▶▶ at the bottom (◀◀ tracks backward)".to_string(),
+            4 => format!("Next: check {} doubtful frame(s): ⚠ Next problem, then fix with ✥ Fix (A)", ctx.problem_count()),
+            _ => "Next: export the track (right panel), or render the insert".to_string(),
+        }
+    };
+    let step = move |n: usize, label: &'static str, tip: &'static str| {
+        view! {
+            <button class="step" title=tip
+                class:done=move || n < current() class:now=move || n == current()
+                on:click=move |_| match n {
+                    1 => ctx.open_footage("file"),
+                    2 => { ctx.tool.set(Tool::Draw); ctx.say("Click around a flat area; click the first point (or Enter) to finish", false); }
+                    3 => if ctx.selected.get_untracked().is_some() { ctx.start_track(1, None) } else { ctx.say("Pick a layer on the left first", true) },
+                    4 => if ctx.problem_count() > 0 { ctx.next_problem(); ctx.tool.set(Tool::Adjust); } else { ctx.say("No doubtful frames", false) },
+                    _ => { ctx.unfold("export"); ctx.say("Pick a format under Export Track on the right", false); }
+                }>
+                <span class="num">{move || if n < current() { "✓".to_string() } else { n.to_string() }}</span><span class="lbl">{label}</span>
+            </button>
+        }
+    };
+    view! {
+        <div class="steps">
+            <div class="step-row">
+                {step(1, "Footage", "Open a different clip")}
+                {step(2, "Shape", "Draw a shape around what to follow (D)")}
+                {step(3, "Track", "Track the selected layer forward")}
+                {step(4, "Check", "Jump to the next doubtful frame and fix it")}
+                {step(5, "Export", "Save the track for another app")}
+            </div>
+            <div class="step-next">{next}</div>
+        </div>
     }
 }
 
@@ -2702,8 +2940,8 @@ fn RightPanel() -> impl IntoView {
     };
     view! {
         <aside class="panel right">
-            <section>
-                <h3>"Footage"</h3>
+            <section class:folded=move || ctx.is_folded("footage")>
+                {fold_head(ctx, "footage", "Footage")}
                 {move || ctx.project.with(|p| match &p.footage {
                     None => view! { <p class="muted">"No footage loaded. Drag a video, image or folder onto the window."</p> }.into_any(),
                     Some(f) => {
@@ -2752,8 +2990,8 @@ fn RightPanel() -> impl IntoView {
                 }}</p>
             </section>
 
-            <section>
-                <h3>"Export Track"</h3>
+            <section class:folded=move || ctx.is_folded("export") class:disabled=move || ctx.project.with(|p| p.footage.is_none())>
+                {fold_head(ctx, "export", "Export Track")}
                 <label class="field">"Format"
                     <select on:change=move |ev| {
                         let v = event_target_value(&ev);
@@ -2782,8 +3020,8 @@ fn RightPanel() -> impl IntoView {
             <LearningSection/>
             <AiSection/>
 
-            <section>
-                <h3>"App Folders"</h3>
+            <section class:folded=move || ctx.is_folded("folders")>
+                {fold_head(ctx, "folders", "App Folders")}
                 {move || {
                     let s = ctx.settings.get();
                     [("Reelforge", s.reelforge_dir), ("Forma3D", s.forma3d_dir), ("Tidefire", s.tidefire_dir)].into_iter().map(|(app, dir)| view! {
@@ -2795,8 +3033,8 @@ fn RightPanel() -> impl IntoView {
                 }}
             </section>
 
-            <section>
-                <h3>"Shortcuts"</h3>
+            <section class:folded=move || ctx.is_folded("shortcuts")>
+                {fold_head(ctx, "shortcuts", "Shortcuts")}
                 <dl class="keys">
                     <dt>"Ctrl+Z / Ctrl+Y"</dt><dd>"Undo / redo"</dd>
                     <dt>"Ctrl+S / Ctrl+O"</dt><dd>"Save / open project"</dd>
@@ -2849,17 +3087,17 @@ fn Bottom() -> impl IntoView {
     };
     view! {
         <footer class="bottom">
-            <div class="transport">
+            <div class="transport" class:empty=move || ctx.project.with(|p| p.footage.is_none())>
                 <button title="First frame (Home)" on:click=move |_| ctx.frame.set(0)>"⏮"</button>
-                <button class="track" title="Track backward" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(-1, None)>"◀◀ Track"</button>
-                <button class="track" title="Track one frame backward (Shift+←)" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(-1, Some(1))>"◀|"</button>
-                <button class="stop" title="Stop (Esc)" disabled=move || !ctx.tracking.get() on:click=move |_| ctx.stop_track()>"■"</button>
-                <button class="track" title="Track one frame forward (Shift+→)" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(1, Some(1))>"|▶"</button>
-                <button class="track" title="Track forward" disabled=move || ctx.tracking.get() on:click=move |_| ctx.start_track(1, None)>"Track ▶▶"</button>
+                <button class="track" title="Track the selected layer backward to the start (or the In point)" disabled=move || ctx.tracking.get() || ctx.selected.get().is_none() on:click=move |_| ctx.start_track(-1, None)>"◀◀ Track back"</button>
+                <button class="track" title="Track one frame backward (Shift+←)" disabled=move || ctx.tracking.get() || ctx.selected.get().is_none() on:click=move |_| ctx.start_track(-1, Some(1))>"◀ 1"</button>
+                <button class="stop" title="Stop tracking (Esc)" disabled=move || !ctx.tracking.get() on:click=move |_| ctx.stop_track()>"■ Stop"</button>
+                <button class="track" title="Track one frame forward (Shift+→)" disabled=move || ctx.tracking.get() || ctx.selected.get().is_none() on:click=move |_| ctx.start_track(1, Some(1))>"1 ▶"</button>
+                <button class="track go" title="Track the selected layer forward to the end (or the Out point)" disabled=move || ctx.tracking.get() || ctx.selected.get().is_none() on:click=move |_| ctx.start_track(1, None)>"Track ▶▶"</button>
                 <button title="Last frame (End)" on:click=move |_| ctx.frame.set(ctx.frame_count_untracked().saturating_sub(1))>"⏭"</button>
                 <span class="sep"></span>
-                <button class="inout" class:set=move || ctx.in_point.get().is_some() title="Set In point (I)" on:click=move |_| ctx.set_in_out(true)>"In"</button>
-                <button class="inout" class:set=move || ctx.out_point.get().is_some() title="Set Out point (O)" on:click=move |_| ctx.set_in_out(false)>"Out"</button>
+                <button class="inout" class:set=move || ctx.in_point.get().is_some() title="Set In point (I): where Re-track starts" on:click=move |_| ctx.set_in_out(true)>"In"</button>
+                <button class="inout" class:set=move || ctx.out_point.get().is_some() title="Set Out point (O): where tracking stops" on:click=move |_| ctx.set_in_out(false)>"Out"</button>
                 <button class="small" title="Clear In/Out (X)" disabled=move || ctx.in_point.get().is_none() && ctx.out_point.get().is_none() on:click=move |_| { ctx.in_point.set(None); ctx.out_point.set(None); }>"✕"</button>
                 <button class="track" title="Re-track In→Out and blend it into the existing track" disabled=move || ctx.tracking.get() || ctx.in_point.get().is_none() || ctx.out_point.get().is_none() on:click=move |_| ctx.retrack_section()>"Re-track In→Out"</button>
                 <button class="warn" title="Jump to the next frame flagged on the quality graph (N)" disabled=move || ctx.problem_count() == 0 on:click=move |_| ctx.next_problem()>
@@ -2892,7 +3130,7 @@ fn Modals() -> impl IntoView {
             <div class="modal-bg" on:click=move |_| ctx.modal.set(Modal::None)>
                 <div class="modal" on:click=|e| e.stop_propagation()>
                     <h2>"Trackwright " {env!("CARGO_PKG_VERSION")}</h2>
-                    <p>"Planar motion tracking. Camera tracking is coming next."</p>
+                    <p>"Planar, mesh and camera tracking."</p>
                     <p class="legal">"© 2026 Scott Hambach. All rights reserved."<br/>"Trackwright is a trademark of Scott Hambach."</p>
                     <h3>"Open-source components"</h3>
                     <ul class="licenses">
@@ -2902,9 +3140,50 @@ fn Modals() -> impl IntoView {
                         <li>"serde, serde_json (MIT / Apache-2.0)"</li>
                         <li>"wasm-bindgen, js-sys, web-sys (MIT / Apache-2.0)"</li>
                         <li>"dirs (MIT / Apache-2.0)"</li>
+                        <li>"ONNX Runtime (MIT), for the optional AI tracker"</li>
+                        <li>"AllTracker model (MIT), downloaded on request"</li>
                         <li>"FFmpeg, if installed, is used as a separate program for video decoding (LGPL/GPL)"</li>
                     </ul>
                     <div class="modal-actions"><button class="primary" on:click=move |_| ctx.modal.set(Modal::None)>"Close"</button></div>
+                </div>
+            </div>
+        }
+        .into_any(),
+        Modal::Help => view! {
+            <div class="modal-bg" on:click=move |_| ctx.modal.set(Modal::None)>
+                <div class="modal help" on:click=|e| e.stop_propagation()>
+                    <h2>"How to track"</h2>
+                    <ol class="steps-list">
+                        <li><strong>"Open footage."</strong>" File › Open video or image, or drag a clip onto the window."</li>
+                        <li><strong>"Draw a shape"</strong>" (✎ Draw, D) around a flat area you want to follow: a screen, a sign, a wall, a face. It becomes a layer on the left."</li>
+                        <li><strong>"Place the corners"</strong>" (⌗ Surface, S) on the surface's real corners, if you'll pin something onto it. For things that bend (faces, cloth), turn on Mesh in Track Settings."</li>
+                        <li><strong>"Track."</strong>" Press Track ▶▶ at the bottom (or ◀◀ to go backward). The green graph shows how sure it was on each frame."</li>
+                        <li><strong>"Check and fix."</strong>" ⚠ Next problem jumps to doubtful frames. Fix one with ✥ Fix (A): drag the corners into place."</li>
+                        <li><strong>"Export."</strong>" Pick a format in Export Track on the right and save, or send it straight to Reelforge, Forma3D or Tidefire."</li>
+                    </ol>
+                    <h3>"Tools"</h3>
+                    <dl class="keys">
+                        {[Tool::Pan, Tool::Draw, Tool::EditShape, Tool::Surface, Tool::Adjust, Tool::LensLine].into_iter().map(|t| {
+                            let (icon, label, key, tip) = tool_info(t);
+                            view! { <dt>{format!("{icon} {label} ({key})")}</dt><dd>{tip}</dd> }
+                        }).collect_view()}
+                    </dl>
+                    <h3>"Shortcuts"</h3>
+                    <dl class="keys">
+                        <dt>"Space"</dt><dd>"Play / pause"</dd>
+                        <dt>"← / →"</dt><dd>"Previous / next frame"</dd>
+                        <dt>"Shift + ← / →"</dt><dd>"Track one frame"</dd>
+                        <dt>"Esc"</dt><dd>"Stop tracking / cancel"</dd>
+                        <dt>"N"</dt><dd>"Next problem frame"</dd>
+                        <dt>"I / O / X"</dt><dd>"Set In / Out, clear"</dd>
+                        <dt>"Ctrl+Z / Ctrl+Y"</dt><dd>"Undo / redo"</dd>
+                        <dt>"Ctrl+S / Ctrl+O"</dt><dd>"Save / open project"</dd>
+                        <dt>"Ctrl+D"</dt><dd>"Duplicate layer"</dd>
+                        <dt>"F"</dt><dd>"Fit the picture"</dd>
+                        <dt>"Wheel / middle-drag"</dt><dd>"Zoom / pan"</dd>
+                    </dl>
+                    <p class="hint">"Hover over any button or setting for a short explanation. Click a panel heading to fold it away."</p>
+                    <div class="modal-actions"><button class="primary" on:click=move |_| ctx.modal.set(Modal::None)>"Got it"</button></div>
                 </div>
             </div>
         }

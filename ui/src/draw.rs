@@ -172,15 +172,8 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
     ctx.set_fill_style_str("#0d0e11");
     ctx.fill_rect(0.0, 0.0, cw, ch);
 
+    // No footage: the welcome card (HTML, over the canvas) says what to do.
     let Some(footage) = scene.project.footage.as_ref() else {
-        ctx.set_fill_style_str("#6b7280");
-        ctx.set_font("15px system-ui, sans-serif");
-        ctx.set_text_align("center");
-        let _ = ctx.fill_text(
-            "Open a video or image sequence to start tracking (or drag it here)",
-            cw / 2.0,
-            ch / 2.0,
-        );
         return;
     };
 
@@ -698,7 +691,7 @@ pub fn draw_timeline(
             ctx.set_fill_style_str("#7a8090");
             ctx.set_font("9px system-ui, sans-serif");
             ctx.set_text_align("left");
-            let _ = ctx.fill_text("error (line) / points (bars)", 4.0, gy0 + 13.0);
+            let _ = ctx.fill_text("Track quality: green bars = points followed, yellow line = error (higher is worse)", 4.0, gy0 + 13.0);
         }
         // Keyframes: shape keys (white) and Adjust Track keys (orange) on the lane.
         if let Some(li) = project.layers.iter().position(|l| l.id == layer.id) {

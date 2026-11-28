@@ -2,6 +2,8 @@
 
 Planar motion tracking in the spirit of Mocha Pro: draw a shape around any flat surface (a screen, a sign, a wall, a tabletop) and Trackwright follows it through the shot, solving a full perspective corner pin you can send to Reelforge, Forma3D, Tidefire, Nuke or After Effects.
 
+**Finding your way around:** with no clip open, the window shows a *Start a track* card (open a video, an image sequence or a project, or pick a recent one). Once a clip is open, a step guide at the top of the picture (Footage › Shape › Track › Check › Export) ticks off what's done and says what to do next; each step is also a button. A strip under the picture explains how to use the current tool. *? Help* (F1) has the whole workflow, the tools and the shortcuts. Panel headings fold away (and the app remembers); specialist panels (Render, Camera Solve, Lens, Learning, AI Tracker) start folded, and Track Settings keeps its fine-tuning under *Advanced settings*. File actions live in the *File* menu.
+
 Built in Rust with Tauri 2 and a Leptos UI.
 
 © 2026 Scott Hambach. All rights reserved. Trackwright is a trademark of Scott Hambach.

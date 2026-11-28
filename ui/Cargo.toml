@@ -30,4 +30,5 @@ features = [
   "Window",
   "Document",
   "console",
+  "Storage",
 ]
