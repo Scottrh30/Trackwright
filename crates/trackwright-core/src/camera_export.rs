@@ -22,10 +22,11 @@ pub enum CameraFormat {
     Chan,
     Fbx,
     Alembic,
+    MayaAscii,
 }
 
 impl CameraFormat {
-    pub const ALL: [CameraFormat; 9] = [
+    pub const ALL: [CameraFormat; 10] = [
         CameraFormat::Forma3d,
         CameraFormat::Tidefire,
         CameraFormat::Blender,
@@ -34,6 +35,7 @@ impl CameraFormat {
         CameraFormat::PointCloudObj,
         CameraFormat::Fbx,
         CameraFormat::Alembic,
+        CameraFormat::MayaAscii,
         CameraFormat::Chan,
     ];
 
@@ -50,6 +52,7 @@ impl CameraFormat {
                 "FBX camera + points (.fbx) for Maya / Cinema 4D / Unreal / Blender"
             }
             CameraFormat::Alembic => "Alembic camera + points (.abc) for Houdini / Maya / Blender",
+            CameraFormat::MayaAscii => "HitFilm / Maya camera + points (.ma)",
         }
     }
 
@@ -64,6 +67,7 @@ impl CameraFormat {
             CameraFormat::Chan => "chan",
             CameraFormat::Fbx => "fbx",
             CameraFormat::Alembic => "abc",
+            CameraFormat::MayaAscii => "ma",
         }
     }
 }
@@ -198,6 +202,7 @@ pub fn export_camera(
         CameraFormat::Chan => chan(f, s, sensor_mm).into_bytes(),
         CameraFormat::Fbx => fbx_camera(f, s, sensor_mm, name),
         CameraFormat::Alembic => alembic_camera(f, s, sensor_mm, name),
+        CameraFormat::MayaAscii => maya_ascii(f, s, sensor_mm, name).into_bytes(),
     }
 }
 
@@ -508,6 +513,153 @@ fn chan(f: &Footage, s: &CameraSolve, _sensor_mm: f64) -> String {
             x.number, x.pos[0], x.pos[1], x.pos[2], e[0], e[1], e[2], vfov
         );
     }
+    out
+}
+
+/// Maya ASCII scene: an animated camera and a locator per solved point. This is the
+/// format HitFilm's Import › 3D Camera Tracking Data reads (as made by SynthEyes,
+/// Boujou, PFTrack), and Maya opens it too. Maya cameras look down -Z with Y up,
+/// like ours; rotations use Maya's default XYZ order. Keys are on footage frame
+/// numbers; HitFilm asks for the frame rate when importing.
+fn maya_ascii(f: &Footage, s: &CameraSolve, sensor_mm: f64, name: &str) -> String {
+    let ident = |s: &str| -> String {
+        let mut o: String = s
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if o.is_empty() || o.starts_with(|c: char| c.is_ascii_digit()) {
+            o.insert_str(0, "cam_");
+        }
+        o
+    };
+    let cam = ident(&format!("{name}_camera"));
+    let fr = frames(f, s);
+    let fps = fps_of(f);
+    let time_unit = match (fps * 1000.0).round() as i64 {
+        24000 => "film".to_string(),
+        25000 => "pal".to_string(),
+        30000 => "ntsc".to_string(),
+        48000 => "show".to_string(),
+        50000 => "palf".to_string(),
+        60000 => "ntscf".to_string(),
+        _ => format!("{}fps", r5(fps)),
+    };
+    let film_w = sensor_mm / 25.4;
+    let film_h = film_w * s.height / s.width;
+    let mut out = String::new();
+    out += "//Maya ASCII 2018 scene\n";
+    out += &format!("//Name: {cam}.ma\n");
+    out += &format!(
+        "//Codeset: UTF-8\n//Made by Trackwright {}\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    out += "requires maya \"2018\";\n";
+    out += &format!("currentUnit -l centimeter -a degree -t {time_unit};\n");
+    out += &format!(
+        "fileInfo \"resolution\" \"{} {}\";\n",
+        s.width as i64, s.height as i64
+    );
+    let mut rots = Vec::new();
+    let mut prev = None;
+    for x in &fr {
+        let e = unwrap_deg(prev, euler_xyz(&x.rot));
+        prev = Some(e);
+        rots.push(e);
+    }
+    let (p0, r0) = (
+        fr.first().map_or([0.0; 3], |x| x.pos),
+        rots.first().copied().unwrap_or([0.0; 3]),
+    );
+    out += &format!("createNode transform -n \"{cam}\";\n");
+    out += &format!(
+        "\tsetAttr \".t\" -type \"double3\" {} {} {} ;\n",
+        r5(p0[0]),
+        r5(p0[1]),
+        r5(p0[2])
+    );
+    out += &format!(
+        "\tsetAttr \".r\" -type \"double3\" {} {} {} ;\n",
+        r5(r0[0]),
+        r5(r0[1]),
+        r5(r0[2])
+    );
+    out += &format!("createNode camera -n \"{cam}Shape\" -p \"{cam}\";\n");
+    out += "\tsetAttr -k off \".v\";\n";
+    out += &format!(
+        "\tsetAttr \".cap\" -type \"double2\" {} {} ;\n",
+        r5(film_w),
+        r5(film_h)
+    );
+    out += "\tsetAttr \".ff\" 1;\n";
+    out += &format!("\tsetAttr \".fl\" {};\n", r5(s.focal_mm(sensor_mm)));
+    out += "\tsetAttr \".coi\" 10;\n";
+    out += &format!("\tsetAttr \".imn\" -type \"string\" \"{cam}\";\n");
+    out += "\tsetAttr \".den\" -type \"string\" \"depth\";\n";
+    out += "\tsetAttr \".man\" -type \"string\" \"mask\";\n";
+    // Animation curves, one per channel.
+    let channels: [(&str, &str, &str, Box<dyn Fn(usize) -> f64>); 6] = [
+        (
+            "translateX",
+            "tx",
+            "animCurveTL",
+            Box::new(|i| fr[i].pos[0]),
+        ),
+        (
+            "translateY",
+            "ty",
+            "animCurveTL",
+            Box::new(|i| fr[i].pos[1]),
+        ),
+        (
+            "translateZ",
+            "tz",
+            "animCurveTL",
+            Box::new(|i| fr[i].pos[2]),
+        ),
+        ("rotateX", "rx", "animCurveTA", Box::new(|i| rots[i][0])),
+        ("rotateY", "ry", "animCurveTA", Box::new(|i| rots[i][1])),
+        ("rotateZ", "rz", "animCurveTA", Box::new(|i| rots[i][2])),
+    ];
+    if fr.len() > 1 {
+        for (long, short, kind, val) in &channels {
+            let node = format!("{cam}_{long}");
+            out += &format!("createNode {kind} -n \"{node}\";\n");
+            out += "\tsetAttr \".tan\" 18;\n";
+            out += "\tsetAttr \".wgt\" no;\n";
+            out += &format!("\tsetAttr -s {} \".ktv[0:{}]\" ", fr.len(), fr.len() - 1);
+            for (i, x) in fr.iter().enumerate() {
+                out += &format!(" {} {}", x.number, r5(val(i)));
+            }
+            out += ";\n";
+            let _ = short;
+        }
+    }
+    // Solved points as locators.
+    for (i, p) in points(s, 3.0).iter().take(5000).enumerate() {
+        let n = format!("trackPoint{}", i + 1);
+        out += &format!("createNode transform -n \"{n}\";\n");
+        out += &format!(
+            "\tsetAttr \".t\" -type \"double3\" {} {} {} ;\n",
+            r5(p[0]),
+            r5(p[1]),
+            r5(p[2])
+        );
+        out += &format!("createNode locator -n \"{n}Shape\" -p \"{n}\";\n");
+        out += "\tsetAttr -k off \".v\";\n";
+    }
+    if fr.len() > 1 {
+        for (long, short, _, _) in &channels {
+            out += &format!("connectAttr \"{cam}_{long}.o\" \"{cam}.{short}\";\n");
+        }
+    }
+    out += &format!(
+        "playbackOptions -min {} -max {} -ast {} -aet {};\n",
+        fr.first().map_or(0, |x| x.number),
+        fr.last().map_or(0, |x| x.number),
+        fr.first().map_or(0, |x| x.number),
+        fr.last().map_or(0, |x| x.number)
+    );
+    out += &format!("// End of {cam}.ma\n");
     out
 }
 
