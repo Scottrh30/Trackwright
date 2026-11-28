@@ -99,12 +99,14 @@ jobs:
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
+          # The official NuGet package carries the Windows x64 library.
           $v = "1.22.0"
-          Invoke-WebRequest "https://github.com/microsoft/onnxruntime/releases/download/v$v/onnxruntime-win-x64-$v.zip" -OutFile ort.zip
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$v" -OutFile ort.zip
           Expand-Archive ort.zip -DestinationPath ort-x -Force
           New-Item -ItemType Directory -Force src-tauri/ort | Out-Null
-          Get-ChildItem ort-x -Recurse -Include onnxruntime.dll | Select-Object -First 1 | Copy-Item -Destination src-tauri/ort/ -Force
-          Get-ChildItem ort-x -Recurse -Include LICENSE, LICENSE.txt | Select-Object -First 1 | Copy-Item -Destination src-tauri/ort/ONNXRuntime-LICENSE.txt -Force
+          Copy-Item ort-x/runtimes/win-x64/native/onnxruntime.dll src-tauri/ort/ -Force
+          $lic = Get-ChildItem ort-x -Recurse -Include LICENSE, LICENSE.txt | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName src-tauri/ort/ONNXRuntime-LICENSE.txt -Force } else { "ONNX Runtime (c) Microsoft Corporation, MIT License. https://github.com/microsoft/onnxruntime" | Set-Content src-tauri/ort/ONNXRuntime-LICENSE.txt }
           Get-ChildItem src-tauri/ort | Format-Table Name, Length
           $cfg = Get-Content src-tauri/tauri.ffmpeg.json | ConvertFrom-Json
           $cfg.bundle.resources | Add-Member -NotePropertyName "ort/onnxruntime.dll" -NotePropertyValue "onnxruntime.dll"
