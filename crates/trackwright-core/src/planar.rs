@@ -495,6 +495,93 @@ fn fill_meshes(layer: &mut Layer, start: usize, reached: usize) {
     }
 }
 
+/// AI assist: ask the AI point tracker where the surface goes over the next frames
+/// (up to a window of 16 from `from`), as ref -> frame transforms. A crop around the
+/// surface, a few times its size, is what the tracker sees.
+fn ai_window<S: FrameSource>(
+    source: &mut S,
+    layer: &Layer,
+    levels: usize,
+    from: usize,
+    h_from: &Mat3,
+    step: isize,
+    end: usize,
+) -> Option<BTreeMap<usize, Mat3>> {
+    let tracker = crate::ai::point_tracker()?;
+    let (w, h) = tracker.frame_size();
+    let first = source.pyramid(from, levels).ok()?;
+    let (fw, fh) = (first.width() as f64, first.height() as f64);
+    let c = layer.surface.map(|p| apply(h_from, p));
+    let b = crate::shape::bbox(&c)?;
+    let (cx, cy) = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
+    let aspect = w as f64 / h as f64;
+    let mut cw = (3.5 * (b[2] - b[0]).max((b[3] - b[1]) * aspect)).max(w as f64);
+    let mut ch = cw / aspect;
+    if cw > fw {
+        cw = fw;
+        ch = cw / aspect;
+    }
+    if ch > fh {
+        ch = fh;
+        cw = ch * aspect;
+    }
+    let x0 = (cx - cw * 0.5).clamp(0.0, (fw - cw).max(0.0));
+    let y0 = (cy - ch * 0.5).clamp(0.0, (fh - ch).max(0.0));
+    let k = cw / w as f64;
+    // The pyramid level closest to the crop's scale, then bilinear.
+    let lvl = (k.log2().floor().max(0.0) as usize).min(first.levels.len() - 1);
+    let crop = |p: &Pyramid| -> Vec<f32> {
+        let img = &p.levels[lvl.min(p.levels.len() - 1)];
+        let s = (1u32 << lvl) as f64;
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let fx = x0 + (x as f64 + 0.5) * k - 0.5;
+                let fy = y0 + (y as f64 + 0.5) * k - 0.5;
+                out.push(img.sample(((fx + 0.5) / s - 0.5) as f32, ((fy + 0.5) / s - 0.5) as f32));
+            }
+        }
+        out
+    };
+    let mut frames_idx = vec![from];
+    let mut f = from;
+    while frames_idx.len() < 16 && f != end {
+        f = (f as isize + step) as usize;
+        frames_idx.push(f);
+    }
+    let mut frames = vec![crop(&first)];
+    for &f in &frames_idx[1..] {
+        let p = source.pyramid(f, levels).ok()?;
+        frames.push(crop(&p));
+    }
+    // Points over the surface (a 5 x 5 grid), in crop pixels.
+    let pts: Vec<Point> = crate::mesh::grid(&layer.surface, 4)
+        .iter()
+        .map(|p| apply(h_from, *p))
+        .collect();
+    let q: Vec<Point> = pts
+        .iter()
+        .map(|p| [(p[0] - x0) / k, (p[1] - y0) / k])
+        .collect();
+    let tracks = tracker.track(&frames, &q).ok()?;
+    let model = if layer.settings.model == MotionModel::Translation {
+        MotionModel::Translation
+    } else {
+        layer.settings.model
+    };
+    let mut out = BTreeMap::new();
+    for (j, &f) in frames_idx.iter().enumerate().skip(1) {
+        let dst: Vec<Point> = tracks
+            .get(j)?
+            .iter()
+            .map(|(p, _)| [x0 + p[0] * k, y0 + p[1] * k])
+            .collect();
+        let fit = ransac(model, &pts, &dst, (2.0 * k).max(2.0), 0xA1 + f as u64)?;
+        out.insert(f, mul(&fit.model, h_from));
+    }
+    Some(out)
+}
+
 /// The pupil inside an eye layer's outline on frame `f` (when the layer asks for it).
 fn pupil_at(layer: &Layer, pyr: &Pyramid, h: &Mat3, f: usize) -> Option<[f64; 3]> {
     if !layer.settings.find_pupil {
@@ -1507,6 +1594,10 @@ fn bridge<S: FrameSource>(
     let mut last_shift: Option<Point> = None;
     // The least it has looked like itself while hidden (at the best spot found).
     let mut hidden_low = f64::INFINITY;
+    // AI assist: where the AI point tracker says the hidden surface is, a window of
+    // frames at a time.
+    let mut ai_pred: BTreeMap<usize, Mat3> = BTreeMap::new();
+    let mut ai_on = s.ai_assist && crate::ai::point_tracker().is_some();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Ok(Bridged::Cancelled);
@@ -1525,41 +1616,53 @@ fn bridge<S: FrameSource>(
                 anchor_corners[i][1] + vel[i][1] * damp_sum * step as f64,
             ]
         });
-        let h_pred = match context_motion(
-            layer,
-            &prev_pyr,
-            &g_pyr,
-            prev,
-            &h_prev,
-            &ctx_vel,
-            exclude,
-            seed_base + g as u64,
-        ) {
-            Some(m) => {
-                ctx_vel = m;
-                // Only the kinds of motion the layer allows: a translation-only layer just
-                // moves with the surroundings, it doesn't turn or grow with them.
-                let m = if s.model == MotionModel::Translation {
-                    let c = layer.shape_ref_at(prev).transformed(&h_prev).flatten(8);
-                    let n = c.len().max(1) as f64;
-                    let o = c
-                        .iter()
-                        .fold([0.0, 0.0], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
-                    let q = apply(&m, o);
-                    [1.0, 0.0, q[0] - o[0], 0.0, 1.0, q[1] - o[1], 0.0, 0.0, 1.0]
-                } else {
-                    m
-                };
-                let h = mul(&m, &h_prev);
-                // Keep the own-motion estimate in step with where the surroundings put it.
-                let c = corners(&h, layer);
-                drift = std::array::from_fn(|i| [c[i][0] - own[i][0], c[i][1] - own[i][1]]);
-                h
+        if ai_on && !ai_pred.contains_key(&g) {
+            match ai_window(source, layer, levels, prev, &h_prev, step, end) {
+                Some(m) if !m.is_empty() => ai_pred.extend(m),
+                _ => ai_on = false,
             }
-            None => {
-                let c: [Point; 4] =
-                    std::array::from_fn(|i| [own[i][0] + drift[i][0], own[i][1] + drift[i][1]]);
-                homography_from_corners(&layer.surface, &c).unwrap_or(h_prev)
+        }
+        let h_pred = if let Some(h) = ai_pred.get(&g).copied() {
+            let c = corners(&h, layer);
+            drift = std::array::from_fn(|i| [c[i][0] - own[i][0], c[i][1] - own[i][1]]);
+            h
+        } else {
+            match context_motion(
+                layer,
+                &prev_pyr,
+                &g_pyr,
+                prev,
+                &h_prev,
+                &ctx_vel,
+                exclude,
+                seed_base + g as u64,
+            ) {
+                Some(m) => {
+                    ctx_vel = m;
+                    // Only the kinds of motion the layer allows: a translation-only layer just
+                    // moves with the surroundings, it doesn't turn or grow with them.
+                    let m = if s.model == MotionModel::Translation {
+                        let c = layer.shape_ref_at(prev).transformed(&h_prev).flatten(8);
+                        let n = c.len().max(1) as f64;
+                        let o = c
+                            .iter()
+                            .fold([0.0, 0.0], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
+                        let q = apply(&m, o);
+                        [1.0, 0.0, q[0] - o[0], 0.0, 1.0, q[1] - o[1], 0.0, 0.0, 1.0]
+                    } else {
+                        m
+                    };
+                    let h = mul(&m, &h_prev);
+                    // Keep the own-motion estimate in step with where the surroundings put it.
+                    let c = corners(&h, layer);
+                    drift = std::array::from_fn(|i| [c[i][0] - own[i][0], c[i][1] - own[i][1]]);
+                    h
+                }
+                None => {
+                    let c: [Point; 4] =
+                        std::array::from_fn(|i| [own[i][0] + drift[i][0], own[i][1] + drift[i][1]]);
+                    homography_from_corners(&layer.surface, &c).unwrap_or(h_prev)
+                }
             }
         };
         let ft = FrameTrack {
@@ -1791,7 +1894,14 @@ fn bridge<S: FrameSource>(
         if g == end {
             return Ok(Bridged::ToEnd);
         }
-        if k >= s.max_bridge_frames.max(1) {
+        // With the AI tracker the guesses stay on the surface for long covers (an eye
+        // that turned while shut and looks different now), so keep going much longer.
+        let limit = if ai_on {
+            s.max_bridge_frames.max(1) * 8
+        } else {
+            s.max_bridge_frames.max(1)
+        };
+        if k >= limit {
             // Not found again: drop the guesses rather than leave a wandering track.
             for j in 1..=k {
                 layer

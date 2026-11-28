@@ -2,6 +2,7 @@
 //!
 //! © Scott Hambach. All rights reserved. "Trackwright" is a trademark of Scott Hambach.
 
+mod ai;
 mod footage;
 mod proxy;
 
@@ -1279,6 +1280,29 @@ async fn import_learning(
     Ok(Some(learning_status_of(&store)))
 }
 
+// ---------------------------------------------------------------------------
+// AI tracker
+
+#[tauri::command]
+fn ai_status(app: AppHandle) -> ai::AiStatus {
+    ai::refresh(&app)
+}
+
+#[tauri::command]
+async fn ai_download(app: AppHandle) -> CmdResult<ai::AiStatus> {
+    tauri::async_runtime::spawn_blocking(move || ai::download(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn ai_remove(app: AppHandle, state: State<'_, AppState>) -> CmdResult<ai::AiStatus> {
+    if state.tracking.load(Ordering::SeqCst) {
+        return Err("Stop tracking first".into());
+    }
+    Ok(ai::remove(&app))
+}
+
 #[tauri::command]
 fn stop_tracking(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
@@ -2433,8 +2457,14 @@ pub fn run() {
                 render_cancel: Arc::new(AtomicBool::new(false)),
                 learning: Mutex::new(load_learning(app.handle())),
             });
+            app.manage(ai::AiState::default());
             let handle = app.handle().clone();
             std::thread::spawn(move || autosave_loop(handle));
+            // Load the AI tracker in the background if it has been downloaded.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let _ = ai::refresh(&handle);
+            });
             // `trackwright <footage or .twproj>` opens it straight away.
             if let Some(arg) = std::env::args().skip(1).find(|a| !a.starts_with('-')) {
                 let handle = app.handle().clone();
@@ -2506,6 +2536,9 @@ pub fn run() {
             reset_learning,
             export_learning,
             import_learning,
+            ai_status,
+            ai_download,
+            ai_remove,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Trackwright");

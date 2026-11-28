@@ -1,0 +1,15 @@
+[package]
+name = "trackwright-ai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AllTracker point tracking through ONNX Runtime for Trackwright"
+
+[dependencies]
+trackwright-core = { path = "../trackwright-core" }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-17"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde_json.workspace = true

@@ -71,6 +71,10 @@ pub struct TrackSettings {
     /// Find the pupil inside the tracked eye on every frame.
     #[serde(default)]
     pub find_pupil: bool,
+    /// AI assist: while the surface is covered, predict it with the AI point tracker
+    /// (when one is installed) instead of from the motion around it.
+    #[serde(default)]
+    pub ai_assist: bool,
     /// Mesh tracking: cells across the surface (0 = off, planar only).
     #[serde(default)]
     pub mesh_cells: usize,
@@ -173,6 +177,7 @@ impl Default for TrackSettings {
             target: TargetKind::General,
             rotation: RotationMode::Free,
             find_pupil: false,
+            ai_assist: false,
             mesh_cells: 0,
             mesh_stiffness: default_stiffness(),
             tuning: crate::learning::Tuning::default(),

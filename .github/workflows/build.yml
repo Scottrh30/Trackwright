@@ -20,6 +20,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p trackwright-core -p trackwright-import --release
 
+  ai-model:
+    name: AI tracker model (ai-models release)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ALLTRACKER_COMMIT: e7553135e7b361590dbccd10e2b274b024f41cd6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Already published?
+        id: check
+        run: |
+          if gh release view ai-models --json assets -q '.assets[].name' 2>/dev/null | grep -q SHA256SUMS.txt; then
+            echo "have=1" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.have != '1'
+        with:
+          python-version: "3.12"
+      - name: Export AllTracker to ONNX and publish
+        if: steps.check.outputs.have != '1'
+        run: |
+          set -e
+          python -m pip install --quiet torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --quiet einops numpy onnx
+          git clone --quiet https://github.com/aharley/alltracker.git at
+          (cd at && git checkout --quiet "$ALLTRACKER_COMMIT" && python ../tools/ai-model/patch_alltracker.py)
+          curl -sSL -o alltracker.pth https://huggingface.co/aharley/alltracker/resolve/main/alltracker.pth
+          mkdir out
+          python tools/ai-model/export_onnx.py at alltracker.pth out
+          cp at/LICENSE out/ALLTRACKER_LICENSE.txt
+          (cd out && sha256sum at_encoder.onnx at_window.onnx > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release delete ai-models -y --cleanup-tag || true
+          gh release create ai-models --prerelease --title "AI tracker model (AllTracker)" \
+            --notes "AllTracker (Harley et al., ICCV 2025; MIT licence, see ALLTRACKER_LICENSE.txt) exported to ONNX for Trackwright's AI assist. The app downloads these files when you ask it to. Built by tools/ai-model from the authors' weights at commit $ALLTRACKER_COMMIT." \
+            out/at_encoder.onnx out/at_window.onnx out/SHA256SUMS.txt out/ALLTRACKER_LICENSE.txt
+
   windows:
     name: Windows installer
     needs: test
@@ -58,6 +95,27 @@ jobs:
           # Installer-only overlay: ffmpeg.exe / ffprobe.exe go next to trackwright.exe.
           '{"bundle":{"resources":{"ffmpeg/ffmpeg.exe":"ffmpeg.exe","ffmpeg/ffprobe.exe":"ffprobe.exe","ffmpeg/FFmpeg-LICENSE.txt":"FFmpeg-LICENSE.txt"}}}' | Set-Content -Encoding ascii src-tauri/tauri.ffmpeg.json
 
+      - name: Fetch ONNX Runtime (for the optional AI tracker)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $rel = gh api repos/microsoft/onnxruntime/releases/latest | ConvertFrom-Json
+          $asset = $rel.assets | Where-Object { $_.name -match '^onnxruntime-win-x64-[0-9.]+\.zip$' } | Select-Object -First 1
+          Write-Host "ONNX Runtime $($rel.tag_name): $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile ort.zip
+          Expand-Archive ort.zip -DestinationPath ort-x -Force
+          New-Item -ItemType Directory -Force src-tauri/ort | Out-Null
+          Get-ChildItem ort-x -Recurse -Include onnxruntime.dll | Select-Object -First 1 | Copy-Item -Destination src-tauri/ort/ -Force
+          Get-ChildItem ort-x -Recurse -Include LICENSE, LICENSE.txt | Select-Object -First 1 | Copy-Item -Destination src-tauri/ort/ONNXRuntime-LICENSE.txt -Force
+          Get-ChildItem src-tauri/ort | Format-Table Name, Length
+          $cfg = Get-Content src-tauri/tauri.ffmpeg.json | ConvertFrom-Json
+          $cfg.bundle.resources | Add-Member -NotePropertyName "ort/onnxruntime.dll" -NotePropertyValue "onnxruntime.dll"
+          $cfg.bundle.resources | Add-Member -NotePropertyName "ort/ONNXRuntime-LICENSE.txt" -NotePropertyValue "ONNXRuntime-LICENSE.txt"
+          $cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding ascii src-tauri/tauri.ffmpeg.json
+          Get-Content src-tauri/tauri.ffmpeg.json
+
       - name: Build app and installers (with FFmpeg)
         run: npx --yes @tauri-apps/cli@^2 build --config "${{ github.workspace }}/src-tauri/tauri.ffmpeg.json"
 
@@ -68,6 +126,8 @@ jobs:
           Copy-Item target/release/trackwright.exe zip-staging/
           Copy-Item packaging/windows/get-ffmpeg.bat zip-staging/
           Copy-Item packaging/windows/README.txt zip-staging/
+          Copy-Item src-tauri/ort/onnxruntime.dll zip-staging/
+          Copy-Item src-tauri/ort/ONNXRuntime-LICENSE.txt zip-staging/
           Compress-Archive -Path zip-staging/* -DestinationPath Trackwright-windows.zip -Force
           Get-Item Trackwright-windows.zip | Format-List Name, Length
 

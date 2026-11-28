@@ -43,6 +43,23 @@ fn yes() -> bool {
     true
 }
 
+/// The optional AI tracker (from the backend).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+struct AiStatus {
+    runtime: bool,
+    downloaded: bool,
+    ready: bool,
+    downloading: bool,
+    message: String,
+    size_mb: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AiProgress {
+    done_mb: f64,
+    total_mb: f64,
+}
+
 /// What has been learned for one kind of target (from the backend).
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct KindStatus {
@@ -206,6 +223,7 @@ struct Ctx {
     proxy: RwSignal<ProxyInfo>,
     settings: RwSignal<AppSettings>,
     learning: RwSignal<Vec<KindStatus>>,
+    ai: RwSignal<AiStatus>,
     /// A reset waiting for its second click ("all" or a kind's id).
     learn_confirm: RwSignal<Option<String>>,
     export_format: RwSignal<ExportFormat>,
@@ -287,6 +305,7 @@ impl Ctx {
             proxy: RwSignal::new(ProxyInfo::default()),
             settings: RwSignal::new(AppSettings::default()),
             learning: RwSignal::new(vec![]),
+            ai: RwSignal::new(AiStatus::default()),
             learn_confirm: RwSignal::new(None),
             export_format: RwSignal::new(ExportFormat::Reelforge),
             modal: RwSignal::new(Modal::None),
@@ -903,6 +922,12 @@ fn App() -> impl IntoView {
         );
     });
     tauri::listen::<ProxyInfo>("proxy-progress", move |p| ctx.proxy.set(p));
+    tauri::listen::<AiProgress>("ai-progress", move |p| {
+        ctx.ai.update(|a| {
+            a.downloading = true;
+            a.message = format!("Downloading… {:.0} / {:.0} MB", p.done_mb, p.total_mb);
+        });
+    });
     tauri::listen::<RenderProgress>("render-progress", move |p| {
         ctx.render_progress.set((p.done, p.total));
         ctx.say(format!("Rendering… {} / {}", p.done, p.total), false);
@@ -945,6 +970,9 @@ fn App() -> impl IntoView {
         }
         if let Ok(l) = tauri::call::<Vec<KindStatus>>("learning_status", json!({})).await {
             ctx.learning.set(l);
+        }
+        if let Ok(a) = tauri::call::<AiStatus>("ai_status", json!({})).await {
+            ctx.ai.set(a);
         }
         if let Ok(Some(info)) =
             tauri::call::<Option<RecoveryInfo>>("recovery_info", json!({})).await
@@ -1592,6 +1620,72 @@ fn CameraSection() -> impl IntoView {
 
 /// Lens distortion: values, line calibration, and an overlay grid.
 #[component]
+fn AiSection() -> impl IntoView {
+    let ctx = expect_context::<Ctx>();
+    let download = move |_| {
+        ctx.ai.update(|a| {
+            a.downloading = true;
+            a.message = "Starting download…".into();
+        });
+        spawn_local(async move {
+            match tauri::call::<AiStatus>("ai_download", json!({})).await {
+                Ok(a) => {
+                    ctx.ai.set(a);
+                    ctx.say(
+                        "AI tracker ready: turn on AI assist in a layer's Track Settings",
+                        false,
+                    );
+                }
+                Err(e) => {
+                    ctx.say(e.clone(), true);
+                    if let Ok(a) = tauri::call::<AiStatus>("ai_status", json!({})).await {
+                        ctx.ai.set(a);
+                    }
+                }
+            }
+        });
+    };
+    let remove = move |_| {
+        spawn_local(async move {
+            match tauri::call::<AiStatus>("ai_remove", json!({})).await {
+                Ok(a) => ctx.ai.set(a),
+                Err(e) => ctx.say(e, true),
+            }
+        });
+    };
+    let refresh = move |_| {
+        spawn_local(async move {
+            if let Ok(a) = tauri::call::<AiStatus>("ai_status", json!({})).await {
+                ctx.ai.set(a);
+            }
+        });
+    };
+    view! {
+        <section>
+            <h3>"AI Tracker"</h3>
+            <p class="muted">"An AI point tracker (AllTracker) that follows a covered surface through blinks, hands and fast moves. Optional: a one-time download, then turn on AI assist per layer. Slower than normal tracking while something is covered."</p>
+            <p class:err=move || { let a = ctx.ai.get(); !a.ready && !a.downloading && a.downloaded }>{move || ctx.ai.get().message}</p>
+            <div class="row">
+                {move || {
+                    let a = ctx.ai.get();
+                    if a.ready || a.downloaded {
+                        view! { <button on:click=remove title="Delete the downloaded model">"Remove"</button> }.into_any()
+                    } else {
+                        view! {
+                            <button class="primary" disabled=move || { let a = ctx.ai.get(); a.downloading || !a.runtime } on:click=download>
+                                {move || format!("Download ({} MB)", ctx.ai.get().size_mb.max(66))}
+                            </button>
+                        }.into_any()
+                    }
+                }}
+                <button class="small" on:click=refresh title="Check again">"↻"</button>
+            </div>
+            <p class="muted">"AllTracker by Adam W. Harley et al. (ICCV 2025), MIT licence. Runs on your computer with ONNX Runtime (MIT)."</p>
+        </section>
+    }
+}
+
+#[component]
 fn LearningSection() -> impl IntoView {
     let ctx = expect_context::<Ctx>();
     let toggle = move |which: &'static str| {
@@ -2156,6 +2250,10 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                 </select>
             </label>
             {(s.mesh_cells > 0).then(|| num("Mesh stiffness", s.mesh_stiffness.to_string(), "0.1", |l, v| l.settings.mesh_stiffness = v.clamp(0.0, 10.0)))}
+            <label class="toggle" title=move || if ctx.ai.get().ready { "While the surface is covered, follow it with the AI point tracker instead of the motion around it. Slower, but steadier through long covers and fast moves".to_string() } else { "Download the AI tracker first (right panel › AI Tracker)".to_string() }>
+                <input type="checkbox" prop:checked=s.ai_assist disabled=move || !ctx.ai.get().ready && !s.ai_assist on:change=move |_| ctx.edit_layer(|l| l.settings.ai_assist = !l.settings.ai_assist) />
+                "AI assist through covers"
+            </label>
             {(s.target == TargetKind::Eye).then(|| view! {
                 <label class="toggle" title="Find the pupil inside the tracked eye on every frame (green ring). Exported with the track">
                     <input type="checkbox" prop:checked=s.find_pupil on:change=move |_| ctx.edit_layer(|l| l.settings.find_pupil = !l.settings.find_pupil) />
@@ -2553,6 +2651,7 @@ fn RightPanel() -> impl IntoView {
             <LensSection/>
 
             <LearningSection/>
+            <AiSection/>
 
             <section>
                 <h3>"App Folders"</h3>

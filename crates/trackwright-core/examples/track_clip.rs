@@ -50,7 +50,7 @@ impl FrameSource for Folder {
     }
 }
 
-fn main() {
+pub fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 5 {
         eprintln!(
@@ -125,6 +125,7 @@ fn main() {
                 }
             }
             "pupil" => s.find_pupil = v == "1",
+            "ai" => s.ai_assist = v == "1",
             "mesh" => s.mesh_cells = v.parse().unwrap(),
             "use" => use_store = Some(v.to_string()),
             "approve" => approve = Some(v.to_string()),

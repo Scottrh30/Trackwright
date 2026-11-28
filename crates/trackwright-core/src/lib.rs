@@ -2,6 +2,7 @@
 //!
 //! © Scott Hambach. All rights reserved.
 
+pub mod ai;
 pub mod alembic;
 pub mod camera_export;
 pub mod epipolar;
