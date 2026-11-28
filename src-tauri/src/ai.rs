@@ -105,9 +105,18 @@ struct Progress {
 }
 
 fn fetch(url: &str) -> Result<ureq::Response, String> {
-    ureq::get(url)
+    // Honour HTTPS_PROXY / HTTP_PROXY like other apps on the machine.
+    ureq::AgentBuilder::new()
+        .try_proxy_from_env(true)
+        .build()
+        .get(url)
         .call()
         .map_err(|e| format!("Download failed ({url}): {e}"))
+}
+
+/// Where the model is published (TW_AI_URL overrides it, for testing).
+fn release_url() -> String {
+    std::env::var("TW_AI_URL").unwrap_or_else(|_| RELEASE.to_string())
 }
 
 /// Download the model files (checked against the release's SHA256SUMS), then load.
@@ -124,7 +133,7 @@ pub fn download(app: &AppHandle) -> Result<AiStatus, String> {
         let dir = model_dir(app).ok_or("No app data folder")?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut sums = String::new();
-        fetch(&format!("{RELEASE}/SHA256SUMS.txt"))?
+        fetch(&format!("{}/SHA256SUMS.txt", release_url()))?
             .into_reader()
             .take(64 * 1024)
             .read_to_string(&mut sums)
@@ -142,7 +151,7 @@ pub fn download(app: &AppHandle) -> Result<AiStatus, String> {
                 want(name).ok_or(format!("{name} is not in the release's checksum list"))?;
             let tmp = dir.join(format!("{name}.part"));
             let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-            let mut r = fetch(&format!("{RELEASE}/{name}"))?.into_reader();
+            let mut r = fetch(&format!("{}/{name}", release_url()))?.into_reader();
             let mut hasher = Sha256::new();
             let mut buf = vec![0u8; 1 << 20];
             let mut last = std::time::Instant::now();
