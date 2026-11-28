@@ -25,13 +25,15 @@ pub enum ExportFormat {
     SilhouetteShake,
     /// Animated mask (roto shape per frame) for Reelforge.
     ReelforgeMask,
+    /// HitFilm composite shot: a plane with a Quad Warp corner pin keyed per frame.
+    HitFilm,
     /// Generic Trackwright JSON.
     Json,
     Csv,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 11] = [
+    pub const ALL: [ExportFormat; 12] = [
         ExportFormat::Reelforge,
         ExportFormat::Forma3d,
         ExportFormat::Tidefire,
@@ -40,6 +42,7 @@ impl ExportFormat {
         ExportFormat::FusionCornerPin,
         ExportFormat::Blender,
         ExportFormat::SilhouetteShake,
+        ExportFormat::HitFilm,
         ExportFormat::ReelforgeMask,
         ExportFormat::Json,
         ExportFormat::Csv,
@@ -55,6 +58,7 @@ impl ExportFormat {
             ExportFormat::FusionCornerPin => "Fusion / DaVinci Resolve CornerPositioner (.setting)",
             ExportFormat::Blender => "Blender plane-track script (.py)",
             ExportFormat::SilhouetteShake => "Silhouette / Shake 4-point tracker (.txt)",
+            ExportFormat::HitFilm => "HitFilm composite shot, Quad Warp corner pin (.hfcs)",
             ExportFormat::ReelforgeMask => "Reelforge animated mask (.rfmask.json)",
             ExportFormat::Json => "Trackwright JSON (.json)",
             ExportFormat::Csv => "CSV corners (.csv)",
@@ -71,6 +75,7 @@ impl ExportFormat {
             ExportFormat::FusionCornerPin => "setting",
             ExportFormat::Blender => "py",
             ExportFormat::SilhouetteShake => "shake.txt",
+            ExportFormat::HitFilm => "hfcs",
             ExportFormat::ReelforgeMask => "rfmask.json",
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
@@ -139,6 +144,7 @@ pub fn export(format: ExportFormat, footage: &Footage, layer: &Layer) -> String 
         ExportFormat::FusionCornerPin => fusion(footage, layer),
         ExportFormat::Blender => blender(footage, layer),
         ExportFormat::SilhouetteShake => shake_trackers(footage, layer),
+        ExportFormat::HitFilm => hitfilm(footage, layer),
         ExportFormat::ReelforgeMask => reelforge_mask(footage, layer),
         ExportFormat::Json => generic_json(footage, layer),
         ExportFormat::Csv => csv(footage, layer),
@@ -549,4 +555,191 @@ fn reelforge_mask(f: &Footage, l: &Layer) -> String {
         "frames": frames,
     }))
     .unwrap()
+}
+
+/// A GUID-shaped id, stable for the same seed text (HitFilm only needs them unique
+/// within the file).
+fn guid(seed: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut b = [0u8; 16];
+    for (i, byte) in seed.bytes().chain(std::iter::repeat_n(0u8, 16)).enumerate() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+        b[i % 16] ^= (h >> 24) as u8;
+        if i > seed.len() + 16 {
+            break;
+        }
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let x: String = b.iter().map(|v| format!("{v:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &x[0..8], &x[8..12], &x[12..16], &x[16..20], &x[20..32])
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Layer settings HitFilm writes for a plane (lighting, shadows, materials), copied
+/// from a composite shot saved by HitFilm Pro.
+const HITFILM_LAYER_DEFAULTS: &str = r#"<Prop CanInterpT="1" Type="1" Spatial="0"><Name>aoSampleRadius</Name><Default V="4"><i>15</i></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>castShadowsIfLayerDisabled</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>audioLevel</Name><Default V="4"><fl>0</fl></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>receiveReflections</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="1" Type="1" Spatial="0"><Name>speed</Name><Default V="4"><db>1</db></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>receiveShadows</Name><Default V="4"><b>1</b></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>billboardedLights</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>shadowColor</Name><Default V="4"><cl G="0" B="0" R="0" A="1"/></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>castAmbientOcclusion</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>castShadows</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>billboardedShadows</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>receiveAmbientOcclusion</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>matAmbient</Name><Default V="4"><fl>100</fl></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>matDiffuse</Name><Default V="4"><fl>50</fl></Default></Prop><Prop CanInterpT="1" Type="1" Spatial="0"><Name>aoDepthFallOff</Name><Default V="4"><fl>10</fl></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>matSpecular</Name><Default V="4"><fl>50</fl></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>matShininess</Name><Default V="4"><fl>100</fl></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>matEmissiveColor</Name><Default V="4"><cl G="0" B="0" R="0" A="1"/></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>castReflections</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="1" Type="1" Spatial="0"><Name>aoDepthScale</Name><Default V="4"><fl>10</fl></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>castReflectionsIfLayerDisabled</Name><Default V="4"><b>0</b></Default></Prop><Prop CanInterpT="1" Type="0" Spatial="0"><Name>specularReflectivity</Name><Default V="4"><fl>100</fl></Default></Prop><Prop CanInterpT="1" Type="1" Spatial="0"><Name>aoSamples</Name><Default V="4"><i>4</i></Default></Prop><Prop CanInterpT="1" Type="1" Spatial="0"><Name>aoIntensity</Name><Default V="4"><fl>50</fl></Default></Prop><Prop CanInterpT="1" Type="1" Spatial="0"><Name>aoBias</Name><Default V="4"><fl>0.01</fl></Default></Prop><Prop CanInterpT="1" Type="1" Spatial="0"><Name>aoBlurRadius</Name><Default V="4"><i>5</i></Default></Prop>"#;
+
+/// The message slots HitFilm keeps on every effect.
+const HITFILM_EFFECT_MESSAGES: &str = r#"<Prop CanInterpT="0" Type="1" Spatial="0"><Name>HF_Persistant_Message_Error</Name><Default V="4"><st></st></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>HF_Persistant_Message_Warning</Name><Default V="4"><st></st></Default></Prop><Prop CanInterpT="0" Type="1" Spatial="0"><Name>HF_Persistant_Message_Info</Name><Default V="4"><st></st></Default></Prop>"#;
+
+/// HitFilm composite shot (.hfcs), the format HitFilm's Import › Composite Shot
+/// reads (and Mocha HitFilm writes): a composite shot the size and frame rate of the
+/// footage holding a plane with HitFilm's Quad Warp (corner pin) effect, its four
+/// corners keyed on every tracked frame. Layout taken from a file saved by HitFilm
+/// Pro 2025 (18.0): key times are milliseconds from the start of the shot, corner
+/// positions are layer pixels from the centre with Y up.
+fn hitfilm(f: &Footage, l: &Layer) -> String {
+    let fps = if f.fps > 0.0 { f.fps } else { 24.0 };
+    let (w, h) = (f.width.max(1) as f64, f.height.max(1) as f64);
+    let frames_total = f.frames.len().max(1);
+    let name = xml_escape(&l.name);
+    let seed = format!("{}#{}#{}", f.source, l.id, l.name);
+    let (asset_id, comp_id, layer_id, effect_id, view_id) = (
+        guid(&format!("{seed}/asset")),
+        guid(&format!("{seed}/comp")),
+        guid(&format!("{seed}/layer")),
+        guid(&format!("{seed}/effect")),
+        guid(&format!("{seed}/view")),
+    );
+    let fr = frames(l);
+    // Pixels (origin top-left, y down) -> HitFilm layer space (origin centre, y up).
+    let hf = |p: Point| [r4(p[0] - w / 2.0), r4(h / 2.0 - p[1])];
+    let num = |v: f64| {
+        if v == v.trunc() && v.abs() < 1e15 {
+            format!("{}", v as i64)
+        } else {
+            format!("{v}")
+        }
+    };
+    let ms = |i: usize| ((i as f64) / fps * 1000.0).round() as i64;
+    let corner_prop = |prop: &str, corner: usize, default: Point| -> String {
+        let d = hf(default);
+        let mut o = format!(
+            "<Prop CanInterpT=\"1\" Type=\"0\" Spatial=\"0\"><Name>{prop}</Name><Default V=\"4\"><p2 X=\"{}\" Y=\"{}\"/></Default><Static V=\"4\"><p2 X=\"{}\" Y=\"{}\"/></Static><Animation>",
+            num(d[0]), num(d[1]), num(d[0]), num(d[1])
+        );
+        for (i, c, ..) in &fr {
+            let p = hf(c[corner]);
+            o += &format!(
+                "<Key Ti=\"{}\" V=\"5\" Tp=\"1\" STp=\"2\"><TLk>0</TLk><SLk>0</SLk><Vl V=\"4\"><p2 X=\"{}\" Y=\"{}\"/></Vl></Key>",
+                ms(*i),
+                num(p[0]),
+                num(p[1])
+            );
+        }
+        o += "</Animation></Prop>";
+        o
+    };
+    let use_layer = |prop: &str| {
+        format!("<Prop CanInterpT=\"0\" Type=\"1\" Spatial=\"0\"><Name>{prop}</Name><Default V=\"4\"><id>00000000-0000-0000-0000-000000000000</id></Default></Prop>")
+    };
+    // The plane's own corners: the whole frame.
+    let full = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    let mut quad = String::new();
+    quad += &use_layer("topLeftUseLayer");
+    quad += &corner_prop("topLeftPoint", 0, full[0]);
+    quad += "<Prop CanInterpT=\"1\" Type=\"1\" Spatial=\"0\"><Name>pluginPreset</Name><Default V=\"4\"><i>0</i></Default></Prop>";
+    quad += &corner_prop("topRightPoint", 1, full[1]);
+    quad += &use_layer("topRightUseLayer");
+    quad += HITFILM_EFFECT_MESSAGES;
+    quad += &corner_prop("bottomLeftPoint", 3, full[3]);
+    quad += &use_layer("bottomLeftUseLayer");
+    quad += &corner_prop("bottomRightPoint", 2, full[2]);
+    quad += &use_layer("bottomRightUseLayer");
+    quad += "<Prop CanInterpT=\"0\" Type=\"0\" Spatial=\"0\"><Name>isPerspective</Name><Default V=\"4\"><b>1</b></Default></Prop>";
+    quad += "<Prop CanInterpT=\"0\" Type=\"0\" Spatial=\"0\"><Name>flipOrder</Name><Default V=\"4\"><b>0</b></Default></Prop>";
+    let ui = ["topLeftUseLayer", "topLeftPoint", "topRightPoint", "topRightUseLayer", "bottomLeftPoint", "bottomLeftUseLayer", "bottomRightPoint", "bottomRightUseLayer", "isPerspective", "flipOrder"]
+        .iter()
+        .map(|n| format!("<Property vis=\"1\" name=\"{n}\"/>"))
+        .collect::<String>();
+    let fl = |n: &str, v: &str| format!("<Prop CanInterpT=\"1\" Type=\"0\" Spatial=\"0\"><Name>{n}</Name><Default V=\"4\"><fl>{v}</fl></Default></Prop>");
+    let b1 = |n: &str, v: u8| format!("<Prop CanInterpT=\"0\" Type=\"1\" Spatial=\"0\"><Name>{n}</Name><Default V=\"4\"><b>{v}</b></Default></Prop>");
+    let layer_props = [
+        fl("rotationY", "0"),
+        "<Prop CanInterpT=\"1\" Type=\"0\" Spatial=\"1\"><Name>anchorPoint</Name><Default V=\"4\"><p3 X=\"0\" Z=\"0\" Y=\"0\"/></Default></Prop>".to_string(),
+        "<Prop CanInterpT=\"1\" Type=\"0\" Spatial=\"1\"><Name>position</Name><Default V=\"4\"><p3 X=\"0\" Z=\"0\" Y=\"0\"/></Default></Prop>".to_string(),
+        b1("illuminated", 1),
+        "<Prop CanInterpT=\"1\" Type=\"0\" Spatial=\"1\"><Name>orientation</Name><Default V=\"4\"><or X=\"0\" Z=\"0\" Y=\"0\"/></Default></Prop>".to_string(),
+        "<Prop CanInterpT=\"1\" Type=\"0\" Spatial=\"0\"><Name>scale</Name><Default V=\"4\"><sc X=\"100\" Z=\"100\" Y=\"100\"/></Default></Prop>".to_string(),
+        b1("scaleLinked", 1),
+        fl("rotationX", "0"),
+        fl("rotationZ", "0"),
+        fl("opacity", "100"),
+        // The rest of a plane's settings, as HitFilm writes them.
+        HITFILM_LAYER_DEFAULTS.to_string(),
+    ]
+    .concat();
+    let end = frames_total.saturating_sub(1).max(1);
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out += "<BiffCompositeShot AppVersion=\"18.0.12110.52955\" AppEdition=\"2000\" Version=\"1\">";
+    out += &format!(
+        "<Assets><SolidAsset Version=\"1\"><ID>{asset_id}</ID><Name>{name} plane</Name><Color G=\"0.5\" B=\"0.9\" R=\"0.3\" A=\"1\"/><Width>{}</Width><Height>{}</Height><PAR>0</PAR><ParentFolderID>00000000-0000-0000-0000-000000000000</ParentFolderID><IsHidden>0</IsHidden><Instances><Instance ID=\"{layer_id}\" Type=\"2\" CompID=\"{comp_id}\"/></Instances></SolidAsset></Assets>",
+        f.width, f.height
+    );
+    out += &format!(
+        "<CompositionAsset Version=\"19\"><ID>{comp_id}</ID><Name>{name} (Trackwright)</Name><ParentFolderID>00000000-0000-0000-0000-000000000000</ParentFolderID><IsHidden>0</IsHidden><CTI>0</CTI><InPoint>0</InPoint><OutPoint>{end}</OutPoint><TimelineZoom>0</TimelineZoom><SplitterPosition>440</SplitterPosition><TimelineTimeFormat>1000</TimelineTimeFormat><TimelineSnapMode>1000</TimelineSnapMode><IsPrimary>0</IsPrimary>"
+    );
+    out += &format!(
+        "<AudioVideoSettings Version=\"1\"><FrameCount>{frames_total}</FrameCount><AudioSampleRate>48000</AudioSampleRate><Width>{}</Width><Height>{}</Height><PAR>0</PAR><PARCustom>1</PARCustom><FrameRate>{}</FrameRate></AudioVideoSettings>",
+        f.width, f.height, num(r4(fps))
+    );
+    out += "<RenderSettings Version=\"2\"><FogEnabled>0</FogEnabled><FogNearDistance>900</FogNearDistance><FogFarDistance>2000</FogFarDistance><FogDensity>1</FogDensity><FogColor G=\"0\" B=\"0\" R=\"0\" A=\"1\"/><FogFalloff>0</FogFalloff><MotionBlurEnabled>1</MotionBlurEnabled><ShutterAngle>180</ShutterAngle><ShutterPhase>-90</ShutterPhase><MaxNumOfSamples>20</MaxNumOfSamples><UseAdaptiveSamples>1</UseAdaptiveSamples></RenderSettings>";
+    out += &format!(
+        "<Layers><AssetLayer Version=\"17\"><AssetID>{asset_id}</AssetID><AssetInstanceStart>0</AssetInstanceStart><AssetHasAudio>0</AssetHasAudio><AssetHasVideo>1</AssetHasVideo><AssetHadAudio>0</AssetHadAudio><AssetHadVideo>1</AssetHadVideo><AssetType>2</AssetType><Dimensions>0</Dimensions><AutoOrient>0</AutoOrient><AutoOrientPathAxis>1</AutoOrientPathAxis><AutoOrientLayer>00000000-0000-0000-0000-000000000000</AutoOrientLayer><PromoteLights>0</PromoteLights><IncludeInDepthMap>1</IncludeInDepthMap><WaveformIsVisible>0</WaveformIsVisible><UseProxyMedia>1</UseProxyMedia><Trackers/>"
+    );
+    out += &format!(
+        "<Effects><Instance Version=\"8\"><ID>{effect_id}</ID><Name></Name><PluginID>65e96f64-7f4a-4141-a02a-76eb1fb42996</PluginID><PluginName>Quad Warp</PluginName><PluginVersion Mi=\"2\" Bu=\"0\" Re=\"0\" Ma=\"2\"/><ParentID>{layer_id}</ParentID><ParentTimelineID>{comp_id}</ParentTimelineID><Enabled>1</Enabled><CreatedInComp>1</CreatedInComp><InitializedUIState>1</InitializedUIState><ParentLayerLastSize X=\"{}\" Y=\"{}\"/><PropertyManager Version=\"7\">{quad}</PropertyManager><UIState>{ui}</UIState></Instance></Effects><Masks/>",
+        f.width, f.height
+    );
+    out += &format!(
+        "<LayerBase Version=\"2\"><ID>{layer_id}</ID><Name>{name}</Name><CompID>{comp_id}</CompID><ParentLayerID>00000000-0000-0000-0000-000000000000</ParentLayerID><StartFrame>0</StartFrame><EndFrame>{end}</EndFrame><BlendMode>0</BlendMode><Visible>1</Visible><Muted>0</Muted><Locked>0</Locked><MotionBlurOn>0</MotionBlurOn><Label>-1</Label><BehaviorEffects/><PropertyManager Version=\"7\">{layer_props}</PropertyManager></LayerBase></AssetLayer></Layers><Instances/>"
+    );
+    out += &format!(
+        "<ViewerState Version=\"5\"><CurrentLayout>0</CurrentLayout><Layout0 Pos0=\"{view_id}\"/><Layout1/><Layout2 Sp1=\"0\" Sp0=\"0.5\" Sp2=\"0\"/><Layout3 Sp1=\"0\" Sp0=\"0.5\" Sp2=\"0.5\"/><Layout4 Sp1=\"0.5\" Sp0=\"0.5\" Sp2=\"0.5\"/><Views><State Active=\"1\" TextureScale=\"0.5\" ID=\"{view_id}\" CameraScale=\"1\" Type=\"0\" Layout=\"0\"><TexturePosition X=\"0\" Y=\"0\"/><TextureAnchorPoint X=\"0\" Y=\"0\"/><CameraPosition X=\"0\" Z=\"0\" Y=\"0\"/><CameraRotation X=\"0\" Z=\"0\" Y=\"0\"/><Options Gz=\"0\" TrPa=\"1\" Ch=\"0\" Vol=\"1\" BiTo=\"1\" TrCb=\"0\" MoPa=\"1\" WoAx=\"1\"><BGColor G=\"0\" B=\"0\" R=\"0\" A=\"1\"/></Options></State></Views></ViewerState>"
+    );
+    out += "<CompositionTemplate Version=\"1\"><IsEditable>1</IsEditable></CompositionTemplate><TemplateParent>00000000-0000-0000-0000-000000000000</TemplateParent></CompositionAsset></BiffCompositeShot>";
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::FrameTrack;
+    use crate::shape::Shape;
+
+    #[test]
+    fn hitfilm_composite_shot_matches_hitfilms_layout() {
+        let footage = Footage {
+            source: "/tmp/shot.mp4".into(),
+            frames: vec![String::new(); 30],
+            width: 2732,
+            height: 1440,
+            fps: 25.0,
+            first_frame: 0,
+        };
+        let mut l = Layer::new(1, 0, Shape::rect(100.0, 100.0, 200.0, 100.0));
+        l.name = "Screen <1>".into();
+        l.surface = [[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]];
+        let mut t = FrameTrack::reference();
+        t.keyframe = false;
+        t.h_from_ref = [1.0, 0.0, 10.0, 0.0, 1.0, -5.0, 0.0, 0.0, 1.0];
+        l.tracks.insert(10, t);
+        let x = export(ExportFormat::HitFilm, &footage, &l);
+        // Frame 10 at 25 fps is 400 ms; top left (110, 95) is (-1256, 625) from the
+        // centre with y up.
+        assert!(x.contains(r#"<Key Ti="400" V="5" Tp="1" STp="2"><TLk>0</TLk><SLk>0</SLk><Vl V="4"><p2 X="-1256" Y="625"/></Vl></Key>"#), "{x}");
+        assert!(x.contains("<PluginName>Quad Warp</PluginName>"));
+        assert!(x.contains("Screen &lt;1&gt;"));
+        assert!(x.starts_with("<?xml"));
+        std::fs::write("/tmp/tw_test.hfcs", &x).unwrap();
+    }
 }

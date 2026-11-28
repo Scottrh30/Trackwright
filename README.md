@@ -60,6 +60,7 @@ Built in Rust with Tauri 2 and a Leptos UI.
 | Fusion / DaVinci Resolve CornerPositioner `.setting` | copy the contents and paste into the Fusion node view (Fusion page in Resolve). Points are normalised; time starts at 0 |
 | Blender plane-track script `.py` | run in Blender's Text Editor: loads the footage as a Movie Clip, adds four corner tracks and a plane track |
 | Silhouette / Shake 4-point tracker `.shake.txt` | Silhouette: import as Shake trackers (it also reads the AE corner pin and Nuke exports). Trackers are numbered TL, TR, BR, BL |
+| HitFilm composite shot `.hfcs` | HitFilm: File › Import › Composite Shot (or right-click the Media panel › Import › Composite Shot). You get a composite shot the size and frame rate of your footage holding a plane with a **Quad Warp** effect, its four corners keyed on every tracked frame. Drag your footage into the shot under the plane, then swap the plane for your insert (or copy the Quad Warp effect onto your insert layer). The layout matches a file saved by HitFilm Pro 2025 |
 | Trackwright JSON / CSV | everything / spreadsheet |
 
 "Send to Reelforge / Forma3D / Tidefire" writes into each app's import folder (default `Documents/<App>/Imports/Tracks`, change it in **App Folders**).
