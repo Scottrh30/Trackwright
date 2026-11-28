@@ -129,22 +129,23 @@ pub fn composite_insert(frame: &mut Rgba, insert: &Rgba, corners: &[Point; 4], o
 
 /// Composite `insert` over `frame` warped by a tracked mesh: `uv` are the grid's
 /// vertices in insert pixels, `pts` the same vertices on this frame (row by row, an
-/// `n` x `n` cell grid). Each grid triangle is mapped on its own, so the insert bends
+/// `cols` x `rows` cell grid). Each grid triangle is mapped on its own, so the insert bends
 /// with the surface.
 pub fn composite_insert_mesh(
     frame: &mut Rgba,
     insert: &Rgba,
-    n: usize,
+    cols: usize,
+    rows: usize,
     uv: &[Point],
     pts: &[Point],
     opacity: f64,
 ) {
-    if uv.len() != pts.len() || pts.len() != (n + 1) * (n + 1) {
+    if uv.len() != pts.len() || pts.len() != (cols + 1) * (rows + 1) {
         return;
     }
     let op = opacity.clamp(0.0, 1.0) as f32;
     let (fw, fh) = (frame.width, frame.height);
-    for t in crate::mesh::triangles(n) {
+    for t in crate::mesh::triangles(cols, rows) {
         let (a, b, c) = (pts[t[0]], pts[t[1]], pts[t[2]]);
         let det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
         if det.abs() < 1e-9 {
@@ -388,9 +389,9 @@ mod tests {
         let mut a = black();
         composite_insert(&mut a, &ins, &quad, 1.0);
         let mut b = black();
-        let uv = crate::mesh::grid(&[[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]], 4);
-        let pts = crate::mesh::grid(&quad, 4);
-        composite_insert_mesh(&mut b, &ins, 4, &uv, &pts, 1.0);
+        let uv = crate::mesh::grid(&[[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]], 4, 4);
+        let pts = crate::mesh::grid(&quad, 4, 4);
+        composite_insert_mesh(&mut b, &ins, 4, 4, &uv, &pts, 1.0);
         // Inside the quad (edge pixels are partly covered either way).
         let mut diff = 0;
         for y in 22..58 {
@@ -406,7 +407,7 @@ mod tests {
         let mut bent = pts.clone();
         bent[12][1] += 10.0;
         let mut c = black();
-        composite_insert_mesh(&mut c, &ins, 4, &uv, &bent, 1.0);
+        composite_insert_mesh(&mut c, &ins, 4, 4, &uv, &bent, 1.0);
         let at = |f: &Rgba, x: usize, y: usize| f.data[(y * 100 + x) * 4 + 1];
         // Green encodes the insert's row: lower on the frame for the same row.
         assert!(at(&c, 45, 48) < at(&b, 45, 48), "bent down");

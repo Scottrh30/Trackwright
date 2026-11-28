@@ -165,6 +165,8 @@ enum Drag {
     MoveSurface { start: Point, orig: [Point; 4] },
     AdjustCorner(usize),
     MoveAdjust { start: Point, orig: [Point; 4] },
+    /// Custom mesh: an inner grid point on the reference frame.
+    MeshPoint(usize),
 }
 
 /// Something that would throw away unsaved work.
@@ -203,6 +205,8 @@ struct Ctx {
     frame: RwSignal<usize>,
     selected: RwSignal<Option<u32>>,
     sel_point: RwSignal<Option<usize>>,
+    /// Track Settings: the mesh size is being typed in (Custom…).
+    mesh_custom: RwSignal<bool>,
     renaming: RwSignal<Option<u32>>,
     tool: RwSignal<Tool>,
     draft: RwSignal<Vec<Point>>,
@@ -285,6 +289,7 @@ impl Ctx {
             frame: RwSignal::new(0),
             selected: RwSignal::new(None),
             sel_point: RwSignal::new(None),
+            mesh_custom: RwSignal::new(false),
             renaming: RwSignal::new(None),
             tool: RwSignal::new(Tool::Pan),
             draft: RwSignal::new(vec![]),
@@ -2164,6 +2169,112 @@ fn InsertSection(layer: Layer) -> impl IntoView {
     view! { <section><h3>"Insert Preview"</h3>{body}</section> }
 }
 
+/// Mesh grids offered in Track Settings (cells across, down).
+const MESH_GRIDS: [(usize, usize); 15] = [
+    (2, 2),
+    (3, 3),
+    (4, 3),
+    (4, 4),
+    (6, 4),
+    (6, 6),
+    (8, 6),
+    (8, 8),
+    (10, 10),
+    (12, 12),
+    (16, 12),
+    (16, 16),
+    (20, 20),
+    (24, 24),
+    (32, 32),
+];
+
+/// Track Settings › Mesh: grid size (presets or typed in, 1–32 each way), and shaping
+/// the grid by hand.
+fn mesh_controls(ctx: Ctx, layer: &Layer) -> impl IntoView {
+    let s = &layer.settings;
+    let dims = layer.mesh_dims();
+    let preset = dims.is_some_and(|d| MESH_GRIDS.contains(&d));
+    let custom = dims.is_some() && (ctx.mesh_custom.get_untracked() || !preset);
+    let current = match dims {
+        None => "off".to_string(),
+        Some(_) if custom => "custom".to_string(),
+        Some((c, r)) => format!("{c}x{r}"),
+    };
+    // A new grid size starts the grid over (a hand shape is for one size).
+    let set_grid = move |c: usize, r: usize| {
+        let (c, r) = (
+            c.clamp(1, trackwright_core::mesh::MAX_CELLS),
+            r.clamp(1, trackwright_core::mesh::MAX_CELLS),
+        );
+        ctx.edit_layer(move |l| {
+            if l.mesh_dims() != Some((c, r)) {
+                l.mesh_shape = None;
+            }
+            l.settings.mesh_cells = c;
+            l.settings.mesh_rows = r;
+        });
+    };
+    let (cols, rows) = dims.unwrap_or((8, 8));
+    let shaped = layer.mesh_shape.is_some();
+    view! {
+        <label class="field" title="Mesh tracking: a grid over the surface that bends with it (faces, mouths, cloth, a curved label). Inserts and exports follow the mesh. More cells follow finer bends but need more detail in the picture">"Mesh"
+            <select on:change=move |ev| {
+                let v = event_target_value(&ev);
+                match v.as_str() {
+                    "off" => {
+                        ctx.mesh_custom.set(false);
+                        ctx.edit_layer(|l| l.settings.mesh_cells = 0);
+                    }
+                    "custom" => {
+                        ctx.mesh_custom.set(true);
+                        set_grid(cols, rows);
+                    }
+                    v => {
+                        ctx.mesh_custom.set(false);
+                        if let Some((c, r)) = v.split_once('x') {
+                            set_grid(c.parse().unwrap_or(8), r.parse().unwrap_or(8));
+                        }
+                    }
+                }
+            }>
+                <option value="off" selected=current == "off">"Off (flat plane)"</option>
+                {MESH_GRIDS.iter().map(|&(c, r)| {
+                    let id = format!("{c}x{r}");
+                    let sel = current == id;
+                    view! { <option value=id selected=sel>{format!("{c} × {r} cells")}</option> }
+                }).collect_view()}
+                <option value="custom" selected=current == "custom">"Custom…"</option>
+            </select>
+        </label>
+        {custom.then(|| view! {
+            <div class="field" title="Cells across × down, 1 to 32 each. Changing it starts the grid over">"Cells"
+                <span class="row">
+                    <input class="cells" type="number" min="1" max="32" step="1" prop:value=cols.to_string() aria-label="Cells across" on:change=move |ev| {
+                        if let Ok(c) = event_target_value(&ev).parse::<usize>() { set_grid(c, rows) }
+                    } />
+                    "×"
+                    <input class="cells" type="number" min="1" max="32" step="1" prop:value=rows.to_string() aria-label="Cells down" on:change=move |ev| {
+                        if let Ok(r) = event_target_value(&ev).parse::<usize>() { set_grid(cols, r) }
+                    } />
+                </span>
+            </div>
+        })}
+        {dims.is_some().then(|| view! {
+            <p class="hint">"Shape the grid by hand: Surface tool (S) on the reference frame, then drag the grid's inner points onto curves or creases. Re-track afterwards."</p>
+            <label class="field" title="Dragging a grid point, the points around it follow, less and less, out to this many cells (0: only the point)">"Falloff (cells)"
+                <input type="number" step="0.5" min="0" max="16" prop:value=s.mesh_falloff.to_string() on:change=move |ev| {
+                    if let Ok(v) = event_target_value(&ev).parse::<f64>() {
+                        ctx.edit_layer(move |l| l.settings.mesh_falloff = v.clamp(0.0, 16.0));
+                    }
+                } />
+            </label>
+            {shaped.then(|| view! {
+                <button title="Put the grid back to even cells" on:click=move |_| ctx.edit_layer(|l| l.mesh_shape = None)>"Reset mesh shape"</button>
+            })}
+        })}
+    }
+}
+
 #[component]
 fn TrackSettingsSection(layer: Layer) -> impl IntoView {
     let ctx = expect_context::<Ctx>();
@@ -2237,18 +2348,7 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                     }).collect_view()}
                 </select>
             </label>
-            <label class="field" title="Mesh tracking: a grid over the surface that bends with it (faces, mouths, cloth). Inserts and exports follow the mesh">"Mesh"
-                <select on:change=move |ev| {
-                    let v: usize = event_target_value(&ev).parse().unwrap_or(0);
-                    ctx.edit_layer(move |l| l.settings.mesh_cells = v);
-                }>
-                    {[0usize, 4, 6, 8, 10, 12].into_iter().map(|c| {
-                        let sel = c == s.mesh_cells;
-                        let label = if c == 0 { "Off (flat plane)".to_string() } else { format!("{c} × {c} grid") };
-                        view! { <option value=c.to_string() selected=sel>{label}</option> }
-                    }).collect_view()}
-                </select>
-            </label>
+            {mesh_controls(ctx, &layer)}
             {(s.mesh_cells > 0).then(|| num("Mesh stiffness", s.mesh_stiffness.to_string(), "0.1", |l, v| l.settings.mesh_stiffness = v.clamp(0.0, 10.0)))}
             <label class="toggle" title=move || if ctx.ai.get().ready { "While the surface is covered, follow it with the AI point tracker instead of the motion around it. Slower, but steadier through long covers and fast moves".to_string() } else { "Download the AI tracker first (right panel › AI Tracker)".to_string() }>
                 <input type="checkbox" prop:checked=s.ai_assist disabled=move || !ctx.ai.get().ready && !s.ai_assist on:change=move |_| ctx.edit_layer(|l| l.settings.ai_assist = !l.settings.ai_assist) />
@@ -2395,6 +2495,26 @@ fn Viewport() -> impl IntoView {
                         .project
                         .with_untracked(|p| p.layer(id).and_then(|l| l.surface_at(fr)));
                     let adjust = tool == Tool::Adjust;
+                    // Surface tool on the reference frame of a mesh layer: the grid's
+                    // inner points can be dragged to shape it by hand.
+                    let mesh = (!adjust)
+                        .then(|| {
+                            ctx.project.with_untracked(|p| {
+                                p.layer(id)
+                                    .filter(|l| l.ref_frame == fr)
+                                    .and_then(|l| l.mesh_grid_at(fr))
+                            })
+                        })
+                        .flatten();
+                    let mesh_hit = mesh.and_then(|(m, cols, rows)| {
+                        m.iter()
+                            .enumerate()
+                            .filter(|(k, _)| !trackwright_core::mesh::is_corner(*k, cols, rows))
+                            .map(|(k, q)| (k, dist2(v.to_screen(*q), s)))
+                            .filter(|(_, d)| *d < hit_r2)
+                            .min_by(|a, b| a.1.total_cmp(&b.1))
+                            .map(|(k, _)| k)
+                    });
                     corners.and_then(|c| {
                         if let Some(i) = c
                             .iter()
@@ -2405,6 +2525,8 @@ fn Viewport() -> impl IntoView {
                             } else {
                                 Drag::SurfaceCorner(i)
                             })
+                        } else if let Some(k) = mesh_hit {
+                            Some(Drag::MeshPoint(k))
                         } else if point_in_polygon(&c, ip) {
                             Some(if adjust {
                                 Drag::MoveAdjust { start: ip, orig: c }
@@ -2478,6 +2600,12 @@ fn Viewport() -> impl IntoView {
                     l.set_adjust_corner(fr, i, ip);
                 }
             }),
+            Drag::MeshPoint(k) => ctx.project.update(|p| {
+                if let Some(l) = p.layer_mut(id) {
+                    let falloff = l.settings.mesh_falloff;
+                    l.set_mesh_point(k, ip, falloff);
+                }
+            }),
             Drag::MoveAdjust { start, orig } => ctx.project.update(|p| {
                 if let Some(l) = p.layer_mut(id) {
                     let d = [ip[0] - start[0], ip[1] - start[1]];
@@ -2500,6 +2628,7 @@ fn Viewport() -> impl IntoView {
                 | Drag::MoveSurface { .. }
                 | Drag::AdjustCorner(_)
                 | Drag::MoveAdjust { .. }
+                | Drag::MeshPoint(_)
         ) {
             // Push the edited layer as one undo step.
             ctx.edit_layer(|_| {});

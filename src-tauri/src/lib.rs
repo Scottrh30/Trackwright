@@ -1749,40 +1749,29 @@ async fn render_layer(
                                     insert_cache = Some((path.to_string(), load_rgba(path)?));
                                 }
                                 let img = &insert_cache.as_ref().unwrap().1;
-                                let mesh = l.mesh_at(f);
-                                match (
-                                    mesh.as_ref(),
-                                    trackwright_core::mesh::grid_side(
-                                        mesh.as_ref().map_or(0, |m| m.len()),
-                                    ),
-                                ) {
+                                match l.mesh_grid_at(f) {
                                     // Mesh-tracked: the insert bends with the surface.
-                                    (Some(m), Some(n)) => {
-                                        let (iw, ih) = (img.width as f64, img.height as f64);
-                                        let rect = [[0.0, 0.0], [iw, 0.0], [iw, ih], [0.0, ih]];
-                                        if let Some(hs) =
-                                            trackwright_core::geometry::homography_from_corners(
-                                                &l.surface, &rect,
-                                            )
-                                        {
-                                            let uv: Vec<_> =
-                                                trackwright_core::mesh::grid(&l.surface, n)
-                                                    .iter()
-                                                    .map(|p| {
-                                                        trackwright_core::geometry::apply(&hs, *p)
-                                                    })
-                                                    .collect();
-                                            render::composite_insert_mesh(
-                                                &mut frame,
-                                                img,
-                                                n,
-                                                &uv,
-                                                m,
-                                                ins.opacity,
-                                            );
-                                        }
+                                    Some((m, cols, rows)) => {
+                                        // The insert spans an even grid over the
+                                        // surface (in perspective); a hand-shaped mesh
+                                        // bends it.
+                                        let uv = trackwright_core::mesh::insert_uv(
+                                            &l.surface,
+                                            cols,
+                                            rows,
+                                            [img.width as f64, img.height as f64],
+                                        );
+                                        render::composite_insert_mesh(
+                                            &mut frame,
+                                            img,
+                                            cols,
+                                            rows,
+                                            &uv,
+                                            &m,
+                                            ins.opacity,
+                                        );
                                     }
-                                    _ => render::composite_insert(
+                                    None => render::composite_insert(
                                         &mut frame,
                                         img,
                                         &corners,

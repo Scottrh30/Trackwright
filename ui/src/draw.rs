@@ -221,27 +221,18 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
             else {
                 continue;
             };
-            let mesh = layer.mesh_at(scene.frame);
-            match (
-                mesh.as_ref(),
-                trackwright_core::mesh::grid_side(mesh.as_ref().map_or(0, |m| m.len())),
-            ) {
-                (Some(m), Some(n)) => {
-                    // Mesh-tracked: the insert bends with the surface.
-                    let (sw, sh) = (
+            match layer.mesh_grid_at(scene.frame) {
+                Some((m, cols, rows)) => {
+                    // Mesh-tracked: the insert bends with the surface (and with a
+                    // hand-shaped grid).
+                    let size = [
                         ins_img.natural_width() as f64,
                         ins_img.natural_height() as f64,
-                    );
-                    let rect = [[0.0, 0.0], [sw, 0.0], [sw, sh], [0.0, sh]];
-                    if let Some(hs) = homography_from_corners(&layer.surface, &rect) {
-                        let uv: Vec<Point> = trackwright_core::mesh::grid(&layer.surface, n)
-                            .iter()
-                            .map(|p| apply(&hs, *p))
-                            .collect();
-                        draw_grid_warp(&ctx, ins_img, n, &uv, m, ins.opacity, px);
-                    }
+                    ];
+                    let uv = trackwright_core::mesh::insert_uv(&layer.surface, cols, rows, size);
+                    draw_grid_warp(&ctx, ins_img, cols, rows, &uv, &m, ins.opacity, px);
                 }
-                _ => draw_insert(&ctx, ins_img, &corners, ins.opacity, px),
+                None => draw_insert(&ctx, ins_img, &corners, ins.opacity, px),
             }
         }
     }
@@ -321,28 +312,39 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
             }
         }
 
-        // Mesh tracking: the grid as it bends; pupil: a ring and cross.
-        if let Some(t) = track {
-            if let (Some(m), true) = (
-                layer.mesh_at(scene.frame),
-                scene.overlays.surface && (selected || scene.overlays.grid),
-            ) {
-                if let Some(n) = trackwright_core::mesh::grid_side(m.len()) {
-                    ctx.set_stroke_style_str(&layer.color);
-                    ctx.set_global_alpha(0.75);
-                    ctx.set_line_width(1.0 * px);
-                    let s = n + 1;
-                    for j in 0..s {
-                        let row: Vec<Point> = (0..s).map(|i| m[j * s + i]).collect();
-                        path(&ctx, &row, false);
-                        ctx.stroke();
-                        let col: Vec<Point> = (0..s).map(|i| m[i * s + j]).collect();
-                        path(&ctx, &col, false);
-                        ctx.stroke();
+        // Mesh tracking: the grid as it bends. With the Surface tool on the reference
+        // frame its inner points have handles: drag them to shape the grid by hand.
+        let shaping = selected && scene.tool == Tool::Surface && scene.frame == layer.ref_frame;
+        if scene.overlays.surface && (selected || scene.overlays.grid) || shaping {
+            if let Some((m, cols, rows)) = layer.mesh_grid_at(scene.frame) {
+                ctx.set_stroke_style_str(&layer.color);
+                ctx.set_global_alpha(if shaping { 0.95 } else { 0.75 });
+                ctx.set_line_width(1.0 * px);
+                let s = cols + 1;
+                for j in 0..=rows {
+                    let row: Vec<Point> = (0..=cols).map(|i| m[j * s + i]).collect();
+                    path(&ctx, &row, false);
+                    ctx.stroke();
+                }
+                for i in 0..=cols {
+                    let col: Vec<Point> = (0..=rows).map(|j| m[j * s + i]).collect();
+                    path(&ctx, &col, false);
+                    ctx.stroke();
+                }
+                ctx.set_global_alpha(1.0);
+                if shaping {
+                    // Smaller handles on dense grids so they don't cover the picture.
+                    let r = if cols.max(rows) > 16 { 2.5 } else { 3.5 } * px;
+                    for (k, p) in m.iter().enumerate() {
+                        if !trackwright_core::mesh::is_corner(k, cols, rows) {
+                            handle(&ctx, *p, r, &layer.color, "#0d0e11");
+                        }
                     }
-                    ctx.set_global_alpha(1.0);
                 }
             }
+        }
+        // Pupil: a ring and cross.
+        if let Some(t) = track {
             if let Some([x, y, r]) = t.pupil {
                 ctx.set_stroke_style_str("#7dff6a");
                 ctx.set_line_width(1.5 * px);
@@ -487,27 +489,28 @@ fn draw_insert(
             grid.push(apply(&h, [u, v]));
         }
     }
-    draw_grid_warp(ctx, img, N, &uv, &grid, opacity, px);
+    draw_grid_warp(ctx, img, N, N, &uv, &grid, opacity, px);
 }
 
-/// Draw `img` warped by a grid: vertex k of the `n` x `n` cell grid takes image point
+/// Draw `img` warped by a grid: vertex k of the `cols` x `rows` cell grid takes image point
 /// `uv[k]` to canvas point `dst[k]`, one affine triangle at a time.
 fn draw_grid_warp(
     ctx: &CanvasRenderingContext2d,
     img: &HtmlImageElement,
-    n: usize,
+    cols: usize,
+    rows: usize,
     uv: &[Point],
     dst: &[Point],
     opacity: f64,
     px: f64,
 ) {
     let (sw, sh) = (img.natural_width() as f64, img.natural_height() as f64);
-    if uv.len() != (n + 1) * (n + 1) || dst.len() != uv.len() {
+    if uv.len() != (cols + 1) * (rows + 1) || dst.len() != uv.len() {
         return;
     }
     ctx.save();
     ctx.set_global_alpha(opacity.clamp(0.0, 1.0));
-    for t in trackwright_core::mesh::triangles(n) {
+    for t in trackwright_core::mesh::triangles(cols, rows) {
         let s = t.map(|k| uv[k]);
         let d = t.map(|k| dst[k]);
         let Some(m) = tri_affine(s, d) else { continue };

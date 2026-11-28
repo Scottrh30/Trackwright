@@ -1236,6 +1236,15 @@ fn rotation_follows_surroundings_or_stays_locked() {
 /// can't be followed by one flat plane; the mesh bends with it.
 #[test]
 fn mesh_follows_a_bending_surface() {
+    // The even 6 x 6 grid; a wide 8 x 4 one; the densest, 32 x 32; and a 6 x 6 one shaped by hand (its inner
+    // points dragged off the even grid) - each point must follow the bend.
+    bending_mesh(6, 0, false);
+    bending_mesh(8, 4, false);
+    bending_mesh(6, 6, true);
+    bending_mesh(32, 32, false);
+}
+
+fn bending_mesh(cols: usize, rows: usize, hand_shaped: bool) {
     let n = 30;
     let tex = noise_texture(101, W, H);
     let rect = [200.0f64, 150.0, 440.0, 330.0];
@@ -1269,7 +1278,17 @@ fn mesh_follows_a_bending_surface() {
     let mut src = Synthetic { frames };
     let cancel = AtomicBool::new(false);
     let mut l = plane_layer(rect);
-    l.settings.mesh_cells = 6;
+    l.settings.mesh_cells = cols;
+    l.settings.mesh_rows = rows;
+    if hand_shaped {
+        let c = l.surface;
+        let mid = [(c[0][0] + c[2][0]) / 2.0, (c[0][1] + c[2][1]) / 2.0];
+        let k = 2 * 7 + 3; // an inner point near the middle
+        let at = l.mesh_ref().unwrap()[k];
+        assert!(l.set_mesh_point(k, [at[0] + 12.0, at[1] - 9.0], 1.5));
+        assert!(!l.set_mesh_point(0, mid, 1.0), "corners are the surface's");
+        assert_ne!(l.mesh_ref().unwrap()[k + 1], trackwright_core::mesh::grid(&l.surface, 6, 6)[k + 1]);
+    }
     let r = track_layer(
         &mut src,
         &mut l,
@@ -1280,9 +1299,10 @@ fn mesh_follows_a_bending_surface() {
         |_, _| {},
     );
     assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
-    let ref_v = trackwright_core::mesh::grid(&l.surface, 6);
+    let ref_v = l.mesh_ref().unwrap();
     let last = n - 1;
-    let mesh = l.tracks[&last].mesh.clone().expect("mesh on every frame");
+    let (mesh, c, r) = l.mesh_grid_at(last).expect("mesh on every frame");
+    assert_eq!((c, r), (cols, if rows == 0 { cols } else { rows }));
     let worst_mesh = ref_v
         .iter()
         .zip(&mesh)
@@ -1309,8 +1329,11 @@ fn mesh_follows_a_bending_surface() {
         })
         .sum::<f64>()
         / ref_v.len() as f64;
-    println!("mesh: mean vertex error {mean_mesh:.2}px, worst {worst_mesh:.2}px (one flat plane: {worst_plane:.2}px)");
+    println!("mesh {cols}x{rows} (hand-shaped: {hand_shaped}): mean vertex error {mean_mesh:.2}px, worst {worst_mesh:.2}px (one flat plane: {worst_plane:.2}px)");
     assert!(worst_plane > 8.0, "a plane can't bend: {worst_plane}");
     assert!(mean_mesh < 0.8, "the mesh bends with it: {mean_mesh}");
-    assert!(worst_mesh < 2.5, "every point: {worst_mesh}");
+    // A 32 x 32 grid has over a thousand points, some on bland patches: a little
+    // more slack for the worst one.
+    let worst_ok = if cols >= 16 { 3.5 } else { 2.5 };
+    assert!(worst_mesh < worst_ok, "every point: {worst_mesh}");
 }

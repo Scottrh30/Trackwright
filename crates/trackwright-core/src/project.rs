@@ -78,13 +78,28 @@ pub struct TrackSettings {
     /// Mesh tracking: cells across the surface (0 = off, planar only).
     #[serde(default)]
     pub mesh_cells: usize,
+    /// Mesh tracking: cells down the surface (0 = as many as across).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mesh_rows: usize,
     /// How strongly mesh points are held to move with their neighbours.
     #[serde(default = "default_stiffness")]
     pub mesh_stiffness: f64,
+    /// Shaping the mesh by hand: dragging a point pulls the points around it, less
+    /// and less, out to this many cells (0: only the point).
+    #[serde(default = "default_falloff")]
+    pub mesh_falloff: f64,
     /// Judgement thresholds for this run (learned or default). Not saved: filled in
     /// from what has been learned each time tracking starts.
     #[serde(skip)]
     pub tuning: crate::learning::Tuning,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
+fn default_falloff() -> f64 {
+    1.0
 }
 
 fn default_stiffness() -> f64 {
@@ -179,7 +194,9 @@ impl Default for TrackSettings {
             find_pupil: false,
             ai_assist: false,
             mesh_cells: 0,
+            mesh_rows: 0,
             mesh_stiffness: default_stiffness(),
+            mesh_falloff: default_falloff(),
             tuning: crate::learning::Tuning::default(),
         }
     }
@@ -212,6 +229,9 @@ pub struct FrameTrack {
     /// Mesh tracking: the grid's vertices on this frame (row by row, frame pixels).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Vec<Point>>,
+    /// Cells across the mesh above (0: a square grid, as older projects saved).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mesh_cols: usize,
 }
 
 impl FrameTrack {
@@ -227,6 +247,7 @@ impl FrameTrack {
             cues: None,
             pupil: None,
             mesh: None,
+            mesh_cols: 0,
         }
     }
 }
@@ -273,6 +294,11 @@ pub struct Layer {
     /// Soft edge for mattes and masks, in pixels.
     #[serde(default)]
     pub feather: f64,
+    /// Custom mesh: the grid's points on the reference frame, shaped by hand, as grid
+    /// coordinates on the surface (0..1 across and down) so they move with its
+    /// corners. `None`: an even grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_shape: Option<Vec<[f64; 2]>>,
 }
 
 /// Media corner-pinned onto a layer's surface (Mocha-style "insert").
@@ -333,6 +359,7 @@ impl Layer {
             shape_keys: BTreeMap::new(),
             adjust_keys: BTreeMap::new(),
             feather: 0.0,
+            mesh_shape: None,
         }
     }
 
@@ -424,28 +451,100 @@ impl Layer {
         }))
     }
 
-    /// Mesh-tracked vertices at `frame` with Adjust Track corrections (each vertex moved
-    /// by the corner offsets, blended across the grid). `None` without a mesh.
-    pub fn mesh_at(&self, frame: usize) -> Option<Vec<Point>> {
-        let m = self.tracks.get(&frame)?.mesh.as_ref()?;
-        let n = crate::mesh::grid_side(m.len())?;
-        if self.adjust_keys.is_empty() {
-            return Some(m.clone());
+    /// Mesh grid size, cells across and down, or `None` when mesh tracking is off.
+    pub fn mesh_dims(&self) -> Option<(usize, usize)> {
+        let c = self.settings.mesh_cells.min(crate::mesh::MAX_CELLS);
+        if c == 0 {
+            return None;
         }
-        let o = self.adjust_at(frame);
-        let s = n + 1;
+        let r = match self.settings.mesh_rows {
+            0 => c,
+            r => r.min(crate::mesh::MAX_CELLS),
+        };
+        Some((c, r))
+    }
+
+    /// The mesh's grid coordinates on the reference frame: the hand-shaped grid, or an
+    /// even one.
+    pub fn mesh_uv(&self) -> Option<Vec<[f64; 2]>> {
+        let (c, r) = self.mesh_dims()?;
+        Some(match &self.mesh_shape {
+            Some(uv) if uv.len() == (c + 1) * (r + 1) => uv.clone(),
+            _ => crate::mesh::grid_uv(c, r),
+        })
+    }
+
+    /// The mesh's points on the reference frame (frame pixels), row by row.
+    pub fn mesh_ref(&self) -> Option<Vec<Point>> {
         Some(
-            m.iter()
-                .enumerate()
-                .map(|(k, p)| {
-                    let (u, v) = ((k % s) as f64 / n as f64, (k / s) as f64 / n as f64);
-                    let w = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
-                    let dx: f64 = (0..4).map(|i| w[i] * o[i][0]).sum();
-                    let dy: f64 = (0..4).map(|i| w[i] * o[i][1]).sum();
-                    [p[0] + dx, p[1] + dy]
-                })
+            self.mesh_uv()?
+                .into_iter()
+                .map(|uv| crate::mesh::at_uv(&self.surface, uv))
                 .collect(),
         )
+    }
+
+    /// Custom mesh: move point `k` of the reference-frame grid to `pos`; points within
+    /// `falloff` cells follow, less and less. Corners stay (they're the surface's).
+    pub fn set_mesh_point(&mut self, k: usize, pos: Point, falloff: f64) -> bool {
+        let (Some((c, r)), Some(mut pts)) = (self.mesh_dims(), self.mesh_ref()) else {
+            return false;
+        };
+        if k >= pts.len() || crate::mesh::is_corner(k, c, r) {
+            return false;
+        }
+        let d = [pos[0] - pts[k][0], pos[1] - pts[k][1]];
+        for (j, p) in pts.iter_mut().enumerate() {
+            let w = crate::mesh::falloff_weight(k, j, c, r, falloff);
+            if w > 0.0 {
+                p[0] += w * d[0];
+                p[1] += w * d[1];
+            }
+        }
+        self.mesh_shape = Some(
+            pts.iter()
+                .map(|p| crate::mesh::to_uv(&self.surface, *p))
+                .collect(),
+        );
+        true
+    }
+
+    /// Mesh-tracked vertices at `frame` with Adjust Track corrections (each vertex moved
+    /// by the corner offsets, blended across the grid), and the grid's cells across and
+    /// down. On the reference frame, the (possibly hand-shaped) starting grid. `None`
+    /// without a mesh.
+    pub fn mesh_grid_at(&self, frame: usize) -> Option<(Vec<Point>, usize, usize)> {
+        let (m, c, r) = if frame == self.ref_frame && self.mesh_dims().is_some() {
+            let (c, r) = self.mesh_dims()?;
+            (self.mesh_ref()?, c, r)
+        } else {
+            let t = self.tracks.get(&frame)?;
+            let m = t.mesh.as_ref()?;
+            let (c, r) = crate::mesh::dims(m.len(), t.mesh_cols)?;
+            (m.clone(), c, r)
+        };
+        if self.adjust_keys.is_empty() {
+            return Some((m, c, r));
+        }
+        let o = self.adjust_at(frame);
+        let s = c + 1;
+        let m = m
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let (u, v) = ((k % s) as f64 / c as f64, (k / s) as f64 / r as f64);
+                let w = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
+                let dx: f64 = (0..4).map(|i| w[i] * o[i][0]).sum();
+                let dy: f64 = (0..4).map(|i| w[i] * o[i][1]).sum();
+                [p[0] + dx, p[1] + dy]
+            })
+            .collect();
+        Some((m, c, r))
+    }
+
+    /// [`Layer::mesh_grid_at`] without the grid size.
+    pub fn mesh_at(&self, frame: usize) -> Option<Vec<Point>> {
+        self.mesh_grid_at(frame).map(|(m, ..)| m)
     }
 
     /// Reference-to-frame transform including Adjust Track corrections.
@@ -835,6 +934,7 @@ fn linked_tracks(parent: &Layer, child_ref: usize) -> BTreeMap<usize, FrameTrack
                 cues: None,
                 pupil: None,
                 mesh: None,
+                mesh_cols: 0,
             },
         );
     }

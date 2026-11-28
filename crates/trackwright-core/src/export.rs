@@ -229,13 +229,14 @@ fn pupil_json(l: &Layer, i: usize) -> serde_json::Value {
     }
 }
 
-/// Mesh-tracked layers: the grid on frame `i` (cells across, vertices row by row).
+/// Mesh-tracked layers: the grid on frame `i` (cells across and down, vertices row by row).
 fn mesh_json(l: &Layer, i: usize) -> serde_json::Value {
-    let Some(m) = l.mesh_at(i) else {
-        return serde_json::Value::Null;
-    };
-    match crate::mesh::grid_side(m.len()) {
-        Some(n) => json!({ "cells": n, "points": m.iter().map(|p| r4p(*p)).collect::<Vec<_>>() }),
+    match l.mesh_grid_at(i) {
+        Some((m, c, r)) => json!({
+            "cols": c,
+            "rows": r,
+            "points": m.iter().map(|p| r4p(*p)).collect::<Vec<_>>(),
+        }),
         None => serde_json::Value::Null,
     }
 }

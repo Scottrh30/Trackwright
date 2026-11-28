@@ -415,11 +415,8 @@ fn mesh_at(
     h_cur: &Mat3,
     h_next: &Mat3,
 ) -> Option<Vec<Point>> {
-    let n = layer.settings.mesh_cells;
-    if n == 0 {
-        return None;
-    }
-    let ref_v = crate::mesh::grid(&layer.surface, n);
+    let (cols, rows) = layer.mesh_dims()?;
+    let ref_v = layer.mesh_ref()?;
     // The previous frame's mesh; after a stretch with none (guessed through a cover),
     // the nearest one before it, carried along with the plane.
     let with_mesh = |f: usize| {
@@ -441,7 +438,8 @@ fn mesh_at(
     let size = ((c[0][0] - c[2][0]).hypot(c[0][1] - c[2][1])
         + (c[1][0] - c[3][0]).hypot(c[1][1] - c[3][1]))
         * 0.5;
-    let cell = size / (n as f64 * std::f64::consts::SQRT_2);
+    // Cell size along the diagonal of a cols x rows grid.
+    let cell = size / (cols as f64).hypot(rows as f64);
     Some(crate::mesh::step(
         prev,
         next,
@@ -449,7 +447,8 @@ fn mesh_at(
         &prev_v,
         &pred_v,
         &ref_v,
-        n,
+        cols,
+        rows,
         cell,
         layer.settings.mesh_stiffness,
     ))
@@ -458,11 +457,10 @@ fn mesh_at(
 /// Frames tracked without a mesh solve (guessed through a cover, snapped to a hand
 /// fix) carry the nearest earlier mesh along with the plane, so the mesh never drops out.
 fn fill_meshes(layer: &mut Layer, start: usize, reached: usize) {
-    let n = layer.settings.mesh_cells;
-    if n == 0 {
+    let (Some((cols, _)), Some(ref_v)) = (layer.mesh_dims(), layer.mesh_ref()) else {
         return;
-    }
-    let count = (n + 1) * (n + 1);
+    };
+    let count = ref_v.len();
     let step: isize = if reached >= start { 1 } else { -1 };
     let mut last: Option<(Mat3, Vec<Point>)> = None;
     let mut f = start as isize;
@@ -476,13 +474,11 @@ fn fill_meshes(layer: &mut Layer, start: usize, reached: usize) {
                         Some((h, m)) => {
                             invert(h).map(|hi| crate::mesh::carry(m, &mul(&t.h_from_ref, &hi)))
                         }
-                        None => Some(crate::mesh::carry(
-                            &crate::mesh::grid(&layer.surface, n),
-                            &t.h_from_ref,
-                        )),
+                        None => Some(crate::mesh::carry(&ref_v, &t.h_from_ref)),
                     };
                     if let Some(v) = v {
                         t.mesh = Some(v.clone());
+                        t.mesh_cols = cols;
                         last = Some((t.h_from_ref, v));
                     }
                 }
@@ -555,7 +551,7 @@ fn ai_window<S: FrameSource>(
         frames.push(crop(&p));
     }
     // Points over the surface (a 5 x 5 grid), in crop pixels.
-    let pts: Vec<Point> = crate::mesh::grid(&layer.surface, 4)
+    let pts: Vec<Point> = crate::mesh::grid(&layer.surface, 4, 4)
         .iter()
         .map(|p| apply(h_from, *p))
         .collect();
@@ -742,13 +738,14 @@ fn track_run<S: FrameSource>(
     // Scores compare fine detail: relative to how this surface usually scores. `look`
     // is the best recent score, fading 1% a frame, so a head turning over seconds is
     // fine but a lid closing over a few frames is not.
+    let flat = layer.mesh_dims().is_none();
     let hidden_from = |look: Option<f64>,
                        steady: Option<f64>,
                        sc: Option<f64>,
                        cons: Option<f64>| {
         // A mesh layer bends by design, so a flat comparison with the reference drifts
         // away slowly: only a sudden change counts as a cover there.
-        let gone = s.mesh_cells == 0
+        let gone = flat
             && matches!((look, sc), (Some(peak), Some(sc)) if peak >= 0.3 && sc < s.tuning.gone * peak);
         let sudden = matches!((steady, cons), (Some(avg), Some(c)) if avg >= 0.5 && c < s.tuning.sudden * avg);
         gone || sudden
@@ -896,6 +893,7 @@ fn track_run<S: FrameSource>(
                 cues: None,
                 pupil: pupil_at(layer, &next_pyr, &truth, next),
                 mesh: None,
+            mesh_cols: 0,
             };
             layer.tracks.insert(next, ft.clone());
             on_frame(next, &ft);
@@ -1053,6 +1051,7 @@ fn track_run<S: FrameSource>(
             mesh: mesh_at(
                 layer, &prev_pyr, &next_pyr, &ref_pyr, cur, &h_cur, &r.h_next,
             ),
+            mesh_cols: layer.mesh_dims().map_or(0, |(c, _)| c),
         };
         velocity = r.step;
         layer.tracks.insert(next, ft.clone());
@@ -1677,6 +1676,7 @@ fn bridge<S: FrameSource>(
             // The eye may be open even while the box is guessed: look anyway.
             pupil: pupil_at(layer, &g_pyr, &h_pred, g),
             mesh: None,
+            mesh_cols: 0,
         };
         layer.tracks.insert(g, ft.clone());
         on_frame(g, &ft);
@@ -1879,6 +1879,7 @@ fn bridge<S: FrameSource>(
                 cues,
                 pupil: pupil_at(layer, &g_pyr, &r.h_next, g),
                 mesh: None,
+            mesh_cols: 0,
             };
             layer.tracks.insert(g, ft.clone());
             on_frame(g, &ft);

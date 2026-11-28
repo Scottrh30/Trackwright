@@ -166,3 +166,5 @@ button.danger:hover:not(:disabled) { border-color: #ff8a80; }
 .learned { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
 .learned .muted { font-size: 11px; }
 p.err { color: #ff8a80; }
+input.cells { width: 52px; }
+.field .row { display: inline-flex; align-items: center; gap: 6px; }

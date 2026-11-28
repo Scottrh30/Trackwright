@@ -11,46 +11,125 @@ use crate::geometry::{apply, Point};
 use crate::image::Pyramid;
 use crate::klt::{track_point, KltParams};
 
-/// Vertices of a `n` x `n` cell grid over the quad `q` (TL, TR, BR, BL), row by row.
-pub fn grid(q: &[Point; 4], n: usize) -> Vec<Point> {
-    let n = n.max(1);
-    let mut v = Vec::with_capacity((n + 1) * (n + 1));
-    for j in 0..=n {
-        let t = j as f64 / n as f64;
-        for i in 0..=n {
-            let s = i as f64 / n as f64;
-            let top = [
-                q[0][0] + (q[1][0] - q[0][0]) * s,
-                q[0][1] + (q[1][1] - q[0][1]) * s,
-            ];
-            let bot = [
-                q[3][0] + (q[2][0] - q[3][0]) * s,
-                q[3][1] + (q[2][1] - q[3][1]) * s,
-            ];
-            v.push([
-                top[0] + (bot[0] - top[0]) * t,
-                top[1] + (bot[1] - top[1]) * t,
-            ]);
+/// Largest grid, cells across or down.
+pub const MAX_CELLS: usize = 32;
+
+/// Point at grid coordinates `uv` (0..1 across, 0..1 down) on the quad `q`
+/// (TL, TR, BR, BL), by blending its sides.
+pub fn at_uv(q: &[Point; 4], uv: [f64; 2]) -> Point {
+    let [s, t] = uv;
+    let top = [
+        q[0][0] + (q[1][0] - q[0][0]) * s,
+        q[0][1] + (q[1][1] - q[0][1]) * s,
+    ];
+    let bot = [
+        q[3][0] + (q[2][0] - q[3][0]) * s,
+        q[3][1] + (q[2][1] - q[3][1]) * s,
+    ];
+    [top[0] + (bot[0] - top[0]) * t, top[1] + (bot[1] - top[1]) * t]
+}
+
+/// Grid coordinates of `p` on the quad `q` (the inverse of [`at_uv`]); may fall
+/// outside 0..1 for points outside the quad.
+pub fn to_uv(q: &[Point; 4], p: Point) -> [f64; 2] {
+    let mut uv = [0.5, 0.5];
+    for _ in 0..30 {
+        let f = at_uv(q, uv);
+        let (rx, ry) = (f[0] - p[0], f[1] - p[1]);
+        if rx.abs() + ry.abs() < 1e-9 {
+            break;
+        }
+        // Jacobian of at_uv.
+        let [s, t] = uv;
+        let dsx = (1.0 - t) * (q[1][0] - q[0][0]) + t * (q[2][0] - q[3][0]);
+        let dsy = (1.0 - t) * (q[1][1] - q[0][1]) + t * (q[2][1] - q[3][1]);
+        let dtx = (1.0 - s) * (q[3][0] - q[0][0]) + s * (q[2][0] - q[1][0]);
+        let dty = (1.0 - s) * (q[3][1] - q[0][1]) + s * (q[2][1] - q[1][1]);
+        let det = dsx * dty - dtx * dsy;
+        if det.abs() < 1e-12 {
+            break;
+        }
+        uv[0] -= (rx * dty - ry * dtx) / det;
+        uv[1] -= (dsx * ry - dsy * rx) / det;
+    }
+    uv
+}
+
+/// Grid coordinates of a regular `cols` x `rows` cell grid, row by row.
+pub fn grid_uv(cols: usize, rows: usize) -> Vec<[f64; 2]> {
+    let (c, r) = (cols.max(1), rows.max(1));
+    let mut v = Vec::with_capacity((c + 1) * (r + 1));
+    for j in 0..=r {
+        for i in 0..=c {
+            v.push([i as f64 / c as f64, j as f64 / r as f64]);
         }
     }
     v
 }
 
-/// Side of a grid with `count` vertices (count = (n + 1)^2), or `None`.
-pub fn grid_side(count: usize) -> Option<usize> {
-    let s = (count as f64).sqrt().round() as usize;
-    (s >= 2 && s * s == count).then_some(s - 1)
+/// Vertices of a regular `cols` x `rows` cell grid over the quad `q` (TL, TR, BR,
+/// BL), row by row.
+pub fn grid(q: &[Point; 4], cols: usize, rows: usize) -> Vec<Point> {
+    grid_uv(cols, rows).into_iter().map(|uv| at_uv(q, uv)).collect()
 }
 
-/// Grid neighbours (up, down, left, right) of vertex `k` in an `n` x `n` cell grid.
-fn neighbours(k: usize, n: usize) -> impl Iterator<Item = usize> {
-    let s = n + 1;
+/// Where an even `cols` x `rows` grid over the surface `q` falls in an insert of
+/// `size` (width, height) pinned to the surface in perspective: the insert's
+/// coordinates for each mesh point, row by row.
+pub fn insert_uv(q: &[Point; 4], cols: usize, rows: usize, size: [f64; 2]) -> Vec<Point> {
+    let [w, h] = size;
+    let rect = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    match crate::geometry::homography_from_corners(q, &rect) {
+        Some(hs) => grid(q, cols, rows).into_iter().map(|p| apply(&hs, p)).collect(),
+        None => grid_uv(cols, rows).into_iter().map(|p| [p[0] * w, p[1] * h]).collect(),
+    }
+}
+
+/// Cells across and down of a grid with `count` vertices, `cols` cells across (0 if
+/// unknown: then the grid is taken to be square).
+pub fn dims(count: usize, cols: usize) -> Option<(usize, usize)> {
+    if cols > 0 && count % (cols + 1) == 0 && count / (cols + 1) >= 2 {
+        return Some((cols, count / (cols + 1) - 1));
+    }
+    let s = (count as f64).sqrt().round() as usize;
+    (s >= 2 && s * s == count).then(|| (s - 1, s - 1))
+}
+
+/// Is vertex `k` one of the grid's four corners?
+pub fn is_corner(k: usize, cols: usize, rows: usize) -> bool {
+    let s = cols + 1;
+    let last = (rows + 1) * s - 1;
+    k == 0 || k == cols || k == last || k == last - cols
+}
+
+/// Weight with which vertex `j` follows a drag of vertex `k`: 1 at `k`, easing to 0
+/// at `falloff` + 1 cells away (0 falloff: only `k`). Corners never follow.
+pub fn falloff_weight(k: usize, j: usize, cols: usize, rows: usize, falloff: f64) -> f64 {
+    if j == k {
+        return 1.0;
+    }
+    if is_corner(j, cols, rows) {
+        return 0.0;
+    }
+    let s = cols + 1;
+    let d = ((k % s) as f64 - (j % s) as f64).hypot((k / s) as f64 - (j / s) as f64);
+    let reach = falloff.max(0.0) + 1.0;
+    if d >= reach {
+        0.0
+    } else {
+        0.5 * (1.0 + (std::f64::consts::PI * d / reach).cos())
+    }
+}
+
+/// Grid neighbours (up, down, left, right) of vertex `k` in a `cols` x `rows` grid.
+fn neighbours(k: usize, cols: usize, rows: usize) -> impl Iterator<Item = usize> {
+    let s = cols + 1;
     let (i, j) = (k % s, k / s);
     [
         (i > 0).then(|| k - 1),
-        (i + 1 < s).then(|| k + 1),
+        (i < cols).then(|| k + 1),
         (j > 0).then(|| k - s),
-        (j + 1 < s).then(|| k + s),
+        (j < rows).then(|| k + s),
     ]
     .into_iter()
     .flatten()
@@ -69,7 +148,8 @@ pub fn step(
     prev_v: &[Point],
     pred_v: &[Point],
     ref_v: &[Point],
-    n: usize,
+    cols: usize,
+    rows: usize,
     cell_px: f64,
     stiffness: f64,
 ) -> Vec<Point> {
@@ -106,7 +186,7 @@ pub fn step(
     let target: Vec<Option<Point>> = (0..m)
         .map(|k| {
             let t = target[k]?;
-            let near: Vec<Point> = neighbours(k, n).filter_map(|j| target[j]).collect();
+            let near: Vec<Point> = neighbours(k, cols, rows).filter_map(|j| target[j]).collect();
             if near.len() >= 2 {
                 let mx = near.iter().map(|p| p[0]).sum::<f64>() / near.len() as f64;
                 let my = near.iter().map(|p| p[1]).sum::<f64>() / near.len() as f64;
@@ -128,7 +208,7 @@ pub fn step(
             let mut sx = w * t[0];
             let mut sy = w * t[1];
             let mut deg = 0.0;
-            for j in neighbours(k, n) {
+            for j in neighbours(k, cols, rows) {
                 sx += lambda * u[j][0];
                 sy += lambda * u[j][1];
                 deg += lambda;
@@ -148,12 +228,12 @@ pub fn carry(pts: &[Point], h: &crate::geometry::Mat3) -> Vec<Point> {
     pts.iter().map(|p| apply(h, *p)).collect()
 }
 
-/// Triangles of the grid as vertex indices (two per cell).
-pub fn triangles(n: usize) -> Vec<[usize; 3]> {
-    let s = n + 1;
-    let mut t = Vec::with_capacity(n * n * 2);
-    for j in 0..n {
-        for i in 0..n {
+/// Triangles of a `cols` x `rows` grid as vertex indices (two per cell).
+pub fn triangles(cols: usize, rows: usize) -> Vec<[usize; 3]> {
+    let s = cols + 1;
+    let mut t = Vec::with_capacity(cols * rows * 2);
+    for j in 0..rows {
+        for i in 0..cols {
             let a = j * s + i;
             t.push([a, a + 1, a + s + 1]);
             t.push([a, a + s + 1, a + s]);
@@ -169,12 +249,35 @@ mod tests {
     #[test]
     fn grid_corners_and_size() {
         let q = [[0.0, 0.0], [100.0, 0.0], [100.0, 50.0], [0.0, 50.0]];
-        let g = grid(&q, 4);
+        let g = grid(&q, 4, 4);
         assert_eq!(g.len(), 25);
         assert_eq!(g[0], [0.0, 0.0]);
         assert_eq!(g[4], [100.0, 0.0]);
         assert_eq!(g[24], [100.0, 50.0]);
-        assert_eq!(grid_side(25), Some(4));
-        assert_eq!(triangles(4).len(), 32);
+        assert_eq!(dims(25, 0), Some((4, 4)));
+        assert_eq!(triangles(4, 4).len(), 32);
+        // Not square: 6 across, 2 down.
+        let g = grid(&q, 6, 2);
+        assert_eq!(g.len(), 21);
+        assert_eq!(g[6], [100.0, 0.0]);
+        assert_eq!(g[20], [100.0, 50.0]);
+        assert_eq!(dims(21, 6), Some((6, 2)));
+        assert_eq!(triangles(6, 2).len(), 24);
+        assert!(is_corner(14, 6, 2) && is_corner(20, 6, 2) && !is_corner(7, 6, 2));
+        // Up to 32 x 32.
+        assert_eq!(grid(&q, 32, 32).len(), 33 * 33);
+    }
+
+    #[test]
+    fn uv_round_trips_on_a_skewed_quad() {
+        let q = [[10.0, 20.0], [130.0, 5.0], [150.0, 110.0], [0.0, 90.0]];
+        for uv in [[0.0, 0.0], [0.3, 0.7], [1.0, 0.5], [0.9, 0.1]] {
+            let back = to_uv(&q, at_uv(&q, uv));
+            assert!((back[0] - uv[0]).abs() < 1e-9 && (back[1] - uv[1]).abs() < 1e-9);
+        }
+        assert_eq!(falloff_weight(8, 8, 4, 4, 0.0), 1.0);
+        assert_eq!(falloff_weight(8, 9, 4, 4, 0.0), 0.0);
+        assert!(falloff_weight(8, 9, 4, 4, 2.0) > 0.5);
+        assert_eq!(falloff_weight(6, 0, 4, 4, 5.0), 0.0); // a corner never follows
     }
 }
