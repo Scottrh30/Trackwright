@@ -17,7 +17,9 @@ use trackwright_core::camera_export::CameraFormat;
 use trackwright_core::geometry::{MotionModel, Point};
 use trackwright_core::sfm::{CameraSettings, FocalMode, SolveMode};
 use trackwright_core::shape::point_in_polygon;
-use trackwright_core::{ExportFormat, FrameTrack, Layer, Project, Shape, TargetKind, Tuning};
+use trackwright_core::{
+    ExportFormat, FrameTrack, Layer, Project, RotationMode, Shape, TargetKind, Tuning,
+};
 use wasm_bindgen::JsCast;
 
 // ---------------------------------------------------------------------------
@@ -2108,7 +2110,16 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                 <select on:change=move |ev| {
                     let v = event_target_value(&ev);
                     if let Ok(k) = serde_json::from_value::<TargetKind>(json!(v)) {
-                        ctx.edit_layer(move |l| l.settings.target = k);
+                        ctx.edit_layer(move |l| {
+                            // Eyes: find the pupil and turn with the head, unless changed since.
+                            if k == TargetKind::Eye && l.settings.target != TargetKind::Eye {
+                                l.settings.find_pupil = true;
+                                if l.settings.rotation == RotationMode::Free {
+                                    l.settings.rotation = RotationMode::Surroundings;
+                                }
+                            }
+                            l.settings.target = k;
+                        });
                     }
                 }>
                     {TargetKind::ALL.iter().map(|k| {
@@ -2118,6 +2129,39 @@ fn TrackSettingsSection(layer: Layer) -> impl IntoView {
                     }).collect_view()}
                 </select>
             </label>
+            <label class="field" title="Where the shape's rotation comes from. Follow surroundings stops a small or round target (an eye, a pupil) from slowly tilting on its own">"Rotation"
+                <select on:change=move |ev| {
+                    let v = event_target_value(&ev);
+                    if let Ok(m) = serde_json::from_value::<RotationMode>(json!(v)) {
+                        ctx.edit_layer(move |l| l.settings.rotation = m);
+                    }
+                }>
+                    {RotationMode::ALL.iter().map(|m| {
+                        let id = enum_id(*m);
+                        let sel = *m == s.rotation;
+                        view! { <option value=id.clone() selected=sel>{m.label()}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            <label class="field" title="Mesh tracking: a grid over the surface that bends with it (faces, mouths, cloth). Inserts and exports follow the mesh">"Mesh"
+                <select on:change=move |ev| {
+                    let v: usize = event_target_value(&ev).parse().unwrap_or(0);
+                    ctx.edit_layer(move |l| l.settings.mesh_cells = v);
+                }>
+                    {[0usize, 4, 6, 8, 10, 12].into_iter().map(|c| {
+                        let sel = c == s.mesh_cells;
+                        let label = if c == 0 { "Off (flat plane)".to_string() } else { format!("{c} × {c} grid") };
+                        view! { <option value=c.to_string() selected=sel>{label}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            {(s.mesh_cells > 0).then(|| num("Mesh stiffness", s.mesh_stiffness.to_string(), "0.1", |l, v| l.settings.mesh_stiffness = v.clamp(0.0, 10.0)))}
+            {(s.target == TargetKind::Eye).then(|| view! {
+                <label class="toggle" title="Find the pupil inside the tracked eye on every frame (green ring). Exported with the track">
+                    <input type="checkbox" prop:checked=s.find_pupil on:change=move |_| ctx.edit_layer(|l| l.settings.find_pupil = !l.settings.find_pupil) />
+                    "Find the pupil"
+                </label>
+            })}
             {num("Max points", s.max_features.to_string(), "10", |l, v| l.settings.max_features = v.clamp(20.0, 3000.0) as usize)}
             {num("Min point spacing (px)", s.min_distance.to_string(), "1", |l, v| l.settings.min_distance = v.clamp(2.0, 50.0) as f32)}
             {num("Search window radius (px)", s.search_radius.to_string(), "1", |l, v| l.settings.search_radius = v.clamp(3.0, 31.0) as i32)}

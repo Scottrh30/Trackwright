@@ -304,6 +304,25 @@ impl LearningStore {
         n
     }
 
+    /// Keep a source's examples for good under a new name, so learning from the same
+    /// layer again (after a re-track has absorbed its fixes) adds to them instead of
+    /// replacing them. Returns whether there was anything to keep.
+    pub fn freeze(&mut self, source: &str) -> bool {
+        let mut done = false;
+        for p in self.profiles.values_mut() {
+            if let Some(h) = p.sources.remove(source) {
+                let n = p
+                    .sources
+                    .keys()
+                    .filter(|k| k.starts_with(&format!("{source}#run")))
+                    .count();
+                p.sources.insert(format!("{source}#run{}", n + 1), h);
+                done = true;
+            }
+        }
+        done
+    }
+
     pub fn tuning_for(&self, kind: TargetKind) -> Tuning {
         self.profiles
             .get(&kind)

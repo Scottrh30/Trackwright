@@ -127,6 +127,65 @@ pub fn composite_insert(frame: &mut Rgba, insert: &Rgba, corners: &[Point; 4], o
     });
 }
 
+/// Composite `insert` over `frame` warped by a tracked mesh: `uv` are the grid's
+/// vertices in insert pixels, `pts` the same vertices on this frame (row by row, an
+/// `n` x `n` cell grid). Each grid triangle is mapped on its own, so the insert bends
+/// with the surface.
+pub fn composite_insert_mesh(
+    frame: &mut Rgba,
+    insert: &Rgba,
+    n: usize,
+    uv: &[Point],
+    pts: &[Point],
+    opacity: f64,
+) {
+    if uv.len() != pts.len() || pts.len() != (n + 1) * (n + 1) {
+        return;
+    }
+    let op = opacity.clamp(0.0, 1.0) as f32;
+    let (fw, fh) = (frame.width, frame.height);
+    for t in crate::mesh::triangles(n) {
+        let (a, b, c) = (pts[t[0]], pts[t[1]], pts[t[2]]);
+        let det = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+        if det.abs() < 1e-9 {
+            continue;
+        }
+        let x0 = a[0].min(b[0]).min(c[0]).floor().max(0.0) as usize;
+        let y0 = a[1].min(b[1]).min(c[1]).floor().max(0.0) as usize;
+        let x1 = (a[0].max(b[0]).max(c[0]).ceil() as usize + 1).min(fw);
+        let y1 = (a[1].max(b[1]).max(c[1]).ceil() as usize + 1).min(fh);
+        let (ua, ub, uc) = (uv[t[0]], uv[t[1]], uv[t[2]]);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                // Barycentric coordinates; a hair of slack so seams don't open up.
+                let l1 = ((px - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (py - a[1])) / det;
+                let l2 = ((b[0] - a[0]) * (py - a[1]) - (px - a[0]) * (b[1] - a[1])) / det;
+                let l0 = 1.0 - l1 - l2;
+                if l0 < -1e-6 || l1 < -1e-6 || l2 < -1e-6 {
+                    continue;
+                }
+                let u = l0 * ua[0] + l1 * ub[0] + l2 * uc[0];
+                let v = l0 * ua[1] + l1 * ub[1] + l2 * uc[1];
+                let s = insert.sample(u, v);
+                let al = s[3] * op;
+                if al <= 0.0 {
+                    continue;
+                }
+                let i = (y * fw + x) * 4;
+                for k in 0..3 {
+                    let d = frame.data[i + k] as f32;
+                    frame.data[i + k] =
+                        (s[k] * al + d * (1.0 - al)).round().clamp(0.0, 255.0) as u8;
+                }
+                let da = frame.data[i + 3] as f32 / 255.0;
+                frame.data[i + 3] =
+                    ((al + da * (1.0 - al)) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
 /// Copy pixels of `original` back into `frame` inside `poly` (with a 1 px soft edge),
 /// so occluders stay in front of an insert.
 pub fn restore_inside(frame: &mut Rgba, original: &Rgba, poly: &[Point]) {
@@ -309,6 +368,48 @@ mod tests {
         assert_eq!(at(40, 35), 255);
         assert_eq!(at(10, 10), 0);
         assert_eq!(at(70, 35), 0);
+    }
+
+    #[test]
+    fn mesh_insert_matches_corner_pin_when_flat_and_bends_when_not() {
+        let mut ins = Rgba::new(40, 40);
+        for (i, px) in ins.data.chunks_mut(4).enumerate() {
+            let (x, y) = (i % 40, i / 40);
+            px.copy_from_slice(&[(x * 6) as u8, (y * 6) as u8, 100, 255]);
+        }
+        let quad = [[20.0, 20.0], [70.0, 20.0], [70.0, 60.0], [20.0, 60.0]];
+        let black = || {
+            let mut f = Rgba::new(100, 80);
+            for px in f.data.chunks_mut(4) {
+                px.copy_from_slice(&[0, 0, 0, 255]);
+            }
+            f
+        };
+        let mut a = black();
+        composite_insert(&mut a, &ins, &quad, 1.0);
+        let mut b = black();
+        let uv = crate::mesh::grid(&[[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]], 4);
+        let pts = crate::mesh::grid(&quad, 4);
+        composite_insert_mesh(&mut b, &ins, 4, &uv, &pts, 1.0);
+        // Inside the quad (edge pixels are partly covered either way).
+        let mut diff = 0;
+        for y in 22..58 {
+            for x in 22..68 {
+                for k in 0..3 {
+                    let i = (y * 100 + x) * 4 + k;
+                    diff = diff.max((a.data[i] as i32 - b.data[i] as i32).abs());
+                }
+            }
+        }
+        assert!(diff <= 2, "flat mesh = corner pin (max diff {diff})");
+        // Push the middle vertex down: the insert follows it.
+        let mut bent = pts.clone();
+        bent[12][1] += 10.0;
+        let mut c = black();
+        composite_insert_mesh(&mut c, &ins, 4, &uv, &bent, 1.0);
+        let at = |f: &Rgba, x: usize, y: usize| f.data[(y * 100 + x) * 4 + 1];
+        // Green encodes the insert's row: lower on the frame for the same row.
+        assert!(at(&c, 45, 48) < at(&b, 45, 48), "bent down");
     }
 }
 

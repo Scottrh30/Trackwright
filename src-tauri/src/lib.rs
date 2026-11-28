@@ -979,6 +979,23 @@ fn start_tracking(
             return Err(e);
         }
     };
+    // Learn from the hand fixes before this run snaps to them and absorbs them, and
+    // keep those lessons apart from whatever this layer teaches later.
+    let (lo, hi) = (from.min(end), from.max(end));
+    let absorbs = layer
+        .adjust_keys
+        .range(lo..=hi)
+        .any(|(_, o)| o.iter().any(|c| c[0].abs() + c[1].abs() > 0.01));
+    if absorbs
+        && state.settings.lock().unwrap().learn_enabled
+        && learn_layers(&app, &state, &[id]).is_ok()
+    {
+        let src = learning_source(&state, &before, id);
+        let mut store = state.learning.lock().unwrap();
+        if store.freeze(&src) {
+            let _ = store_learning(&app, &store);
+        }
+    }
     layer.settings.tuning = if state.settings.lock().unwrap().use_learning {
         state
             .learning
@@ -1023,6 +1040,8 @@ fn start_tracking(
             let mut p = state.project.lock().unwrap();
             if let Some(l) = p.layer_mut(id) {
                 l.tracks = layer.tracks.clone();
+                // Hand fixes the run snapped to are now in the track itself.
+                l.adjust_keys = layer.adjust_keys.clone();
             }
             p.resolve_links();
             if *p != before {
@@ -1037,23 +1056,37 @@ fn start_tracking(
             .range(lo..=hi)
             .filter(|(_, t)| t.predicted)
             .count();
+        let fixed = layer
+            .adjust_keys
+            .range(lo..=hi)
+            .filter(|(f, _)| {
+                **f != layer.ref_frame && layer.tracks.get(f).is_some_and(|t| t.keyframe)
+            })
+            .count();
+        let fixed = if fixed > 0 {
+            format!(". Snapped to {fixed} frame(s) you fixed by hand")
+        } else {
+            String::new()
+        };
         let bridged = if predicted > 0 {
             format!(". {predicted} covered frame(s) were predicted by the occlusion solver (cyan on the timeline)")
         } else {
             String::new()
         };
         let done = match result {
-            Ok(StopReason::Finished) => TrackDoneEvent {
-                layer_id: id,
-                ok: true,
-                cancelled: false,
-                message: if blend {
-                    format!("Section re-tracked and blended into the existing track{bridged}")
-                } else {
-                    format!("Tracking finished{bridged}")
-                },
-                last_frame,
-            },
+            Ok(StopReason::Finished) => {
+                TrackDoneEvent {
+                    layer_id: id,
+                    ok: true,
+                    cancelled: false,
+                    message: if blend {
+                        format!("Section re-tracked and blended into the existing track{fixed}{bridged}")
+                    } else {
+                        format!("Tracking finished{fixed}{bridged}")
+                    },
+                    last_frame,
+                }
+            }
             Ok(StopReason::Cancelled) => TrackDoneEvent {
                 layer_id: id,
                 ok: true,
@@ -1691,12 +1724,47 @@ async fn render_layer(
                                 if insert_cache.as_ref().map(|(p, _)| p.as_str()) != Some(path) {
                                     insert_cache = Some((path.to_string(), load_rgba(path)?));
                                 }
-                                render::composite_insert(
-                                    &mut frame,
-                                    &insert_cache.as_ref().unwrap().1,
-                                    &corners,
-                                    ins.opacity,
-                                );
+                                let img = &insert_cache.as_ref().unwrap().1;
+                                let mesh = l.mesh_at(f);
+                                match (
+                                    mesh.as_ref(),
+                                    trackwright_core::mesh::grid_side(
+                                        mesh.as_ref().map_or(0, |m| m.len()),
+                                    ),
+                                ) {
+                                    // Mesh-tracked: the insert bends with the surface.
+                                    (Some(m), Some(n)) => {
+                                        let (iw, ih) = (img.width as f64, img.height as f64);
+                                        let rect = [[0.0, 0.0], [iw, 0.0], [iw, ih], [0.0, ih]];
+                                        if let Some(hs) =
+                                            trackwright_core::geometry::homography_from_corners(
+                                                &l.surface, &rect,
+                                            )
+                                        {
+                                            let uv: Vec<_> =
+                                                trackwright_core::mesh::grid(&l.surface, n)
+                                                    .iter()
+                                                    .map(|p| {
+                                                        trackwright_core::geometry::apply(&hs, *p)
+                                                    })
+                                                    .collect();
+                                            render::composite_insert_mesh(
+                                                &mut frame,
+                                                img,
+                                                n,
+                                                &uv,
+                                                m,
+                                                ins.opacity,
+                                            );
+                                        }
+                                    }
+                                    _ => render::composite_insert(
+                                        &mut frame,
+                                        img,
+                                        &corners,
+                                        ins.opacity,
+                                    ),
+                                }
                             }
                         }
                         if let Some(orig) = original {

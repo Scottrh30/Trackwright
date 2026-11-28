@@ -117,6 +117,15 @@ fn main() {
                     _ => TargetKind::General,
                 }
             }
+            "rotation" => {
+                s.rotation = match v {
+                    "follow" => RotationMode::Surroundings,
+                    "locked" => RotationMode::Locked,
+                    _ => RotationMode::Free,
+                }
+            }
+            "pupil" => s.find_pupil = v == "1",
+            "mesh" => s.mesh_cells = v.parse().unwrap(),
             "use" => use_store = Some(v.to_string()),
             "approve" => approve = Some(v.to_string()),
             _ => panic!("unknown setting {k}"),
@@ -204,7 +213,7 @@ fn main() {
                     let pp = src.pyramid(pf, 4).ok()?;
                     trackwright_core::planar::appearance_between(&layer, &pp, &pt.h_from_ref, pf, &fp, &t.h_from_ref, *f)
                 });
-                serde_json::json!({ "frame": f, "corners": c, "predicted": t.predicted, "inliers": t.inliers, "rms": t.rms_error, "look": look, "look_prev": look_prev,
+                serde_json::json!({ "frame": f, "corners": c, "predicted": t.predicted, "inliers": t.inliers, "rms": t.rms_error, "look": look, "look_prev": look_prev, "pupil": t.pupil, "mesh": t.mesh,
                     "shape": layer.shape.transformed(&t.h_from_ref).points })
             })
             .collect();

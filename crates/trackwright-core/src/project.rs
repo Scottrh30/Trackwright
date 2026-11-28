@@ -64,10 +64,55 @@ pub struct TrackSettings {
     /// What is being tracked; what the app learns from manual fixes is kept per kind.
     #[serde(default)]
     pub target: TargetKind,
+    /// Where the surface's rotation comes from (stops a small or round target from
+    /// slowly tilting on its own).
+    #[serde(default)]
+    pub rotation: RotationMode,
+    /// Find the pupil inside the tracked eye on every frame.
+    #[serde(default)]
+    pub find_pupil: bool,
+    /// Mesh tracking: cells across the surface (0 = off, planar only).
+    #[serde(default)]
+    pub mesh_cells: usize,
+    /// How strongly mesh points are held to move with their neighbours.
+    #[serde(default = "default_stiffness")]
+    pub mesh_stiffness: f64,
     /// Judgement thresholds for this run (learned or default). Not saved: filled in
     /// from what has been learned each time tracking starts.
     #[serde(skip)]
     pub tuning: crate::learning::Tuning,
+}
+
+fn default_stiffness() -> f64 {
+    1.0
+}
+
+/// How a layer's rotation is decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RotationMode {
+    /// From the surface's own points.
+    #[default]
+    Free,
+    /// Turns as much as the area around it (an eye turns with the head).
+    Surroundings,
+    /// Never turns away from how it was drawn.
+    Locked,
+}
+
+impl RotationMode {
+    pub const ALL: [RotationMode; 3] = [
+        RotationMode::Free,
+        RotationMode::Surroundings,
+        RotationMode::Locked,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RotationMode::Free => "Its own",
+            RotationMode::Surroundings => "Follow surroundings",
+            RotationMode::Locked => "Locked (no rotation)",
+        }
+    }
 }
 
 /// The kind of thing a layer tracks. Each kind learns separately.
@@ -126,6 +171,10 @@ impl Default for TrackSettings {
             bridge_occlusions: true,
             max_bridge_frames: 48,
             target: TargetKind::General,
+            rotation: RotationMode::Free,
+            find_pupil: false,
+            mesh_cells: 0,
+            mesh_stiffness: default_stiffness(),
             tuning: crate::learning::Tuning::default(),
         }
     }
@@ -152,6 +201,12 @@ pub struct FrameTrack {
     /// The scores the solver judged this frame by, for learning from manual fixes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cues: Option<crate::learning::Cues>,
+    /// Eye layers: the pupil found inside the eye on this frame (x, y, radius).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pupil: Option<[f64; 3]>,
+    /// Mesh tracking: the grid's vertices on this frame (row by row, frame pixels).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<Vec<Point>>,
 }
 
 impl FrameTrack {
@@ -165,6 +220,8 @@ impl FrameTrack {
             retried: false,
             predicted: false,
             cues: None,
+            pupil: None,
+            mesh: None,
         }
     }
 }
@@ -360,6 +417,30 @@ impl Layer {
         Some(std::array::from_fn(|i| {
             [c[i][0] + o[i][0], c[i][1] + o[i][1]]
         }))
+    }
+
+    /// Mesh-tracked vertices at `frame` with Adjust Track corrections (each vertex moved
+    /// by the corner offsets, blended across the grid). `None` without a mesh.
+    pub fn mesh_at(&self, frame: usize) -> Option<Vec<Point>> {
+        let m = self.tracks.get(&frame)?.mesh.as_ref()?;
+        let n = crate::mesh::grid_side(m.len())?;
+        if self.adjust_keys.is_empty() {
+            return Some(m.clone());
+        }
+        let o = self.adjust_at(frame);
+        let s = n + 1;
+        Some(
+            m.iter()
+                .enumerate()
+                .map(|(k, p)| {
+                    let (u, v) = ((k % s) as f64 / n as f64, (k / s) as f64 / n as f64);
+                    let w = [(1.0 - u) * (1.0 - v), u * (1.0 - v), u * v, (1.0 - u) * v];
+                    let dx: f64 = (0..4).map(|i| w[i] * o[i][0]).sum();
+                    let dy: f64 = (0..4).map(|i| w[i] * o[i][1]).sum();
+                    [p[0] + dx, p[1] + dy]
+                })
+                .collect(),
+        )
     }
 
     /// Reference-to-frame transform including Adjust Track corrections.
@@ -747,6 +828,8 @@ fn linked_tracks(parent: &Layer, child_ref: usize) -> BTreeMap<usize, FrameTrack
                 retried: t.retried,
                 predicted: t.predicted,
                 cues: None,
+                pupil: None,
+                mesh: None,
             },
         );
     }

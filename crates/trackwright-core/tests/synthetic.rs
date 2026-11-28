@@ -1108,3 +1108,209 @@ fn learning_from_fixes_cuts_false_alarms() {
         "back to the defaults after a reset"
     );
 }
+
+/// Hand fixes carry into the next run: re-tracking through a frame fixed with Adjust
+/// Track snaps the track onto the fix, eases the frames before it onto it, and leaves
+/// the final positions of frames outside the run exactly as they were.
+#[test]
+fn retracking_snaps_to_hand_fixes() {
+    let n = 50;
+    let (frames, rect) = blink_footage(n, n + 5..n + 5, true);
+    let mut src = Synthetic { frames };
+    let cancel = AtomicBool::new(false);
+    let mut l = plane_layer(rect);
+    let r = track_layer(
+        &mut src,
+        &mut l,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    assert_eq!(r, Ok(StopReason::Finished));
+    // The user moves frame 20 by (8, -5) and frame 40 by (3, 3).
+    let fix = |l: &mut Layer, f: usize, d: [f64; 2]| {
+        let c = l.surface_at(f).unwrap();
+        for (i, p) in c.iter().enumerate() {
+            assert!(l.set_adjust_corner(f, i, [p[0] + d[0], p[1] + d[1]]));
+        }
+    };
+    fix(&mut l, 20, [8.0, -5.0]);
+    fix(&mut l, 40, [3.0, 3.0]);
+    let want20 = l.surface_at(20).unwrap();
+    let keep: Vec<(usize, [Point; 4])> = (31..n).map(|f| (f, l.surface_at(f).unwrap())).collect();
+    // Re-track 0..30 only.
+    let r = track_layer(&mut src, &mut l, 0, 30, &no_exclusions, &cancel, |_, _| {});
+    assert_eq!(r, Ok(StopReason::Finished));
+    let got20 = l.tracked_surface_at(20).unwrap();
+    let d = |a: &[Point; 4], b: &[Point; 4]| {
+        (0..4)
+            .map(|i| (a[i][0] - b[i][0]).hypot(a[i][1] - b[i][1]))
+            .fold(0.0, f64::max)
+    };
+    assert!(d(&got20, &want20) < 0.01, "the track itself is on the fix");
+    assert!(
+        d(&l.surface_at(20).unwrap(), &want20) < 0.01,
+        "and stays there with the offsets"
+    );
+    assert!(l.tracks[&20].keyframe, "marked as fixed by hand");
+    assert_eq!(l.adjust_keys[&20], [[0.0; 2]; 4], "its offset was absorbed");
+    // Eased in: frame 10 moved about half of the fix (the truth there plus ~(4, -2.5)).
+    let at10 = l.tracked_surface_at(10).unwrap();
+    let t10 = l.surface.map(|p| apply(&truth_face(10), p));
+    let off = [at10[0][0] - t10[0][0], at10[0][1] - t10[0][1]];
+    assert!(
+        (off[0] - 4.0).abs() < 1.0 && (off[1] + 2.5).abs() < 1.0,
+        "eased: {off:?}"
+    );
+    for (f, before) in keep {
+        assert!(
+            d(&l.surface_at(f).unwrap(), &before) < 1e-6,
+            "frame {f} outside the run is unchanged"
+        );
+    }
+}
+
+/// A round, featureless target (a pupil) can't tell how far it has turned: its own
+/// points give a rotation that wanders. "Follow surroundings" takes the turn from the
+/// face around it; "Locked" keeps it level.
+#[test]
+fn rotation_follows_surroundings_or_stays_locked() {
+    let n = 40;
+    let face = noise_texture(81, W, H);
+    let (cx, cy, rad) = (320.0f64, 240.0f64, 30.0f64);
+    let frames: Vec<Arc<Pyramid>> = (0..n)
+        .map(|k| {
+            let hi = invert(&truth_face(k)).unwrap();
+            let mut img = GrayImage::new(W, H);
+            for y in 0..H {
+                for x in 0..W {
+                    let s = apply(&hi, [x as f64, y as f64]);
+                    let r = (s[0] - cx).hypot(s[1] - cy);
+                    // Dark disk with a soft rim; no texture inside.
+                    let edge = ((r - rad) / 3.0).clamp(-1.0, 1.0) * 0.5 + 0.5;
+                    let skin = face.sample(s[0] as f32, s[1] as f32);
+                    img.data[y * W + x] = (30.0 * (1.0 - edge) as f32) + skin * edge as f32;
+                }
+            }
+            Arc::new(Pyramid::build(img, 4))
+        })
+        .collect();
+    let angle = |h: &[f64; 9]| h[3].atan2(h[0]);
+    let run = |mode: RotationMode| {
+        let mut src = Synthetic {
+            frames: frames.clone(),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut l = plane_layer([cx - 40.0, cy - 40.0, cx + 40.0, cy + 40.0]);
+        l.settings.model = MotionModel::Similarity;
+        l.settings.rotation = mode;
+        let r = track_layer(
+            &mut src,
+            &mut l,
+            0,
+            n - 1,
+            &no_exclusions,
+            &cancel,
+            |_, _| {},
+        );
+        assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
+        let t = l.tracks[&(n - 1)].h_from_ref;
+        // Centre error too: whatever the turn, it stays on the disk.
+        let c = apply(&t, [cx, cy]);
+        let tc = apply(&truth_face(n - 1), [cx, cy]);
+        (angle(&t), (c[0] - tc[0]).hypot(c[1] - tc[1]))
+    };
+    let truth = angle(&truth_face(n - 1));
+    let (free, _) = run(RotationMode::Free);
+    let (follow, e1) = run(RotationMode::Surroundings);
+    let (locked, e2) = run(RotationMode::Locked);
+    println!("rotation: truth {truth:.4}, own {free:.4}, follow {follow:.4}, locked {locked:.4}; centre err {e1:.2} {e2:.2}");
+    assert!((follow - truth).abs() < 0.01, "follows the face's turn");
+    assert!(locked.abs() < 1e-6, "locked stays level");
+    assert!(e1 < 1.0 && e2 < 1.0, "still on the target");
+}
+
+/// Mesh tracking: a surface that bulges (like a cheek puffing or a mouth opening)
+/// can't be followed by one flat plane; the mesh bends with it.
+#[test]
+fn mesh_follows_a_bending_surface() {
+    let n = 30;
+    let tex = noise_texture(101, W, H);
+    let rect = [200.0f64, 150.0, 440.0, 330.0];
+    // Ref point -> frame point on frame k: a slow drift plus a bulge in the middle.
+    let deform = move |k: usize, p: Point| -> Point {
+        let t = k as f64;
+        let s = ((p[0] - rect[0]) / (rect[2] - rect[0])).clamp(0.0, 1.0);
+        let u = ((p[1] - rect[1]) / (rect[3] - rect[1])).clamp(0.0, 1.0);
+        let bump = (std::f64::consts::PI * s).sin() * (std::f64::consts::PI * u).sin();
+        let a = 0.8 * t; // grows to ~23 px
+        [p[0] + 1.5 * t + 0.3 * a * bump, p[1] + 0.8 * t + a * bump]
+    };
+    let frames: Vec<Arc<Pyramid>> = (0..n)
+        .map(|k| {
+            let mut img = GrayImage::new(W, H);
+            for y in 0..H {
+                for x in 0..W {
+                    // Invert the deformation by fixed-point iteration.
+                    let q = [x as f64, y as f64];
+                    let mut p = q;
+                    for _ in 0..12 {
+                        let d = deform(k, p);
+                        p = [p[0] + (q[0] - d[0]), p[1] + (q[1] - d[1])];
+                    }
+                    img.data[y * W + x] = tex.sample(p[0] as f32, p[1] as f32);
+                }
+            }
+            Arc::new(Pyramid::build(img, 4))
+        })
+        .collect();
+    let mut src = Synthetic { frames };
+    let cancel = AtomicBool::new(false);
+    let mut l = plane_layer(rect);
+    l.settings.mesh_cells = 6;
+    let r = track_layer(
+        &mut src,
+        &mut l,
+        0,
+        n - 1,
+        &no_exclusions,
+        &cancel,
+        |_, _| {},
+    );
+    assert_eq!(r, Ok(StopReason::Finished), "{r:?}");
+    let ref_v = trackwright_core::mesh::grid(&l.surface, 6);
+    let last = n - 1;
+    let mesh = l.tracks[&last].mesh.clone().expect("mesh on every frame");
+    let worst_mesh = ref_v
+        .iter()
+        .zip(&mesh)
+        .map(|(p, m)| {
+            let t = deform(last, *p);
+            (t[0] - m[0]).hypot(t[1] - m[1])
+        })
+        .fold(0.0, f64::max);
+    let h = l.tracks[&last].h_from_ref;
+    let worst_plane = ref_v
+        .iter()
+        .map(|p| {
+            let t = deform(last, *p);
+            let q = apply(&h, *p);
+            (t[0] - q[0]).hypot(t[1] - q[1])
+        })
+        .fold(0.0, f64::max);
+    let mean_mesh = ref_v
+        .iter()
+        .zip(&mesh)
+        .map(|(p, m)| {
+            let t = deform(last, *p);
+            (t[0] - m[0]).hypot(t[1] - m[1])
+        })
+        .sum::<f64>()
+        / ref_v.len() as f64;
+    println!("mesh: mean vertex error {mean_mesh:.2}px, worst {worst_mesh:.2}px (one flat plane: {worst_plane:.2}px)");
+    assert!(worst_plane > 8.0, "a plane can't bend: {worst_plane}");
+    assert!(mean_mesh < 0.8, "the mesh bends with it: {mean_mesh}");
+    assert!(worst_mesh < 2.5, "every point: {worst_mesh}");
+}

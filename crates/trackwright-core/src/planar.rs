@@ -8,7 +8,9 @@ use crate::geometry::{
 use crate::image::{GrayImage, Pyramid};
 use crate::klt::{track_point, KltParams};
 use crate::learning::Cues;
+use crate::project::RotationMode;
 use crate::project::{FrameTrack, Layer, TrackSettings};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -385,6 +387,228 @@ pub fn track_layer<S: FrameSource>(
     cancel: &AtomicBool,
     mut on_frame: impl FnMut(usize, &FrameTrack),
 ) -> Result<StopReason, TrackError> {
+    let anchors = hand_fixed(layer, start, end);
+    let old_keys = layer.adjust_keys.clone();
+    let mut reached = start;
+    let r = track_run(source, layer, start, end, exclude, cancel, |f, t| {
+        if f.abs_diff(start) > reached.abs_diff(start) {
+            reached = f;
+        }
+        on_frame(f, t)
+    });
+    if !anchors.is_empty() {
+        absorb_fixes(layer, &anchors, &old_keys, start, reached);
+    }
+    fill_meshes(layer, start, reached);
+    r
+}
+
+/// Mesh tracking for one seen frame: the previous frame's grid moved by the planar
+/// motion, then each point refined on its own.
+#[allow(clippy::too_many_arguments)]
+fn mesh_at(
+    layer: &Layer,
+    prev: &Pyramid,
+    next: &Pyramid,
+    reference: &Pyramid,
+    cur: usize,
+    h_cur: &Mat3,
+    h_next: &Mat3,
+) -> Option<Vec<Point>> {
+    let n = layer.settings.mesh_cells;
+    if n == 0 {
+        return None;
+    }
+    let ref_v = crate::mesh::grid(&layer.surface, n);
+    // The previous frame's mesh; after a stretch with none (guessed through a cover),
+    // the nearest one before it, carried along with the plane.
+    let with_mesh = |f: usize| {
+        let t = layer.tracks.get(&f)?;
+        t.mesh
+            .clone()
+            .filter(|m| m.len() == ref_v.len())
+            .map(|m| (t.h_from_ref, m))
+    };
+    let prev_v = (0..64)
+        .flat_map(|d| [cur.checked_sub(d), cur.checked_add(d)])
+        .flatten()
+        .find_map(with_mesh)
+        .and_then(|(h, m)| Some(crate::mesh::carry(&m, &mul(h_cur, &invert(&h)?))))
+        .unwrap_or_else(|| crate::mesh::carry(&ref_v, h_cur));
+    let step = mul(h_next, &invert(h_cur)?);
+    let pred_v = crate::mesh::carry(&prev_v, &step);
+    let c = layer.surface.map(|p| apply(h_next, p));
+    let size = ((c[0][0] - c[2][0]).hypot(c[0][1] - c[2][1])
+        + (c[1][0] - c[3][0]).hypot(c[1][1] - c[3][1]))
+        * 0.5;
+    let cell = size / (n as f64 * std::f64::consts::SQRT_2);
+    Some(crate::mesh::step(
+        prev,
+        next,
+        reference,
+        &prev_v,
+        &pred_v,
+        &ref_v,
+        n,
+        cell,
+        layer.settings.mesh_stiffness,
+    ))
+}
+
+/// Frames tracked without a mesh solve (guessed through a cover, snapped to a hand
+/// fix) carry the nearest earlier mesh along with the plane, so the mesh never drops out.
+fn fill_meshes(layer: &mut Layer, start: usize, reached: usize) {
+    let n = layer.settings.mesh_cells;
+    if n == 0 {
+        return;
+    }
+    let count = (n + 1) * (n + 1);
+    let step: isize = if reached >= start { 1 } else { -1 };
+    let mut last: Option<(Mat3, Vec<Point>)> = None;
+    let mut f = start as isize;
+    loop {
+        let fu = f as usize;
+        if let Some(t) = layer.tracks.get_mut(&fu) {
+            match &t.mesh {
+                Some(m) if m.len() == count => last = Some((t.h_from_ref, m.clone())),
+                _ => {
+                    let v = match &last {
+                        Some((h, m)) => {
+                            invert(h).map(|hi| crate::mesh::carry(m, &mul(&t.h_from_ref, &hi)))
+                        }
+                        None => Some(crate::mesh::carry(
+                            &crate::mesh::grid(&layer.surface, n),
+                            &t.h_from_ref,
+                        )),
+                    };
+                    if let Some(v) = v {
+                        t.mesh = Some(v.clone());
+                        last = Some((t.h_from_ref, v));
+                    }
+                }
+            }
+        }
+        if fu == reached {
+            break;
+        }
+        f += step;
+    }
+}
+
+/// The pupil inside an eye layer's outline on frame `f` (when the layer asks for it).
+fn pupil_at(layer: &Layer, pyr: &Pyramid, h: &Mat3, f: usize) -> Option<[f64; 3]> {
+    if !layer.settings.find_pupil {
+        return None;
+    }
+    let eye = layer.shape_ref_at(f).transformed(h).flatten(8);
+    crate::pupil::find_pupil(pyr, &eye).map(|p| [p.centre[0], p.centre[1], p.radius])
+}
+
+/// How far the surface under `h` is turned from how it was drawn (radians): the
+/// average turn of its four edges.
+fn surface_angle(layer: &Layer, h: &Mat3) -> f64 {
+    let a = layer.surface;
+    let b = a.map(|p| apply(h, p));
+    let (mut sx, mut sy) = (0.0, 0.0);
+    for i in 0..4 {
+        let j = (i + 1) % 4;
+        let ea = (a[j][1] - a[i][1]).atan2(a[j][0] - a[i][0]);
+        let eb = (b[j][1] - b[i][1]).atan2(b[j][0] - b[i][0]);
+        let d = wrap(eb - ea);
+        sx += d.cos();
+        sy += d.sin();
+    }
+    sy.atan2(sx)
+}
+
+fn wrap(a: f64) -> f64 {
+    let t = std::f64::consts::TAU;
+    (a + std::f64::consts::PI).rem_euclid(t) - std::f64::consts::PI
+}
+
+/// `h` with the surface turned by `angle` about its own centre.
+fn turn(layer: &Layer, h: &Mat3, angle: f64) -> Mat3 {
+    let c = layer.surface.map(|p| apply(h, p));
+    let m = [
+        c.iter().map(|p| p[0]).sum::<f64>() / 4.0,
+        c.iter().map(|p| p[1]).sum::<f64>() / 4.0,
+    ];
+    let (co, si) = (angle.cos(), angle.sin());
+    let t = c.map(|p| {
+        let (x, y) = (p[0] - m[0], p[1] - m[1]);
+        [m[0] + co * x - si * y, m[1] + si * x + co * y]
+    });
+    homography_from_corners(&layer.surface, &t).unwrap_or(*h)
+}
+
+/// Adjust Track keys in `start..=end` (either direction) that move the track, with the
+/// transform they put the surface at.
+fn hand_fixed(layer: &Layer, start: usize, end: usize) -> BTreeMap<usize, Mat3> {
+    let (lo, hi) = (start.min(end), start.max(end));
+    layer
+        .adjust_keys
+        .range(lo..=hi)
+        .filter(|(f, off)| {
+            layer.tracks.contains_key(f) && off.iter().any(|o| o[0].abs() + o[1].abs() > 0.01)
+        })
+        .filter_map(|(&f, _)| Some((f, layer.final_h_at(f)?)))
+        .collect()
+}
+
+/// After a run snapped to the user's fixes, the track itself is right on those
+/// frames: their Adjust offsets become zero (kept as keys, they still mark checked
+/// frames). Frames outside the re-tracked stretch keep exactly the offsets they had.
+fn absorb_fixes(
+    layer: &mut Layer,
+    anchors: &BTreeMap<usize, Mat3>,
+    old_keys: &BTreeMap<usize, [Point; 4]>,
+    start: usize,
+    reached: usize,
+) {
+    let old = |f: usize| {
+        let mut l = Layer::new(0, 0, layer.shape.clone());
+        l.adjust_keys = old_keys.clone();
+        l.adjust_at(f)
+    };
+    let (lo, hi) = (start.min(reached), start.max(reached));
+    let mut changed = false;
+    for (&f, truth) in anchors.range(lo..=hi) {
+        let on_it = layer
+            .tracks
+            .get(&f)
+            .is_some_and(|t| max_corner_delta(&layer.surface, &t.h_from_ref, truth) < 0.01);
+        if on_it {
+            layer.adjust_keys.insert(f, [[0.0; 2]; 4]);
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    // Pin the frames just outside the stretch to their old offsets.
+    let mut edges = vec![hi + 1];
+    if lo > 0 {
+        edges.push(lo - 1);
+    }
+    for e in edges {
+        let (was, now) = (old(e), layer.adjust_at(e));
+        let differs =
+            (0..4).any(|i| (was[i][0] - now[i][0]).abs() + (was[i][1] - now[i][1]).abs() > 1e-6);
+        if differs && layer.tracks.contains_key(&e) {
+            layer.adjust_keys.insert(e, was);
+        }
+    }
+}
+
+fn track_run<S: FrameSource>(
+    source: &mut S,
+    layer: &mut Layer,
+    start: usize,
+    end: usize,
+    exclude: ExcludeFn,
+    cancel: &AtomicBool,
+    mut on_frame: impl FnMut(usize, &FrameTrack),
+) -> Result<StopReason, TrackError> {
     if !layer.shape.is_valid() {
         return Err(TrackError::InvalidShape);
     }
@@ -435,10 +659,26 @@ pub fn track_layer<S: FrameSource>(
                        steady: Option<f64>,
                        sc: Option<f64>,
                        cons: Option<f64>| {
-        let gone = matches!((look, sc), (Some(peak), Some(sc)) if peak >= 0.3 && sc < s.tuning.gone * peak);
+        // A mesh layer bends by design, so a flat comparison with the reference drifts
+        // away slowly: only a sudden change counts as a cover there.
+        let gone = s.mesh_cells == 0
+            && matches!((look, sc), (Some(peak), Some(sc)) if peak >= 0.3 && sc < s.tuning.gone * peak);
         let sudden = matches!((steady, cons), (Some(avg), Some(c)) if avg >= 0.5 && c < s.tuning.sudden * avg);
         gone || sudden
     };
+
+    // Frames the user fixed by hand (Adjust Track keys) ahead of us: the track snaps to
+    // them and the frames before are eased onto them, so one fix carries into the run.
+    let anchors = hand_fixed(layer, start, end);
+    let mut last_snap = start;
+    if let Some(&h) = anchors.get(&start) {
+        // Starting on a fixed frame: start from where the user put it.
+        h_cur = h;
+        if let Some(t) = layer.tracks.get_mut(&start) {
+            t.h_from_ref = h;
+        }
+        memory[0] = (start, h);
+    }
 
     while cur != end {
         if cancel.load(Ordering::Relaxed) {
@@ -490,6 +730,101 @@ pub fn track_layer<S: FrameSource>(
             }
             Err(e) => Err(e),
         };
+        // Rotation from somewhere other than the surface's own points.
+        let rotation = if s.model == MotionModel::Translation {
+            RotationMode::Free
+        } else {
+            s.rotation
+        };
+        let result = match (result, rotation) {
+            (Ok(mut r), RotationMode::Surroundings) => {
+                let own = surface_angle(layer, &r.h_next) - surface_angle(layer, &h_cur);
+                if let Some(m) = context_motion(
+                    layer,
+                    &prev_pyr,
+                    &next_pyr,
+                    cur,
+                    &h_cur,
+                    &velocity,
+                    exclude,
+                    seed ^ 0x707,
+                ) {
+                    let around = m[3].atan2(m[0]);
+                    r.h_next = turn(layer, &r.h_next, wrap(around - own));
+                    r.step = invert(&h_cur).map_or(r.step, |hi| mul(&r.h_next, &hi));
+                }
+                Ok(r)
+            }
+            (Ok(mut r), RotationMode::Locked) => {
+                r.h_next = turn(layer, &r.h_next, -surface_angle(layer, &r.h_next));
+                r.step = invert(&h_cur).map_or(r.step, |hi| mul(&r.h_next, &hi));
+                Ok(r)
+            }
+            (r, _) => r,
+        };
+
+        // A frame the user fixed: take their corners, whatever the solve said.
+        if let Some(&truth) = anchors.get(&next) {
+            let solved = result.as_ref().ok().map(|r| r.h_next);
+            let r = result.unwrap_or(StepResult {
+                h_next: truth,
+                step: IDENTITY,
+                inliers: 0,
+                rms: 0.0,
+                shown: vec![],
+            });
+            // Ease the frames since the last fixed one onto it.
+            let miss: [Point; 4] = {
+                let a = layer.surface.map(|p| apply(&truth, p));
+                let b = layer.surface.map(|p| apply(&solved.unwrap_or(truth), p));
+                std::array::from_fn(|i| [a[i][0] - b[i][0], a[i][1] - b[i][1]])
+            };
+            let span = next.abs_diff(last_snap) as f64;
+            let mut f = last_snap;
+            while f != cur {
+                f = (f as isize + step) as usize;
+                let w = f.abs_diff(last_snap) as f64 / span;
+                let Some(t) = layer.tracks.get_mut(&f) else {
+                    continue;
+                };
+                let c = layer.surface.map(|p| apply(&t.h_from_ref, p));
+                let target: [Point; 4] =
+                    std::array::from_fn(|i| [c[i][0] + miss[i][0] * w, c[i][1] + miss[i][1] * w]);
+                if let Some(h) = homography_from_corners(&layer.surface, &target) {
+                    t.h_from_ref = h;
+                    // Moved by the fix, not by the tracker: don't learn from it.
+                    t.cues = None;
+                    let t = t.clone();
+                    on_frame(f, &t);
+                }
+            }
+            let ft = FrameTrack {
+                h_from_ref: truth,
+                inliers: r.inliers as u32,
+                rms_error: r.rms,
+                points: r.shown,
+                keyframe: true,
+                retried,
+                predicted: false,
+                cues: None,
+                pupil: pupil_at(layer, &next_pyr, &truth, next),
+                mesh: None,
+            };
+            layer.tracks.insert(next, ft.clone());
+            on_frame(next, &ft);
+            memory.push((next, truth));
+            if memory.len() > 6 {
+                memory.remove(1);
+            }
+            last_snap = next;
+            velocity = IDENTITY;
+            h_cur = truth;
+            cur = next;
+            recent.clear();
+            look = appearance(layer, &ref_pyr, &next_pyr, &truth, next, exclude);
+            continue;
+        }
+
         // Covered? The step failed, or it "worked" but no longer looks like the surface.
         let mut cues = None;
         let lost = match &result {
@@ -627,6 +962,10 @@ pub fn track_layer<S: FrameSource>(
             retried,
             predicted: false,
             cues,
+            pupil: pupil_at(layer, &next_pyr, &r.h_next, next),
+            mesh: mesh_at(
+                layer, &prev_pyr, &next_pyr, &ref_pyr, cur, &h_cur, &r.h_next,
+            ),
         };
         velocity = r.step;
         layer.tracks.insert(next, ft.clone());
@@ -1232,6 +1571,9 @@ fn bridge<S: FrameSource>(
             retried: false,
             predicted: true,
             cues: None,
+            // The eye may be open even while the box is guessed: look anyway.
+            pupil: pupil_at(layer, &g_pyr, &h_pred, g),
+            mesh: None,
         };
         layer.tracks.insert(g, ft.clone());
         on_frame(g, &ft);
@@ -1432,6 +1774,8 @@ fn bridge<S: FrameSource>(
                 retried: false,
                 predicted: false,
                 cues,
+                pupil: pupil_at(layer, &g_pyr, &r.h_next, g),
+                mesh: None,
             };
             layer.tracks.insert(g, ft.clone());
             on_frame(g, &ft);

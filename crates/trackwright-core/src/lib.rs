@@ -14,10 +14,12 @@ pub mod klt;
 pub mod learning;
 pub mod lens;
 pub mod linalg;
+pub mod mesh;
 mod par;
 pub mod planar;
 pub mod points;
 pub mod project;
+pub mod pupil;
 pub mod render;
 pub mod sfm;
 pub mod shape;
@@ -30,6 +32,7 @@ pub use planar::{
     no_exclusions, retrack_section, track_layer, FrameSource, StopReason, TrackError,
 };
 pub use project::{
-    exclusion_polys, Footage, FrameTrack, Layer, Problem, Project, TargetKind, TrackSettings,
+    exclusion_polys, Footage, FrameTrack, Layer, Problem, Project, RotationMode, TargetKind,
+    TrackSettings,
 };
 pub use shape::Shape;

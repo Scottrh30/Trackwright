@@ -161,6 +161,8 @@ fn reelforge(f: &Footage, l: &Layer) -> String {
                 "transform": { "position": r4p(pos), "rotation_deg": r4(rot), "scale": r4p(scale) },
                 "homography": h,
                 "confidence": { "inliers": inl, "rms_px": r4(rms) },
+                "pupil": pupil_json(l, i),
+                "mesh": mesh_json(l, i),
             })
         })
         .collect();
@@ -190,6 +192,8 @@ fn planar_3d(f: &Footage, l: &Layer, target: &str) -> String {
                 "homography": hm,
                 "inliers": inl,
                 "rms_px": r4(rms),
+                "pupil": pupil_json(l, i),
+                "mesh": mesh_json(l, i),
             })
         })
         .collect();
@@ -209,6 +213,25 @@ fn planar_3d(f: &Footage, l: &Layer, target: &str) -> String {
         "frames": frames,
     }))
     .unwrap()
+}
+
+/// The pupil on frame `i` (eye layers with Find pupil on): centre and radius, pixels.
+fn pupil_json(l: &Layer, i: usize) -> serde_json::Value {
+    match l.tracks.get(&i).and_then(|t| t.pupil) {
+        Some(p) => json!({ "x": r4(p[0]), "y": r4(p[1]), "radius": r4(p[2]) }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Mesh-tracked layers: the grid on frame `i` (cells across, vertices row by row).
+fn mesh_json(l: &Layer, i: usize) -> serde_json::Value {
+    let Some(m) = l.mesh_at(i) else {
+        return serde_json::Value::Null;
+    };
+    match crate::mesh::grid_side(m.len()) {
+        Some(n) => json!({ "cells": n, "points": m.iter().map(|p| r4p(*p)).collect::<Vec<_>>() }),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn generic_json(f: &Footage, l: &Layer) -> String {

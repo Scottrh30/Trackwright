@@ -221,7 +221,28 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
             else {
                 continue;
             };
-            draw_insert(&ctx, ins_img, &corners, ins.opacity, px);
+            let mesh = layer.mesh_at(scene.frame);
+            match (
+                mesh.as_ref(),
+                trackwright_core::mesh::grid_side(mesh.as_ref().map_or(0, |m| m.len())),
+            ) {
+                (Some(m), Some(n)) => {
+                    // Mesh-tracked: the insert bends with the surface.
+                    let (sw, sh) = (
+                        ins_img.natural_width() as f64,
+                        ins_img.natural_height() as f64,
+                    );
+                    let rect = [[0.0, 0.0], [sw, 0.0], [sw, sh], [0.0, sh]];
+                    if let Some(hs) = homography_from_corners(&layer.surface, &rect) {
+                        let uv: Vec<Point> = trackwright_core::mesh::grid(&layer.surface, n)
+                            .iter()
+                            .map(|p| apply(&hs, *p))
+                            .collect();
+                        draw_grid_warp(&ctx, ins_img, n, &uv, m, ins.opacity, px);
+                    }
+                }
+                _ => draw_insert(&ctx, ins_img, &corners, ins.opacity, px),
+            }
         }
     }
 
@@ -297,6 +318,42 @@ pub fn draw_viewport(canvas: &HtmlCanvasElement, scene: &Scene, image: Option<Ht
                 for p in &t.points {
                     ctx.fill_rect(p[0] - 1.5 * px, p[1] - 1.5 * px, 3.0 * px, 3.0 * px);
                 }
+            }
+        }
+
+        // Mesh tracking: the grid as it bends; pupil: a ring and cross.
+        if let Some(t) = track {
+            if let (Some(m), true) = (
+                layer.mesh_at(scene.frame),
+                scene.overlays.surface && (selected || scene.overlays.grid),
+            ) {
+                if let Some(n) = trackwright_core::mesh::grid_side(m.len()) {
+                    ctx.set_stroke_style_str(&layer.color);
+                    ctx.set_global_alpha(0.75);
+                    ctx.set_line_width(1.0 * px);
+                    let s = n + 1;
+                    for j in 0..s {
+                        let row: Vec<Point> = (0..s).map(|i| m[j * s + i]).collect();
+                        path(&ctx, &row, false);
+                        ctx.stroke();
+                        let col: Vec<Point> = (0..s).map(|i| m[i * s + j]).collect();
+                        path(&ctx, &col, false);
+                        ctx.stroke();
+                    }
+                    ctx.set_global_alpha(1.0);
+                }
+            }
+            if let Some([x, y, r]) = t.pupil {
+                ctx.set_stroke_style_str("#7dff6a");
+                ctx.set_line_width(1.5 * px);
+                ctx.begin_path();
+                let _ = ctx.arc(x, y, r, 0.0, std::f64::consts::TAU);
+                ctx.stroke();
+                let k = (r * 0.35).max(4.0 * px);
+                path(&ctx, &[[x - k, y], [x + k, y]], false);
+                ctx.stroke();
+                path(&ctx, &[[x, y - k], [x, y + k]], false);
+                ctx.stroke();
             }
         }
 
@@ -421,58 +478,72 @@ fn draw_insert(
     };
     let (sw, sh) = (img.natural_width() as f64, img.natural_height() as f64);
     const N: usize = 12;
-    let mut grid = vec![[0.0; 2]; (N + 1) * (N + 1)];
+    let mut uv = Vec::with_capacity((N + 1) * (N + 1));
+    let mut grid = Vec::with_capacity((N + 1) * (N + 1));
     for j in 0..=N {
         for i in 0..=N {
-            grid[j * (N + 1) + i] = apply(&h, [i as f64 / N as f64, j as f64 / N as f64]);
+            let (u, v) = (i as f64 / N as f64, j as f64 / N as f64);
+            uv.push([u * sw, v * sh]);
+            grid.push(apply(&h, [u, v]));
         }
     }
-    let src = |i: usize, j: usize| [i as f64 / N as f64 * sw, j as f64 / N as f64 * sh];
-    let dst = |i: usize, j: usize| grid[j * (N + 1) + i];
+    draw_grid_warp(ctx, img, N, &uv, &grid, opacity, px);
+}
+
+/// Draw `img` warped by a grid: vertex k of the `n` x `n` cell grid takes image point
+/// `uv[k]` to canvas point `dst[k]`, one affine triangle at a time.
+fn draw_grid_warp(
+    ctx: &CanvasRenderingContext2d,
+    img: &HtmlImageElement,
+    n: usize,
+    uv: &[Point],
+    dst: &[Point],
+    opacity: f64,
+    px: f64,
+) {
+    let (sw, sh) = (img.natural_width() as f64, img.natural_height() as f64);
+    if uv.len() != (n + 1) * (n + 1) || dst.len() != uv.len() {
+        return;
+    }
     ctx.save();
     ctx.set_global_alpha(opacity.clamp(0.0, 1.0));
-    for j in 0..N {
-        for i in 0..N {
-            for tri in [
-                [(i, j), (i + 1, j), (i + 1, j + 1)],
-                [(i, j), (i + 1, j + 1), (i, j + 1)],
-            ] {
-                let s = tri.map(|(a, b)| src(a, b));
-                let d = tri.map(|(a, b)| dst(a, b));
-                let Some(m) = tri_affine(s, d) else { continue };
-                // Grow the clip slightly so neighbouring triangles overlap (no seams).
-                let c = [
-                    (d[0][0] + d[1][0] + d[2][0]) / 3.0,
-                    (d[0][1] + d[1][1] + d[2][1]) / 3.0,
-                ];
-                let grow = |p: Point| {
-                    let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
-                    let l = (dx * dx + dy * dy).sqrt().max(1e-9);
-                    [p[0] + dx / l * 0.8 * px, p[1] + dy / l * 0.8 * px]
-                };
-                ctx.save();
-                path(ctx, &d.map(grow), true);
-                ctx.clip();
-                let _ = ctx.transform(m[0], m[1], m[2], m[3], m[4], m[5]);
-                let x0 = (s.iter().map(|p| p[0]).fold(f64::MAX, f64::min) - 1.0).max(0.0);
-                let y0 = (s.iter().map(|p| p[1]).fold(f64::MAX, f64::min) - 1.0).max(0.0);
-                let x1 = (s.iter().map(|p| p[0]).fold(f64::MIN, f64::max) + 1.0).min(sw);
-                let y1 = (s.iter().map(|p| p[1]).fold(f64::MIN, f64::max) + 1.0).min(sh);
-                let _ = ctx
-                    .draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
-                        img,
-                        x0,
-                        y0,
-                        x1 - x0,
-                        y1 - y0,
-                        x0,
-                        y0,
-                        x1 - x0,
-                        y1 - y0,
-                    );
-                ctx.restore();
-            }
+    for t in trackwright_core::mesh::triangles(n) {
+        let s = t.map(|k| uv[k]);
+        let d = t.map(|k| dst[k]);
+        let Some(m) = tri_affine(s, d) else { continue };
+        // Grow the clip slightly so neighbouring triangles overlap (no seams).
+        let c = [
+            (d[0][0] + d[1][0] + d[2][0]) / 3.0,
+            (d[0][1] + d[1][1] + d[2][1]) / 3.0,
+        ];
+        let grow = |p: Point| {
+            let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+            let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+            [p[0] + dx / l * 0.8 * px, p[1] + dy / l * 0.8 * px]
+        };
+        ctx.save();
+        path(ctx, &d.map(grow), true);
+        ctx.clip();
+        let _ = ctx.transform(m[0], m[1], m[2], m[3], m[4], m[5]);
+        let x0 = (s.iter().map(|p| p[0]).fold(f64::MAX, f64::min) - 1.0).max(0.0);
+        let y0 = (s.iter().map(|p| p[1]).fold(f64::MAX, f64::min) - 1.0).max(0.0);
+        let x1 = (s.iter().map(|p| p[0]).fold(f64::MIN, f64::max) + 1.0).min(sw);
+        let y1 = (s.iter().map(|p| p[1]).fold(f64::MIN, f64::max) + 1.0).min(sh);
+        if x1 > x0 && y1 > y0 {
+            let _ = ctx
+                .draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    img,
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                );
         }
+        ctx.restore();
     }
     ctx.restore();
 }
